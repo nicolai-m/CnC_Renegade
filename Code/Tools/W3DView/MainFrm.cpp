@@ -3015,10 +3015,10 @@ CMainFrame::OnCmdMsg
 void
 CMainFrame::OnCrashApp (void)
 {
-	// Usefull HACK to get the program to crash when needed...
-	LPTSTR hack = 0;
-	(*hack) = 0;
-	return ;
+       // Previously this command intentionally crashed the application.
+       // Display a message instead to avoid accidental crashes.
+       ::AfxMessageBox(_T("CrashApp debug command triggered."), MB_OK | MB_ICONWARNING);
+       return ;
 }
 
 
