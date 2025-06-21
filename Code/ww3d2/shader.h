@@ -438,12 +438,15 @@ public:
 
 	// Texturing, no zbuffer reading/writing, no gradients, multiplicative
 	// blending, no fogging - mostly for multiplicatively blended 2D objects.
-	static ShaderClass _PresetMultiplicative2DShader;
+        static ShaderClass _PresetMultiplicative2DShader;
 
-	// Texturing, default zbuffer reading, no zbuffer writing, no gradients,
-	// multiplicative blending, no fogging - mostly for use in multiplicatively
-	// blended sprite objects.
-	static ShaderClass _PresetMultiplicativeSpriteShader;
+        // Texturing, default zbuffer reading, no zbuffer writing, no gradients,
+        // multiplicative blending, no fogging - mostly for use in multiplicatively
+        // blended sprite objects.
+        static ShaderClass _PresetMultiplicativeSpriteShader;
+
+        // Experimental RTX neural shader preset
+        static ShaderClass _PresetRTXNeuralShader;
 
 protected:
 
