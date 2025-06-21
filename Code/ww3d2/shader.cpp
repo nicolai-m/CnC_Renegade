@@ -238,6 +238,13 @@ ShaderClass ShaderClass::_PresetMultiplicative2DShader(SC_MUL_2D);
 	DETAILCOLOR_DISABLE, DETAILALPHA_DISABLE) )
 ShaderClass ShaderClass::_PresetMultiplicativeSpriteShader(SC_MUL_SPRITE);
 
+// Experimental RTX neural shader preset
+#define SC_RTX_NEURAL ( SHADE_CNST(PASS_LEQUAL, DEPTH_WRITE_ENABLE, COLOR_WRITE_ENABLE, \
+        SRCBLEND_ONE, DSTBLEND_ZERO, FOG_DISABLE, GRADIENT_MODULATE, SECONDARY_GRADIENT_DISABLE, \
+        TEXTURING_ENABLE, ALPHATEST_DISABLE, CULL_MODE_ENABLE, \
+        DETAILCOLOR_DISABLE, DETAILALPHA_DISABLE) )
+ShaderClass ShaderClass::_PresetRTXNeuralShader(SC_RTX_NEURAL);
+
 
 /***********************************************************************************************
  * ShaderClass::Init_From_Material3 -- Initialize a shader from a Material3 structure          *

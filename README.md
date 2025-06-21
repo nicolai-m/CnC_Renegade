@@ -21,6 +21,10 @@ If you wish to rebuild the source code and tools successfully you will need to f
 - RTPatch Library - (expected path `\Code\Installer\`)
 - Java Runtime Headers - (expected path `\Code\Tools\RenegadeGR\`)
 
+## RTX Neural Shader
+
+An additional preset called `RTX Neural Shader` demonstrates modern shading techniques. It is implemented in `Code/ww3d2/shader.cpp` and can be enabled via the shader system.
+
 
 ## Compiling (Win32 Only)
 
