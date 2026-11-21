@@ -38,6 +38,29 @@
 
 SysTimeClass SystemTime;
 
+#if defined(__linux__)
+
+uint32 SysTimeClass::Get(void) const
+{
+	using Clock = std::chrono::steady_clock;
+	// The engine can read SystemTime from other global initializers.
+	static const auto initial_time = Clock::now();
+	const auto start = StartTime == Clock::time_point{} ? initial_time : StartTime;
+	const auto elapsed = Clock::now() - start;
+	return static_cast<uint32>(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count());
+}
+
+void SysTimeClass::Reset(void)
+{
+	StartTime = std::chrono::steady_clock::now();
+}
+
+bool SysTimeClass::Is_Getting_Late(void) const
+{
+	return Get() > 0x6fffffff;
+}
+
+#else
 
 /***********************************************************************************************
  * SysTimeClass::Reset -- Reset class to good state                                            *
@@ -86,6 +109,8 @@ bool SysTimeClass::Is_Getting_Late(void)
 	}
 	return(false);
 }
+
+#endif // __linux__
 
 
 

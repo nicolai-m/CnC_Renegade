@@ -28,7 +28,11 @@
 #define ENCODERLIST_H
 
 #include "encodertypeentry.h"
+#if defined(__linux__)
+#include "mathutil.h"
+#else
 #include "miscutil.h"
+#endif
 #include "wwdebug.h"
 
 

@@ -40,6 +40,26 @@ When the workspace has finished building, the compiled binaries will be copied t
 ### Free Dedicated Server
 It’s possible to build the Windows version of the FDS (Free Dedicated Server) for Command & Conquer Renegade from the source code in this repository, just uncomment `#define FREEDEDICATEDSERVER` in [Combat\specialbuilds.h](Combat\specialbuilds.h) and perform a “Rebuild All” action on the Release config.
 
+### Linux Dedicated Server port (in progress)
+
+The Linux build currently compiles the original game-packet encoding and framing
+code for amd64 and arm64. Tests cover the Win32 wire layout, including UTF-16
+strings and packet headers. The playable dedicated server still requires a Linux
+UDP transport, a headless entry point, and a port of map loading and the game loop.
+
+Run the packet tests on either architecture with CMake 3.20 or newer and a C++17
+compiler.
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
+```
+
+Server acceptance requires starting on Linux with locally installed game data,
+loading a multiplayer map without a display or audio device, and joining a match
+with a compatible Renegade client on both server architectures.
+
 
 ### Level Edit (Public Release)
 To build the public release build of Level Edit, modify the LevelEdit project settings and add `PUBLIC_EDITOR_VER` to the preprocessor defines.

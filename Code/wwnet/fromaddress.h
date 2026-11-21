@@ -31,8 +31,14 @@
 #ifndef FROMADDRESS_H
 #define FROMADDRESS_H
 
+#include <string.h>
+#if defined(__linux__)
+#include <netinet/in.h>
+typedef sockaddr_in SOCKADDR_IN;
+#else
 #include "win.h"
 #include <winsock.h>
+#endif
 
 //
 // This trivial class exists solely to speed compile times.
@@ -41,6 +47,7 @@
 class cFromAddress
 {
 	public:
+      cFromAddress() {memset(&FromAddress, 0, sizeof(FromAddress));}
       cFromAddress& operator=(const cFromAddress& rhs) {FromAddress = rhs.FromAddress; return * this;}
 
 		SOCKADDR_IN FromAddress;

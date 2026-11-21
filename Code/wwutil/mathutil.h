@@ -31,13 +31,24 @@
 #ifndef MATHUTIL_H
 #define MATHUTIL_H
 
+const float MISCUTIL_EPSILON = 0.0001f;
+
 class cMathUtil
 {
 	public:
 		static void		Angle_To_Vector(double angle, double & dx, double & dy);
       static void		Vector_To_Angle(double dx, double dy, double & angle);
 		static double	Simple_Distance(double x1, double y1, double x2, double y2);
-      static int		Round(double arg);
+      static int		Round(double arg)
+		{
+			if (arg > MISCUTIL_EPSILON) {
+				return (int)(arg + 0.5f);
+			}
+			if (arg < -MISCUTIL_EPSILON) {
+				return (int)(arg - 0.5f);
+			}
+			return 0;
+		}
       static void		Rotate_Vector(double & vx, double & vy, double angle);
 
       //

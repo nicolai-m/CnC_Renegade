@@ -36,12 +36,37 @@
 
 #pragma once
 #ifndef _SYSTIMER_H
+#define _SYSTIMER_H
 
 #include "always.h"
+#if defined(__linux__)
+#include <chrono>
+#include "bittype.h"
+#else
 #include <windows.h>
 #include "mmsys.h"
+#endif
 
 #define TIMEGETTIME SystemTime.Get
+
+#if defined(__linux__)
+
+class SysTimeClass
+{
+	public:
+		uint32 Get(void) const;
+		uint32 operator () (void) const {return Get();}
+		operator uint32(void) const {return Get();}
+		void Reset(void);
+		bool Is_Getting_Late(void) const;
+
+	private:
+		std::chrono::steady_clock::time_point StartTime{};
+};
+
+extern SysTimeClass SystemTime;
+
+#else
 
 /*
 ** Class that just wraps around timeGetTime()
@@ -132,6 +157,7 @@ __forceinline unsigned long SysTimeClass::Get(void)
 #define timeGetTime SystemTime.Get
 #endif //timeGetTime
 
+#endif // __linux__
 
 
 

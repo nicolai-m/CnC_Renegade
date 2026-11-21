@@ -13,6 +13,7 @@ GameSpy/
 DirectX/
 
 # Output build folders
+/build/
 [Rr]elease*
 [Pp]rofile*
 [Dd]ebug*

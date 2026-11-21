@@ -1178,7 +1178,9 @@ int cConnection::Send_Wrapper(cPacket & packet, LPSOCKADDR_IN p_address)
    WWASSERT(p_address != NULL);
 
 	cPacket full_packet;
-	cPacket::Construct_Full_Packet(full_packet, packet);
+	if (!cPacket::Construct_Full_Packet(full_packet, packet)) {
+		return 0;
+	}
 
 	//
 	// Update stats
@@ -1331,7 +1333,9 @@ int cConnection::Receive_Wrapper(cPacket & packet)
 		//
 		full_packet.Set_Bit_Length(ret_code * 8);
 
-		cPacket::Construct_App_Packet(packet, full_packet);
+		if (!cPacket::Construct_App_Packet(packet, full_packet)) {
+			return 0;
+		}
 
 #ifndef WRAPPER_CRC
 		if (packet.Is_Crc_Correct()) {

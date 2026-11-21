@@ -27,10 +27,8 @@
 #include "encodertypeentry.h" // I WANNA BE FIRST!
 
 #include <math.h>
-#include <limits.h>
 
 #include "wwdebug.h"
-#include "miscutil.h"
 #include "mathutil.h"
 
 static const int MAX_BITS = 32;
@@ -92,12 +90,7 @@ void cEncoderTypeEntry::Init(int num_bits)
 	BitPrecision = num_bits;
 	Resolution = 1;
 
-	UINT max = 0;
-	for (int i = 0; i < num_bits; i++) {
-		max += 1 << i;
-	}
-
-	Max = max;
+	Max = ldexp(1.0, num_bits) - 1.0;
 
 	WWASSERT(Is_Valid());	
 }
@@ -113,8 +106,10 @@ bool cEncoderTypeEntry::Scale(double value, ULONG & scaled_value)
 		value = Clamp(value);
 	}
 
-	scaled_value = static_cast<ULONG>
-		(cMathUtil::Round((value - Min) / Resolution));
+	// Constant ranges always encode as zero. Round in double for the full
+	// unsigned 32-bit wire range.
+	double units = Resolution == 0 ? 0 : (value - Min) / Resolution;
+	scaled_value = units <= 0 ? 0 : static_cast<ULONG>(floor(units + 0.5));
 
 	return is_in_range;
 }
@@ -158,24 +153,16 @@ void cEncoderTypeEntry::Calc_Bit_Precision(double resolution)
 	WWASSERT(Max - Min > -MISCUTIL_EPSILON);
 	WWASSERT(resolution > MISCUTIL_EPSILON);
 
-	double f_units = (double) ceil((Max - Min) / resolution - MISCUTIL_EPSILON) + 1;
-	WWASSERT(f_units <= UINT_MAX + MISCUTIL_EPSILON);
-	UINT units = (UINT) f_units;
-
-	BitPrecision = 0;
-	UINT max_units = 0;
-	while (max_units < units) {
-		max_units += 1 << BitPrecision;
+	double units = ceil((Max - Min) / resolution - MISCUTIL_EPSILON) + 1;
+	double max_units = 2;
+	BitPrecision = 1;
+	while (max_units < units && BitPrecision < MAX_BITS) {
+		max_units *= 2;
 		BitPrecision++;
-		if (BitPrecision == 1) {
-			max_units++;
-		}
-	}	
+	}
+	WWASSERT(units <= max_units);
 
-	WWASSERT(BitPrecision > 0 && BitPrecision <= MAX_BITS);
-	WWASSERT(max_units > 0);
-
-	Resolution = (Max - Min) / (double) (max_units - 1);
+	Resolution = (Max - Min) / (max_units - 1);
 
 	/*TSS2001
 	if (Resolution > 0) {

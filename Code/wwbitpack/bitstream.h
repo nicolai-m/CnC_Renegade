@@ -40,12 +40,15 @@
 #define BITSTREAM_H
 
 
-#include "bitpacker.h"
+#include "BitPacker.h"
 #include "wwdebug.h"
 #include "encoderlist.h"
 #include "mathutil.h"
 #include "math.h"
+#include <string.h>
+#if !defined(__linux__)
 #include "widestring.h"
+#endif
 
 #define BYTE_DEPTH(x)		(sizeof(x))
 #define BIT_DEPTH(x)			(8 * sizeof(x))
@@ -120,14 +123,18 @@ class BitStreamClass : public cBitPacker
 		void		Add(BYTE val,int type = NO_ENCODER)							{ Internal_Add(val,type); }
 		void		Add(USHORT val,int type = NO_ENCODER)						{ Internal_Add(val,type); }
 		void		Add(UINT val,int type = NO_ENCODER)							{ Internal_Add(val,type); }
+#if !defined(__linux__) // ULONG and UINT share a type on Linux.
 		void		Add(ULONG val,int type = NO_ENCODER)						{ Internal_Add(val,type); }
+#endif
 		void		Add(char val,int type = NO_ENCODER)							{ Internal_Add(val,type); }
 		void		Add(int val,int type = NO_ENCODER)							{ Internal_Add(val,type); }
 		void		Add(float val,int type = NO_ENCODER)						{ Internal_Add(val,type); }
 
 		BYTE		Get(BYTE & set_val,int type = NO_ENCODER)					{ return Internal_Get(set_val,type); }
 		USHORT	Get(USHORT & set_val,int type = NO_ENCODER)				{ return Internal_Get(set_val,type); }
+#if !defined(__linux__)
 		ULONG		Get(ULONG & set_val,int type = NO_ENCODER)				{ return Internal_Get(set_val,type); }
+#endif
 		UINT		Get(UINT & set_val,int type = NO_ENCODER)					{ return Internal_Get(set_val,type); }
 		char		Get(char & set_val,int type = NO_ENCODER)					{ return Internal_Get(set_val,type); }
 		int		Get(int & set_val,int type = NO_ENCODER)					{ return Internal_Get(set_val,type); }
@@ -166,7 +173,10 @@ class BitStreamClass : public cBitPacker
 				Add_Bits(scaled_value, entry.Get_Bit_Precision());
 
 			} else {
-				Add_Bits(*(reinterpret_cast<ULONG *>(&value)), BIT_DEPTH(T));
+				// The supported little-endian targets share the Win32 scalar layout.
+				ULONG bits = 0;
+				memcpy(&bits, &value, sizeof(value));
+				Add_Bits(bits, BIT_DEPTH(T));
 			}
 
 			UncompressedSizeBytes += BYTE_DEPTH(T);
@@ -206,7 +216,7 @@ class BitStreamClass : public cBitPacker
 				ULONG u_value;
 				Get_Bits(u_value, BIT_DEPTH(T));
 
-				value = *(reinterpret_cast<T *>(&u_value));
+				memcpy(&value, &u_value, sizeof(value));
 			}
 			return value;
 		}
