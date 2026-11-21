@@ -37,8 +37,7 @@
 #include "slist.h"
 #include "wwdebug.h"
 
-#include "win.h"
-#include <winsock.h>
+#include "socketplatform.h"
 
 //const USHORT MAX_MESSAGE_TYPES = 256;
 

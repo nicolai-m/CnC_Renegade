@@ -20,8 +20,15 @@ add_library(renegade_packet STATIC
     Code/wwbitpack/encodertypeentry.cpp
     Code/wwlib/crc.cpp
     Code/wwlib/systimer.cpp
+    Code/wwnet/BWBalance.cpp
+    Code/wwnet/connect.cpp
+    Code/wwnet/msgstat.cpp
+    Code/wwnet/msgstatlist.cpp
+    Code/wwnet/netstats.cpp
     Code/wwnet/netutil.cpp
     Code/wwnet/packetmgr.cpp
+    Code/wwnet/rhost.cpp
+    Code/wwnet/singlepl.cpp
     Code/wwnet/wwpacket.cpp
 )
 target_link_libraries(renegade_packet PUBLIC Threads::Threads)
@@ -44,4 +51,8 @@ if(BUILD_TESTING)
     add_executable(renegade_udp_test Code/Tests/Linux/udp_transport_test.cpp)
     target_link_libraries(renegade_udp_test PRIVATE renegade_packet)
     add_test(NAME renegade_udp_transport COMMAND renegade_udp_test)
+
+    add_executable(renegade_connection_test Code/Tests/Linux/connection_test.cpp)
+    target_link_libraries(renegade_connection_test PRIVATE renegade_packet)
+    add_test(NAME renegade_connection_handshake COMMAND renegade_connection_test)
 endif()

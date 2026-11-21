@@ -38,4 +38,6 @@
 
 
 
+#if !defined(__linux__)
 DEFINE_AUTO_POOL (GenericSLNode, 256);
+#endif

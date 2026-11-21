@@ -42,11 +42,14 @@ It’s possible to build the Windows version of the FDS (Free Dedicated Server) 
 
 ### Linux Dedicated Server port (in progress)
 
-The Linux build compiles the original game-packet code and UDP transport for
-amd64 and arm64. Tests compare the original wire layout and exercise UDP checksums,
-packet coalescing, and delta decompression over loopback. The playable dedicated
-server still requires the connection and session layer, a headless entry point,
-map loading, and the game loop.
+The Linux build compiles the original game-packet code, UDP transport, and peer
+connection layer for amd64 and arm64. Loopback tests cover the original wire
+layout, UDP checksums, packet coalescing, delta decompression, the connection
+handshake, and reliable delivery. The Linux connection layer supports direct UDP;
+the legacy Westwood Online NAT negotiation is available in the Windows build.
+
+The playable dedicated server still requires a headless entry point, game-session
+initialization, map loading, and the simulation loop.
 
 Run the network tests on either architecture with CMake 3.20 or newer and a C++17
 compiler.

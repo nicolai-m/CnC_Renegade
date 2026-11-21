@@ -102,7 +102,7 @@ class cConnection
 		~cConnection();
 
       void Init_As_Client(ULONG server_ip, USHORT server_port, unsigned short my_port = 0);
-      void Init_As_Server(USHORT server_port, int max_players,
+      bool Init_As_Server(USHORT server_port, int max_players,
 			bool is_dedicated_server, ULONG addr = 0);
       void Connect_Cs(cPacket & app_data);
       void Send_Packet_To_Individual(cPacket & packet, int addressee, BYTE send_flags);
@@ -128,6 +128,7 @@ class cConnection
 		cRemoteHost * Get_Remote_Host(int rhost);
 		bool Is_Destroy() {return IsDestroy;}
       int Get_Local_Id() const {return LocalId;}
+		USHORT Get_Local_Port() const {return LocalPort;}
 		double Get_Max_Acceptable_Packetloss_Pc() const {return MaxAcceptablePacketlossPc;}
 		cNetStats & Get_Combined_Stats() {return CombinedStats;}
 		cNetStats & Get_Averaged_Stats() {return AveragedStats;}
