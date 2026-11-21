@@ -11,14 +11,20 @@ if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|aarch64|arm64)$" OR
     message(FATAL_ERROR "The port build targets 64-bit little-endian Linux (amd64 or arm64).")
 endif()
 
+find_package(Threads REQUIRED)
+
 add_library(renegade_packet STATIC
     Code/wwbitpack/BitPacker.cpp
     Code/wwbitpack/bitstream.cpp
     Code/wwbitpack/encoderlist.cpp
     Code/wwbitpack/encodertypeentry.cpp
+    Code/wwlib/crc.cpp
     Code/wwlib/systimer.cpp
+    Code/wwnet/netutil.cpp
+    Code/wwnet/packetmgr.cpp
     Code/wwnet/wwpacket.cpp
 )
+target_link_libraries(renegade_packet PUBLIC Threads::Threads)
 target_compile_features(renegade_packet PUBLIC cxx_std_17)
 target_include_directories(renegade_packet PUBLIC
     Code/WWMath
@@ -34,4 +40,8 @@ if(BUILD_TESTING)
     add_executable(renegade_packet_test Code/Tests/Linux/packet_test.cpp)
     target_link_libraries(renegade_packet_test PRIVATE renegade_packet)
     add_test(NAME renegade_packet_wire_format COMMAND renegade_packet_test)
+
+    add_executable(renegade_udp_test Code/Tests/Linux/udp_transport_test.cpp)
+    target_link_libraries(renegade_udp_test PRIVATE renegade_packet)
+    add_test(NAME renegade_udp_transport COMMAND renegade_udp_test)
 endif()

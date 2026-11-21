@@ -9,8 +9,8 @@ permissions:
   contents: read
 
 jobs:
-  packet-tests:
-    name: Packet tests (${{ matrix.arch }})
+  network-tests:
+    name: Network tests (${{ matrix.arch }})
     strategy:
       fail-fast: false
       matrix:

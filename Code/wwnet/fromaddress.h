@@ -32,13 +32,7 @@
 #define FROMADDRESS_H
 
 #include <string.h>
-#if defined(__linux__)
-#include <netinet/in.h>
-typedef sockaddr_in SOCKADDR_IN;
-#else
-#include "win.h"
-#include <winsock.h>
-#endif
+#include "socketplatform.h"
 
 //
 // This trivial class exists solely to speed compile times.

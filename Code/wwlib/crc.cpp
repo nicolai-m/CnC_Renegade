@@ -60,11 +60,11 @@
  *=============================================================================================*/
 void CRCEngine::operator() (char datum)
 {
-	StagingBuffer.Buffer[Index++] = datum;
+	StagingWord |= static_cast<uint32>(static_cast<uint8>(datum)) << (8 * Index++);
 
-	if (Index == sizeof(long))  {
-		CRC = Value();
-		StagingBuffer.Composite = 0;
+	if (Index == 4) {
+		CRC = Rotate_Left(CRC) + StagingWord;
+		StagingWord = 0;
 		Index = 0;
 	}
 }
@@ -88,7 +88,7 @@ void CRCEngine::operator() (char datum)
  * HISTORY:                                                                                    *
  *   03/02/1996 JLB : Created.                                                                 *
  *=============================================================================================*/
-long CRCEngine::operator() (void const * buffer, int length)
+sint32 CRCEngine::operator() (void const * buffer, int length)
 {
 	if (buffer != NULL && length > 0)  {
 		char const * dataptr = (char const *)buffer;
@@ -110,18 +110,20 @@ long CRCEngine::operator() (void const * buffer, int length)
 		**	Perform the fast 'bulk' processing by reading long word sized
 		**	data blocks.
 		*/
-		long const * longptr = (long const *)dataptr;
-		int longcount = bytes_left / sizeof(long);		// Whole 'long' elements remaining.
-		while (longcount--) {
-			CRC = _lrotl(CRC, 1) + *longptr++;
-			bytes_left -= sizeof(long);
+		while (bytes_left >= 4) {
+			uint32 word = 0;
+			for (int i = 0; i < 4; ++i) {
+				word |= static_cast<uint32>(static_cast<uint8>(dataptr[i])) << (8 * i);
+			}
+			CRC = Rotate_Left(CRC) + word;
+			dataptr += 4;
+			bytes_left -= 4;
 		}
 
 		/*
 		**	If there are remainder bytes, then process these by adding them
 		**	to the staging buffer.
 		*/
-		dataptr = (char const *)longptr;
 		while (bytes_left) {
 			operator()(*dataptr);
 			dataptr++;
@@ -135,7 +137,7 @@ long CRCEngine::operator() (void const * buffer, int length)
 	return(Value());
 }
 //    CRC for poly 0x04C11DB7   
-unsigned long  CRC::_Table[ 256 ] =
+uint32 CRC::_Table[ 256 ] =
 {
 	0x00000000L, 0x77073096L, 0xEE0E612CL, 0x990951BAL, 
 	0x076DC419L, 0x706AF48FL, 0xE963A535L, 0x9E6495A3L,
@@ -203,7 +205,7 @@ unsigned long  CRC::_Table[ 256 ] =
 	0xB40BBE37L, 0xC30C8EA1L, 0x5A05DF1BL, 0x2D02EF8DL
 };
 
-unsigned long	CRC::Memory( unsigned char *data, unsigned long length, unsigned long crc )
+uint32 CRC::Memory( const unsigned char *data, unsigned long length, uint32 crc )
 {
  	crc ^= 0xFFFFFFFF;									// invert previous CRC
 	while ( length-- ) {
@@ -212,7 +214,7 @@ unsigned long	CRC::Memory( unsigned char *data, unsigned long length, unsigned l
 	return (crc ^ 0xFFFFFFFF); 						// invert new CRC and return it
 }
 
-unsigned long	CRC::String( const char *string, unsigned long crc)
+uint32 CRC::String( const char *string, uint32 crc)
 {
  	crc ^= 0xFFFFFFFF;									// invert previous CRC
 	while ( *string )	{

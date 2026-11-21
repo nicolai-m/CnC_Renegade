@@ -42,12 +42,13 @@ It’s possible to build the Windows version of the FDS (Free Dedicated Server) 
 
 ### Linux Dedicated Server port (in progress)
 
-The Linux build currently compiles the original game-packet encoding and framing
-code for amd64 and arm64. Tests cover the Win32 wire layout, including UTF-16
-strings and packet headers. The playable dedicated server still requires a Linux
-UDP transport, a headless entry point, and a port of map loading and the game loop.
+The Linux build compiles the original game-packet code and UDP transport for
+amd64 and arm64. Tests compare the original wire layout and exercise UDP checksums,
+packet coalescing, and delta decompression over loopback. The playable dedicated
+server still requires the connection and session layer, a headless entry point,
+map loading, and the game loop.
 
-Run the packet tests on either architecture with CMake 3.20 or newer and a C++17
+Run the network tests on either architecture with CMake 3.20 or newer and a C++17
 compiler.
 
 ```sh
