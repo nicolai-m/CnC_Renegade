@@ -20,6 +20,7 @@
 #include "coltype.h"
 #include "connect.h"
 #include "headless_collision.h"
+#include "headless_simulation.h"
 #include "mixarchive.h"
 #include "netutil.h"
 #include "packetmgr.h"
@@ -380,6 +381,14 @@ void Report_Static_Collision(const HeadlessCollision &collision)
               << box_hits << '/' << starts << " ground box sweeps hit (" << box_overlaps << " initial overlaps)\n";
 }
 
+void Report_Soldier_Spawns(const HeadlessCollision &collision)
+{
+    HeadlessSimulation simulation(collision);
+    const char *nod = simulation.Spawn_Soldier(1, PLAYERTYPE_NOD) ? "ready" : "no clear start";
+    const char *gdi = simulation.Spawn_Soldier(2, PLAYERTYPE_GDI) ? "ready" : "no clear start";
+    std::cout << "Headless soldier spawns: Nod " << nod << ", GDI " << gdi << '\n';
+}
+
 volatile std::sig_atomic_t stop_requested = 0;
 
 void Request_Stop(int)
@@ -397,7 +406,8 @@ void Unexpected_Join(int)
     throw std::logic_error("Connection was admitted before a game session was ready");
 }
 
-int Run_Headless(const Settings &settings, const std::string &address, const in_addr &bind_address)
+int Run_Headless(const Settings &settings, const std::string &address, const in_addr &bind_address,
+    const HeadlessCollision &collision)
 {
     if (std::signal(SIGINT, Request_Stop) == SIG_ERR || std::signal(SIGTERM, Request_Stop) == SIG_ERR) {
         throw std::runtime_error("Cannot install shutdown handlers");
@@ -413,12 +423,17 @@ int Run_Headless(const Settings &settings, const std::string &address, const in_
         throw std::runtime_error("Cannot bind UDP to " + address + ":" + std::to_string(settings.Port));
     }
 
+    HeadlessSimulation simulation(collision);
     std::cout << "FDS bootstrap listening on " << address << ':' << server.Get_Local_Port()
               << " (game session pending; joins refused)" << std::endl;
+    auto previous = HeadlessSimulation::Clock::now();
     while (!stop_requested) {
+        const auto frame_start = HeadlessSimulation::Clock::now();
         server.Service_Read();
+        simulation.Advance(frame_start - previous);
+        previous = frame_start;
         server.Service_Send(true);
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        std::this_thread::sleep_until(frame_start + std::chrono::milliseconds(10));
     }
     return 0;
 }
@@ -451,7 +466,11 @@ int main(int argc, char **argv)
                   << level.Spawners().size() << " spawners (" << level.Count_Player_Spawns(PLAYERTYPE_NOD)
                   << " Nod and " << level.Count_Player_Spawns(PLAYERTYPE_GDI) << " GDI soldier starts)\n";
         Report_Static_Collision(collision);
-        return options.CheckOnly ? 0 : Run_Headless(settings, options.BindAddress, bind_address);
+        if (options.CheckOnly) {
+            Report_Soldier_Spawns(collision);
+            return 0;
+        }
+        return Run_Headless(settings, options.BindAddress, bind_address, collision);
     } catch (const std::exception &error) {
         std::cerr << "FDS: " << error.what() << '\n';
         return 1;

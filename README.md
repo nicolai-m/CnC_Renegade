@@ -77,10 +77,16 @@ orientation. The result includes the first contact or an initial overlap.
 Startup reports both ground-ray and box-sweep results at enabled soldier starts.
 The box probe uses the soldier debug box dimensions with its feet 0.25 m above
 the saved position.
-The bootstrap refuses joins while player and vehicle movement, animated and
-dynamic objects, the simulation loop, and game-session callbacks are being
-ported. Tests exercise scene loading, collision masks and hit results, the UDP
-handshake, reliable delivery, and bootstrap startup and shutdown.
+The server advances a headless simulation every 20 ms. It can place a soldier on
+an enabled team spawn with walkable ground below it and apply movement input.
+Soldiers use the debug-sized collision box, a fixed movement speed of 4 m/s,
+gravity, and sliding against static geometry. With `--check`, the server also
+reports whether it can place a grounded soldier for each team.
+
+The bootstrap refuses joins while client input and object updates, animated
+and dynamic collision, vehicle movement, and match rules are being ported.
+Tests exercise soldier spawns, movement and wall contacts, the UDP handshake,
+reliable delivery, and bootstrap startup and shutdown.
 
 
 ### Level Edit (Public Release)

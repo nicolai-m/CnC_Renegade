@@ -45,6 +45,7 @@ target_include_directories(renegade_packet PUBLIC
 add_library(renegade_level STATIC
     Code/Commando/headless_collision.cpp
     Code/Commando/headless_level.cpp
+    Code/Commando/headless_simulation.cpp
     Code/WWMath/colmathline.cpp
     Code/WWMath/colmathobbobb.cpp
     Code/WWMath/colmathobbtri.cpp

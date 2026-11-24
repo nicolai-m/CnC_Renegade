@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -25,6 +26,7 @@
 #include "crc.h"
 #include "combatchunkid.h"
 #include "headless_collision.h"
+#include "headless_simulation.h"
 #include "netutil.h"
 #include "obbox.h"
 #include "playertype.h"
@@ -173,6 +175,8 @@ std::string Collision_Data(uint32 last_vertex = 2)
             {1, 0, 0}, {0.75f, 0.25f, 0.25f}) +
         box("testmesh.low", W3D_BOX_ATTRIBUTE_ALIGNED | W3D_MESH_FLAG_COLLISION_TYPE_PHYSICAL,
             {0, 0, 0}, {2, 2, 1}) +
+        box("testmesh.wall", W3D_BOX_ATTRIBUTE_ALIGNED | W3D_MESH_FLAG_COLLISION_TYPE_PHYSICAL,
+            {0, 2.8f, 1}, {0.5f, 0.05f, 1}) +
         Chunk(W3D_CHUNK_EMITTER, Chunk(W3D_CHUNK_EMITTER_HEADER, Bytes(emitter), false)) +
         Chunk(W3D_CHUNK_HIERARCHY, Chunk(W3D_CHUNK_HIERARCHY_HEADER, Bytes(hierarchy), false) +
             Chunk(W3D_CHUNK_PIVOTS, Bytes(pivots), false)) +
@@ -181,7 +185,8 @@ std::string Collision_Data(uint32 last_vertex = 2)
         Chunk(W3D_CHUNK_HLOD, Chunk(W3D_CHUNK_HLOD_HEADER, Bytes(hlod), false) +
             parts(W3D_CHUNK_HLOD_LOD_ARRAY, 1, part("testmesh.low", 0)) +
             parts(W3D_CHUNK_HLOD_LOD_ARRAY, 2, part("testmesh.terrain", 0) + part("legacy", 1)) +
-            parts(W3D_CHUNK_HLOD_AGGREGATE_ARRAY, 2, part("testmesh.camera", 1) + part("testmesh.smoke", 1)));
+            parts(W3D_CHUNK_HLOD_AGGREGATE_ARRAY, 3, part("testmesh.camera", 1) + part("testmesh.smoke", 1) +
+                part("testmesh.wall", 0)));
 }
 
 std::string Dynamic_Data()
@@ -250,6 +255,52 @@ void Check_Box_Sweeps(const HeadlessCollision &collision)
     Check(camera && !camera->StartsInside && camera->ContactPoint &&
         std::abs(camera->ContactPoint->Z - 1.75f) < 0.0001f,
         "The sweep lost the aligned collider offset within its rotated hierarchy");
+}
+
+void Check_Soldier_Simulation(const HeadlessCollision &collision)
+{
+    HeadlessSimulation simulation(collision);
+    Check(!simulation.Spawn_Soldier(0, PLAYERTYPE_GDI) && !simulation.Spawn_Soldier(3, PLAYERTYPE_SPECTATOR),
+        "Only valid players on a combat team can spawn");
+    Check(simulation.Spawn_Soldier(1, PLAYERTYPE_GDI) && simulation.Spawn_Soldier(2, PLAYERTYPE_NOD) &&
+        !simulation.Spawn_Soldier(1, PLAYERTYPE_NOD), "A team spawn should create one soldier per player");
+    const auto &gdi = *simulation.Find_Soldier(1);
+    const auto &nod = *simulation.Find_Soldier(2);
+    Check(gdi.SpawnerId == 20 && gdi.Position.X == 6 && gdi.Grounded &&
+        gdi.Position.Z >= 0 && gdi.Position.Z < 0.01f &&
+        nod.SpawnerId == 10 && nod.Position.X == -6 && nod.Grounded,
+        "Soldiers must start on the ground at their team's saved spawn");
+
+    Check(simulation.Set_Move_Input(1, Vector2(0, 1)) &&
+        !simulation.Set_Move_Input(1, Vector2(0, std::numeric_limits<float>::quiet_NaN())) &&
+        !simulation.Set_Move_Input(3, Vector2(0, 1)), "Only valid input for a spawned soldier should be accepted");
+    const auto spawn_position = gdi.Position;
+    simulation.Advance(19ms);
+    Check(gdi.Position == spawn_position, "An incomplete tick changed the soldier position");
+    simulation.Advance(1ms);
+    Check(std::abs(gdi.Position.Y - (spawn_position.Y + 0.08f)) < 0.0001f,
+        "A fixed tick did not move the soldier at the configured speed");
+    for (int tick = 0; tick < 12; ++tick) {
+        simulation.Advance(20ms);
+    }
+    Check(std::abs(gdi.Position.Y - 2.448f) < 0.002f && gdi.Grounded,
+        "The moving soldier penetrated or stopped short of the wall");
+
+    Check(simulation.Set_Move_Input(1, Vector2(1, 1)), "Diagonal input was rejected");
+    simulation.Advance(40ms);
+    Check(std::abs(gdi.Position.X - (6.0f + std::sqrt(0.5f) * 0.16f)) < 0.001f &&
+        std::abs(gdi.Position.Y - 2.448f) < 0.002f && gdi.Grounded,
+        "The soldier should slide along the wall at a normalized diagonal speed");
+
+    Check(simulation.Set_Move_Input(2, Vector2(0, -1)), "Nod movement input was rejected");
+    simulation.Advance(5s);
+    Check(std::abs(nod.Position.Y - 1.6f) < 0.0001f,
+        "After a long stall the simulation should catch up by at most five ticks");
+    for (int tick = 0; tick < 30; ++tick) {
+        simulation.Advance(20ms);
+    }
+    Check(nod.Position.Y < -0.5f && nod.Position.Z < -0.05f && !nod.Grounded,
+        "A soldier who walks off the terrain should fall");
 }
 
 std::string Definitions()
@@ -450,7 +501,7 @@ int main(int argc, char **argv)
 
         const auto collision = HeadlessCollision::Load(level,
             [&](const std::string &name) { return archive.Find(name); }, archive.Find("c&c_test.dep"));
-        Check(collision.Collider_Count() == 9 && collision.Incomplete_Object_Count() == 0,
+        Check(collision.Collider_Count() == 12 && collision.Incomplete_Object_Count() == 0,
             "HLOD dependencies, top LOD or aggregate parts failed to load");
         const Vector3 start(6.5f, 0.125f, 3), end(6.5f, 0.125f, -1);
         const auto ground = collision.Cast_Ray(start, end, COLLISION_TYPE_PHYSICAL);
@@ -471,6 +522,7 @@ int main(int argc, char **argv)
         Check(!collision.Cast_Ray(Vector3(7.9f, 2, 3), Vector3(7.9f, 2, -1), COLLISION_TYPE_PHYSICAL),
             "A ray that misses the terrain triangle but passes through its bounds must not hit");
         Check_Box_Sweeps(collision);
+        Check_Soldier_Simulation(collision);
 
         FdsProcess check(argv[1], fixture.Path, master, "--check");
         const auto check_status = check.Wait();
@@ -479,9 +531,11 @@ int main(int argc, char **argv)
             "FDS did not validate the configured map");
         Check(check.Output().find("3 static objects in 3 spatial nodes, 1 buildings, 2 spawners") != std::string::npos,
             "FDS did not load the headless scene before startup");
-        Check(check.Output().find("9 colliders, 0 static objects with incomplete geometry; "
+        Check(check.Output().find("12 colliders, 0 static objects with incomplete geometry; "
             "2/2 soldier-start ground rays hit; 2/2 ground box sweeps hit (0 initial overlaps)") != std::string::npos,
             "FDS did not load W3D collision from the selected map");
+        Check(check.Output().find("Headless soldier spawns: Nod ready, GDI ready") != std::string::npos,
+            "FDS did not validate grounded spawns for both teams");
 
         FdsProcess server(argv[1], fixture.Path, master);
         const auto port = server.Wait_For_Port();
