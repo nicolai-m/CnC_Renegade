@@ -61,15 +61,19 @@ INI such as `svrcfg_cnc.ini`, or a `[Server]` INI with `GameType=LAN` and
 ./build/renegade_fds --data-dir /path/to/game --config /path/to/svrcfg_cnc.ini
 ```
 
-The bootstrap validates the core assets and reads the configured maps’ static
-and dynamic chunk headers through the original chunk reader. With `--check` it
-exits after validation. Otherwise it listens for direct UDP on `127.0.0.1` by
-default, with port `4848` if the INI does not specify one. `--bind` and `--port`
-override the address and port. `SIGINT` and `SIGTERM` stop it cleanly.
+The bootstrap loads the first configured map into a headless scene using the
+original chunk reader. It restores the map bounds and spatial tree, static object
+model references and transforms, building state, and spawner placements with
+their team definitions. It also checks the other maps’ chunk headers. With
+`--check` it exits after loading and validation. Otherwise it listens for direct
+UDP on `127.0.0.1` by default, with port `4848` if the INI does not specify one.
+`--bind` and `--port` override the address and port. `SIGINT` and `SIGTERM` stop
+it cleanly.
 
-The bootstrap refuses joins until the game-session callbacks, map instantiation,
-and simulation loop are ported. The current tests cover the library’s UDP
-handshake and reliable delivery as well as bootstrap startup, refusal, and shutdown.
+The spatial tree provides candidate object lookups. Mesh collision, live combat
+objects, the simulation loop, and game-session callbacks are still being ported,
+so the bootstrap refuses joins. Tests exercise scene loading, spatial queries,
+the UDP handshake, reliable delivery, and bootstrap startup and shutdown.
 
 
 ### Level Edit (Public Release)

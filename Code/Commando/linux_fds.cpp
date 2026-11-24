@@ -16,9 +16,11 @@
 
 #include "chunkio.h"
 #include "connect.h"
+#include "headless_level.h"
 #include "mixarchive.h"
 #include "netutil.h"
 #include "packetmgr.h"
+#include "playertype.h"
 
 namespace {
 
@@ -248,7 +250,7 @@ Settings Load_Settings(const Options &options, const fs::path &data_dir)
     return result;
 }
 
-GameDataFile Find_Asset(const fs::path &directory, const std::vector<MixArchive> &archives,
+std::optional<GameDataFile> Find_Optional_Asset(const fs::path &directory, const std::vector<MixArchive> &archives,
     const std::string &name)
 {
     if (const auto loose = Find_Child(directory, name)) {
@@ -258,6 +260,15 @@ GameDataFile Find_Asset(const fs::path &directory, const std::vector<MixArchive>
         if (auto entry = archive.Find(name)) {
             return *entry;
         }
+    }
+    return std::nullopt;
+}
+
+GameDataFile Find_Asset(const fs::path &directory, const std::vector<MixArchive> &archives,
+    const std::string &name)
+{
+    if (auto file = Find_Optional_Asset(directory, archives, name)) {
+        return *file;
     }
     throw std::runtime_error("Missing game asset: " + name);
 }
@@ -283,7 +294,7 @@ void Check_Chunks(const GameDataFile &data, const std::string &name)
     }
 }
 
-void Check_Game_Data(const fs::path &directory, const Settings &settings)
+HeadlessLevel Load_Game_Data(const fs::path &directory, const Settings &settings)
 {
     std::vector<MixArchive> core;
     for (const char *name : {"Always2.dat", "Always.dbs", "Always.dat"}) {
@@ -291,7 +302,7 @@ void Check_Game_Data(const fs::path &directory, const Settings &settings)
             core.emplace_back(*path);
         }
     }
-    Check_Chunks(Find_Asset(directory, core, "objects.ddb"), "objects.ddb");
+    const auto definitions = Find_Asset(directory, core, "objects.ddb");
     Check_Chunks(Find_Asset(directory, core, "strings.tdb"), "strings.tdb");
     auto armor = Find_Asset(directory, core, "armor.ini").Open();
     char first_byte;
@@ -299,6 +310,7 @@ void Check_Game_Data(const fs::path &directory, const Settings &settings)
         throw std::runtime_error("Cannot read armor.ini");
     }
 
+    std::optional<HeadlessLevel> level;
     for (const auto &map : settings.Maps) {
         const auto map_path = Find_Child(directory, map);
         if (!map_path) {
@@ -312,11 +324,17 @@ void Check_Game_Data(const fs::path &directory, const Settings &settings)
         } else if (extension != ".lsd") {
             throw std::runtime_error("Map must be a .mix archive or a loose .lsd file: " + map);
         }
-        for (const char *suffix : {".lsd", ".ldd"}) {
-            const auto name = stem + suffix;
-            Check_Chunks(Find_Asset(directory, map_archives, name), name);
+        const auto static_data = Find_Asset(directory, map_archives, stem + ".lsd");
+        const auto dynamic_data = Find_Asset(directory, map_archives, stem + ".ldd");
+        if (!level) {
+            level = HeadlessLevel::Load(static_data, dynamic_data, definitions,
+                Find_Optional_Asset(directory, map_archives, stem + ".ddb"));
+        } else {
+            Check_Chunks(static_data, stem + ".lsd");
+            Check_Chunks(dynamic_data, stem + ".ldd");
         }
     }
+    return std::move(*level);
 }
 
 volatile std::sig_atomic_t stop_requested = 0;
@@ -381,9 +399,14 @@ int main(int argc, char **argv)
         }
         const auto directory = Resolve_Data_Directory(options.DataDir);
         const Settings settings = Load_Settings(options, directory);
-        Check_Game_Data(directory, settings);
+        const auto level = Load_Game_Data(directory, settings);
         std::cout << "Validated game data for " << settings.Maps.size() << " map(s); first map: "
-                  << settings.Maps.front() << std::endl;
+                  << settings.Maps.front() << '\n'
+                  << "Loaded headless scene: " << level.Static_Objects().size() << " static objects in "
+                  << level.Node_Count() << " spatial nodes, " << level.Buildings().size() << " buildings, "
+                  << level.Spawners().size() << " spawners (" << level.Count_Player_Spawns(PLAYERTYPE_NOD)
+                  << " Nod and " << level.Count_Player_Spawns(PLAYERTYPE_GDI) << " GDI soldier starts)"
+                  << std::endl;
         return options.CheckOnly ? 0 : Run_Headless(settings, options.BindAddress, bind_address);
     } catch (const std::exception &error) {
         std::cerr << "FDS: " << error.what() << '\n';
