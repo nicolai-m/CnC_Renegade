@@ -437,6 +437,12 @@ no_negative:
 		fstp		[ecx]						// x
 	}
 }
+#elif defined(__linux__)
+void Fast_Slerp(Quaternion& res, const Quaternion & p,const Quaternion & q,float alpha)
+{
+	// The Linux math build uses the standard trigonometric functions.
+	Slerp(res,p,q,alpha);
+}
 #else
 void __cdecl Fast_Slerp(Quaternion& res, const Quaternion & p,const Quaternion & q,float alpha)
 {		

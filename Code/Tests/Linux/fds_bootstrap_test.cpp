@@ -7,7 +7,9 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -17,12 +19,14 @@
 #include <thread>
 #include <vector>
 
+#include "coltype.h"
 #include "connect.h"
 #include "crc.h"
 #include "combatchunkid.h"
-#include "headless_level.h"
+#include "headless_collision.h"
 #include "netutil.h"
 #include "playertype.h"
+#include "w3d_file.h"
 
 namespace {
 
@@ -90,8 +94,8 @@ std::string Static_Data(uint32 last_link = 2)
 {
     const auto tree = Chunk(1, Bytes(uint32{0x10000}), false) + Tree_Node(0, 20, 3) +
         Tree_Node(6, 3, 0) + Tree_Node(-6, 3, 0);
-    auto linked_object = [](uint32 node, uint32 id) {
-        const std::array<float, 12> transform{1, 0, 0, 6, 0, 1, 0, 0, 0, 0, 1, 0};
+    auto linked_object = [](uint32 node, uint32 id, float x) {
+        const std::array<float, 12> transform{1, 0, 0, x, 0, 1, 0, 0, 0, 0, 1, 0};
         const auto vars = Chunk(0x660055, Micro(3, uint32{15}) + Micro(7, id), false);
         const auto model = Chunk(0x660056, Chunk(CHUNKID_WW3D_BEGIN,
             Chunk(0x555040, Micro(1, "TESTMESH") + Micro(2, transform), false)));
@@ -100,7 +104,81 @@ std::string Static_Data(uint32 last_link = 2)
     };
     return Chunk(CHUNKID_WWPHYS_BEGIN, Chunk(0x04433220, Chunk(0x4500, Chunk(0x104, tree)))) +
         Chunk(CHUNKID_WWPHYS_BEGIN + 1, Chunk(0x06090609, Chunk(0x770100,
-            linked_object(1, 30) + linked_object(1, 31) + linked_object(last_link, 32))));
+            linked_object(1, 30, 6) + linked_object(1, 31, 6) + linked_object(last_link, 32, -6))));
+}
+
+std::string Collision_Data(uint32 last_vertex = 2)
+{
+    W3dMeshHeader3Struct mesh{};
+    mesh.Attributes = W3D_MESH_FLAG_COLLISION_TYPE_PHYSICAL | W3D_MESH_FLAG_COLLISION_TYPE_PROJECTILE;
+    std::strcpy(mesh.ContainerName, "testmesh");
+    std::strcpy(mesh.MeshName, "terrain");
+    mesh.NumVertices = 3;
+    mesh.NumTris = 1;
+    const W3dVectorStruct vertices[]{{-2, 0, 0}, {2, 0, 0}, {0, 3, 0}};
+    const W3dTriStruct triangle{{0, 1, last_vertex}, SURFACE_TYPE_DIRT, {0, 0, 1}, 0};
+
+    auto box = [](const char *name, uint32 attributes, W3dVectorStruct center, W3dVectorStruct extent) {
+        W3dBoxStruct shape{};
+        std::strcpy(shape.Name, name);
+        shape.Attributes = attributes;
+        shape.Center = center;
+        shape.Extent = extent;
+        return Chunk(W3D_CHUNK_BOX, Bytes(shape), false);
+    };
+
+    W3dHierarchyStruct hierarchy{};
+    hierarchy.Version = W3D_MAKE_VERSION(4, 1);
+    hierarchy.NumPivots = 2;
+    std::strcpy(hierarchy.Name, "fixture_pivots");
+    W3dPivotStruct pivots[2]{};
+    pivots[0].ParentIdx = 0xffffffffu;
+    pivots[1].Translation.Z = 1.5f;
+    pivots[1].Rotation.Q[2] = std::sqrt(0.5f);
+    pivots[1].Rotation.Q[3] = std::sqrt(0.5f);
+
+    W3dHLodHeaderStruct hlod{};
+    hlod.LodCount = 2;
+    std::strcpy(hlod.Name, "testmesh");
+    std::strcpy(hlod.HierarchyName, "fixture_pivots");
+    W3dEmitterHeaderStruct emitter{};
+    std::strcpy(emitter.Name, "testmesh.smoke");
+    W3dHModelHeaderStruct hmodel{};
+    hmodel.Version = W3D_MAKE_VERSION(4, 1);
+    hmodel.NumConnections = 1;
+    std::strcpy(hmodel.Name, "legacy");
+    std::strcpy(hmodel.HierarchyName, "fixture_pivots");
+    W3dHModelNodeStruct hmodel_node{};
+    std::strcpy(hmodel_node.RenderObjName, "cover");
+    auto part = [](const char *name, uint32 bone) {
+        W3dHLodSubObjectStruct object{};
+        object.BoneIndex = bone;
+        std::strcpy(object.Name, name);
+        return Chunk(W3D_CHUNK_HLOD_SUB_OBJECT, Bytes(object), false);
+    };
+    auto parts = [](uint32 id, uint32 count, const std::string &objects) {
+        return Chunk(id, Chunk(W3D_CHUNK_HLOD_SUB_OBJECT_ARRAY_HEADER,
+            Bytes(W3dHLodArrayHeaderStruct{count, 0}), false) + objects);
+    };
+
+    return Chunk(W3D_CHUNK_MESH, Chunk(W3D_CHUNK_MESH_HEADER3, Bytes(mesh), false) +
+            Chunk(W3D_CHUNK_VERTICES, Bytes(vertices), false) +
+            Chunk(W3D_CHUNK_TRIANGLES, Bytes(triangle), false)) +
+        box("legacy.cover", W3D_BOX_ATTRIBUTE_ORIENTED | W3D_MESH_FLAG_COLLISION_TYPE_PROJECTILE,
+            {0, 0, 0}, {0.25f, 0.75f, 0.25f}) +
+        box("testmesh.camera", W3D_BOX_ATTRIBUTE_ALIGNED | W3D_MESH_FLAG_COLLISION_TYPE_CAMERA,
+            {1, 0, 0}, {0.75f, 0.25f, 0.25f}) +
+        box("testmesh.low", W3D_BOX_ATTRIBUTE_ALIGNED | W3D_MESH_FLAG_COLLISION_TYPE_PHYSICAL,
+            {0, 0, 0}, {2, 2, 1}) +
+        Chunk(W3D_CHUNK_EMITTER, Chunk(W3D_CHUNK_EMITTER_HEADER, Bytes(emitter), false)) +
+        Chunk(W3D_CHUNK_HIERARCHY, Chunk(W3D_CHUNK_HIERARCHY_HEADER, Bytes(hierarchy), false) +
+            Chunk(W3D_CHUNK_PIVOTS, Bytes(pivots), false)) +
+        Chunk(W3D_CHUNK_HMODEL, Chunk(W3D_CHUNK_HMODEL_HEADER, Bytes(hmodel), false) +
+            Chunk(W3D_CHUNK_COLLISION_NODE, Bytes(hmodel_node), false)) +
+        Chunk(W3D_CHUNK_HLOD, Chunk(W3D_CHUNK_HLOD_HEADER, Bytes(hlod), false) +
+            parts(W3D_CHUNK_HLOD_LOD_ARRAY, 1, part("testmesh.low", 0)) +
+            parts(W3D_CHUNK_HLOD_LOD_ARRAY, 2, part("testmesh.terrain", 0) + part("legacy", 1)) +
+            parts(W3D_CHUNK_HLOD_AGGREGATE_ARRAY, 2, part("testmesh.camera", 1) + part("testmesh.smoke", 1)));
 }
 
 std::string Dynamic_Data()
@@ -286,7 +364,10 @@ int main(int argc, char **argv)
         const auto dynamic_data = Dynamic_Data();
         Write_Archive(data / "always.dbs", {{"STRINGS.TDB", chunk}, {"OBJECTS.DDB", Definitions()}});
         std::ofstream(data / "ARMOR.ini") << "[Armor]\n";
-        Write_Archive(data / "C&C_Test.mix", {{"C&C_TEST.LDD", dynamic_data}, {"C&C_TEST.LSD", static_data}});
+        const auto dependencies = Chunk(0x04020527, Micro(1, "D:\\levels\\COLLIDERS.W3D"), false);
+        const auto collision_data = Collision_Data();
+        Write_Archive(data / "C&C_Test.mix", {{"C&C_TEST.LDD", dynamic_data}, {"C&C_TEST.LSD", static_data},
+            {"C&C_TEST.DEP", dependencies}, {"COLLIDERS.W3D", collision_data}});
         std::ofstream(master) << "[Server]\r\nConfig=settings.ini\r\nGameType=LAN\r\nPort=0\r\n";
         std::ofstream(settings) << "[settings]\nMapName=c&c_test.MIX ; first map\nMaxPlayers=16\n";
 
@@ -312,6 +393,29 @@ int main(int argc, char **argv)
             level.Buildings()[0].Position == Vector3(5, 1, 2) && !level.Buildings()[0].Powered,
             "Building placement and state did not survive loading");
 
+        const auto collision = HeadlessCollision::Load(level,
+            [&](const std::string &name) { return archive.Find(name); }, archive.Find("c&c_test.dep"));
+        Check(collision.Collider_Count() == 9 && collision.Incomplete_Object_Count() == 0,
+            "HLOD dependencies, top LOD or aggregate parts failed to load");
+        const Vector3 start(6.5f, 0.125f, 3), end(6.5f, 0.125f, -1);
+        const auto ground = collision.Cast_Ray(start, end, COLLISION_TYPE_PHYSICAL);
+        Check(ground && ground->ObjectIndex == 0 && ground->Fraction == 0.75f &&
+            ground->Point == Vector3(6.5f, 0.125f, 0) && ground->Normal == Vector3(0, 0, 1) &&
+            ground->Surface == SURFACE_TYPE_DIRT && !ground->StartsInside,
+            "Physical ray did not return the terrain triangle and its surface");
+        const auto cover = collision.Cast_Ray(start, end, COLLISION_TYPE_PROJECTILE);
+        Check(cover && std::abs(cover->Point.Z - 1.75f) < 0.0001f && !cover->StartsInside,
+            "Projectile ray missed the nearer rotated box");
+        const auto inside = collision.Cast_Ray(Vector3(6.5f, 0.125f, 1.5f), end, COLLISION_TYPE_PROJECTILE);
+        Check(inside && inside->StartsInside && inside->Fraction == 0,
+            "Projectile ray did not report that it started inside the collider");
+        const auto camera = collision.Cast_Ray(Vector3(7.5f, 0.125f, 3), Vector3(7.5f, 0.125f, -1),
+            COLLISION_TYPE_CAMERA);
+        Check(camera && std::abs(camera->Point.Z - 1.75f) < 0.0001f,
+            "Aligned aggregate box lost its translated center or world-aligned extents");
+        Check(!collision.Cast_Ray(Vector3(7.9f, 2, 3), Vector3(7.9f, 2, -1), COLLISION_TYPE_PHYSICAL),
+            "A ray that misses the terrain triangle but passes through its bounds must not hit");
+
         FdsProcess check(argv[1], fixture.Path, master, "--check");
         const auto check_status = check.Wait();
         Check(check_status == 0, "FDS rejected valid fixture: " + check.Output());
@@ -319,6 +423,9 @@ int main(int argc, char **argv)
             "FDS did not validate the configured map");
         Check(check.Output().find("3 static objects in 3 spatial nodes, 1 buildings, 2 spawners") != std::string::npos,
             "FDS did not load the headless scene before startup");
+        Check(check.Output().find("9 colliders, 0 static objects with incomplete geometry; "
+            "2/2 soldier-start ground rays hit") != std::string::npos,
+            "FDS did not load W3D collision from the selected map");
 
         FdsProcess server(argv[1], fixture.Path, master);
         const auto port = server.Wait_For_Port();
@@ -331,7 +438,7 @@ int main(int argc, char **argv)
         // The first entry claims an offset outside the archive's data section.
         {
             std::fstream broken(data / "C&C_Test.mix", std::ios::in | std::ios::out | std::ios::binary);
-            broken.seekp(16 + static_data.size() + dynamic_data.size() + 8);
+            broken.seekp(16 + static_data.size() + dynamic_data.size() + dependencies.size() + collision_data.size() + 8);
             Write_U32(broken, 0xffffff00u);
         }
         FdsProcess bad_mix(argv[1], fixture.Path, master, "--check");
@@ -342,6 +449,12 @@ int main(int argc, char **argv)
         FdsProcess bad_level(argv[1], fixture.Path, master, "--check");
         Check(bad_level.Wait() == 1 && bad_level.Output().find("invalid AAB tree node") != std::string::npos,
             "FDS accepted an out-of-range static object link in an otherwise valid archive");
+
+        Write_Archive(data / "C&C_Test.mix", {{"C&C_TEST.LDD", dynamic_data}, {"C&C_TEST.LSD", static_data},
+            {"C&C_TEST.DEP", dependencies}, {"COLLIDERS.W3D", Collision_Data(999)}});
+        FdsProcess bad_triangle(argv[1], fixture.Path, master, "--check");
+        Check(bad_triangle.Wait() == 1 && bad_triangle.Output().find("Invalid W3D triangle") != std::string::npos,
+            "FDS accepted an out-of-range W3D triangle index");
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';
         return 1;

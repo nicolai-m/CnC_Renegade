@@ -9,8 +9,11 @@
 #include <string>
 #include <utility>
 
-#include "chunkio.h"
+#include "aabox.h"
+#include "bounded_chunk_reader.h"
+#include "colmath.h"
 #include "combatchunkid.h"
+#include "lineseg.h"
 #include "playertype.h"
 
 namespace {
@@ -50,92 +53,7 @@ constexpr uint32 ObjectNodeIndex = 0x200;
 constexpr uint32 PhysVariables = 0x00660055;
 constexpr uint32 ModelVariables = 0x00555040;
 
-// Keep each read bounded by the enclosing chunk while using the original
-// ChunkLoadClass for its header and microchunk handling.
-class LevelReader {
-public:
-    explicit LevelReader(const GameDataFile &source)
-        : File(source.Open()), Chunks(File.get()), End(source.Length) {}
-
-    template<class Visit> void Each_Chunk(Visit visit)
-    {
-        const int limit = End;
-        while (File->Tell() < limit) {
-            Require(limit - File->Tell() >= static_cast<int>(sizeof(ChunkHeader)) && Chunks.Open_Chunk(),
-                "Invalid chunk header");
-            Set_Child_End(Chunks.Cur_Chunk_Length(), limit);
-            visit(Chunks.Cur_Chunk_ID());
-            Require(Chunks.Close_Chunk() && File->Tell() == End, "Cannot finish chunk");
-            End = limit;
-        }
-    }
-
-    template<class Visit> void In_Chunk(uint32 id, Visit visit)
-    {
-        bool seen = false;
-        Each_Chunk([&](uint32 child) {
-            if (child == id) {
-                Require(!seen, "Duplicate required chunk " + std::to_string(id));
-                seen = true;
-                visit();
-            }
-        });
-        Require(seen, "Missing required chunk " + std::to_string(id));
-    }
-
-    template<class Visit> void Each_Micro(Visit visit)
-    {
-        const int limit = End;
-        while (File->Tell() < limit) {
-            Require(limit - File->Tell() >= static_cast<int>(sizeof(MicroChunkHeader)) && Chunks.Open_Micro_Chunk(),
-                "Invalid microchunk header");
-            Set_Child_End(Chunks.Cur_Micro_Chunk_Length(), limit);
-            visit(Chunks.Cur_Micro_Chunk_ID());
-            Require(Chunks.Close_Micro_Chunk() && File->Tell() == End, "Cannot finish microchunk");
-            End = limit;
-        }
-    }
-
-    template<class T> T Value()
-    {
-        T result{};
-        Require(End - File->Tell() == static_cast<int>(sizeof(result)) &&
-            Chunks.Read(&result, sizeof(result)) == sizeof(result), "Invalid field size");
-        return result;
-    }
-
-    std::string Read_String()
-    {
-        const int size = End - File->Tell();
-        Require(size > 0, "Empty string field");
-        std::string result(size, '\0');
-        Require(Chunks.Read(result.data(), size) == static_cast<uint32>(size) &&
-            result.find('\0') == result.size() - 1, "Invalid terminated string field");
-        result.pop_back();
-        return result;
-    }
-
-    bool Has_Children() { return Chunks.Contains_Chunks() != 0; }
-
-    void Require(bool condition, const std::string &message) const
-    {
-        if (!condition) {
-            throw std::runtime_error(std::string(File->File_Name()) + ": " + message);
-        }
-    }
-
-private:
-    void Set_Child_End(uint32 size, int limit)
-    {
-        const int start = File->Tell();
-        Require(start <= limit && size <= static_cast<uint32>(limit - start), "Chunk extends past its container");
-        End = start + static_cast<int>(size);
-    }
-
-    std::unique_ptr<FileClass> File;
-    ChunkLoadClass Chunks;
-    int End;
-};
+using LevelReader = BoundedChunkReader;
 
 struct SavedBox {
     IOVector3Struct Center;
@@ -461,12 +379,26 @@ std::size_t HeadlessLevel::Count_Player_Spawns(int player_type) const
 
 std::vector<std::size_t> HeadlessLevel::Find_Static_Candidates(const Vector3 &point) const
 {
+    return Collect_Static_Candidates([&](const Bounds &box) { return box.Contains(point); });
+}
+
+std::vector<std::size_t> HeadlessLevel::Find_Static_Candidates(const Vector3 &start, const Vector3 &end) const
+{
+    const LineSegClass ray(start, end);
+    return Collect_Static_Candidates([&](const Bounds &box) {
+        CastResultStruct result;
+        return box.Contains(end) || CollisionMath::Collide(ray, AABoxClass(box.Center, box.Extent), &result);
+    });
+}
+
+template<class Intersects> std::vector<std::size_t> HeadlessLevel::Collect_Static_Candidates(Intersects intersects) const
+{
     std::vector<std::size_t> objects;
     std::vector<std::size_t> pending{0};
     while (!pending.empty()) {
         const auto &node = Nodes[pending.back()];
         pending.pop_back();
-        if (node.Box.Contains(point)) {
+        if (intersects(node.Box)) {
             objects.insert(objects.end(), node.Objects.begin(), node.Objects.end());
             if (node.Front != NoNode) { pending.push_back(node.Front); }
             if (node.Back != NoNode) { pending.push_back(node.Back); }

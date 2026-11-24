@@ -70,10 +70,14 @@ UDP on `127.0.0.1` by default, with port `4848` if the INI does not specify one.
 `--bind` and `--port` override the address and port. `SIGINT` and `SIGTERM` stop
 it cleanly.
 
-The spatial tree provides candidate object lookups. Mesh collision, live combat
-objects, the simulation loop, and game-session callbacks are still being ported,
-so the bootstrap refuses joins. Tests exercise scene loading, spatial queries,
-the UDP handshake, reliable delivery, and bootstrap startup and shutdown.
+The server uses the spatial tree to cast rays against static W3D triangles and
+collision boxes, including hierarchical models in their base pose. Startup
+reports loaded colliders, objects with incomplete geometry, and ground-ray hits
+at enabled soldier starts. Swept player and vehicle collision, animated and
+dynamic objects, the simulation loop, and game-session callbacks are still being
+ported, so the bootstrap refuses joins. Tests exercise scene loading, spatial
+queries, collision masks and hit results, the UDP handshake, reliable delivery,
+and bootstrap startup and shutdown.
 
 
 ### Level Edit (Public Release)

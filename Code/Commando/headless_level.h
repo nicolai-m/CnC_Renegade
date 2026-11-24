@@ -59,6 +59,7 @@ public:
     // Returns indices into Static_Objects() for the intersected tree nodes.
     // It does not test individual mesh geometry or collision flags.
     std::vector<std::size_t> Find_Static_Candidates(const Vector3 &point) const;
+    std::vector<std::size_t> Find_Static_Candidates(const Vector3 &start, const Vector3 &end) const;
 
 private:
     HeadlessLevel() = default;
@@ -74,6 +75,7 @@ private:
     void Load_Static(const GameDataFile &data);
     void Load_Dynamic(const GameDataFile &data, const GameDataFile &definitions,
         const std::optional<GameDataFile> &map_definitions);
+    template<class Intersects> std::vector<std::size_t> Collect_Static_Candidates(Intersects intersects) const;
 
     std::vector<Node> Nodes;
     std::vector<StaticObject> LevelStaticObjects;

@@ -43,12 +43,17 @@ target_include_directories(renegade_packet PUBLIC
 )
 
 add_library(renegade_level STATIC
+    Code/Commando/headless_collision.cpp
     Code/Commando/headless_level.cpp
+    Code/WWMath/colmathline.cpp
+    Code/WWMath/matrix3d.cpp
+    Code/WWMath/quat.cpp
+    Code/WWMath/tri.cpp
     Code/wwlib/chunkio.cpp
     Code/wwlib/mixarchive.cpp
 )
 target_link_libraries(renegade_level PUBLIC renegade_packet)
-target_include_directories(renegade_level PUBLIC Code/Commando Code/Combat Code/wwsaveload)
+target_include_directories(renegade_level PUBLIC Code/Commando Code/Combat Code/ww3d2 Code/wwsaveload)
 
 add_executable(renegade_fds Code/Commando/linux_fds.cpp)
 target_link_libraries(renegade_fds PRIVATE renegade_level)

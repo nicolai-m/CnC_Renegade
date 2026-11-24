@@ -12,11 +12,13 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "chunkio.h"
+#include "coltype.h"
 #include "connect.h"
-#include "headless_level.h"
+#include "headless_collision.h"
 #include "mixarchive.h"
 #include "netutil.h"
 #include "packetmgr.h"
@@ -294,7 +296,7 @@ void Check_Chunks(const GameDataFile &data, const std::string &name)
     }
 }
 
-HeadlessLevel Load_Game_Data(const fs::path &directory, const Settings &settings)
+HeadlessCollision Load_Game_Data(const fs::path &directory, const Settings &settings)
 {
     std::vector<MixArchive> core;
     for (const char *name : {"Always2.dat", "Always.dbs", "Always.dat"}) {
@@ -310,7 +312,7 @@ HeadlessLevel Load_Game_Data(const fs::path &directory, const Settings &settings
         throw std::runtime_error("Cannot read armor.ini");
     }
 
-    std::optional<HeadlessLevel> level;
+    std::optional<HeadlessCollision> collision;
     for (const auto &map : settings.Maps) {
         const auto map_path = Find_Child(directory, map);
         if (!map_path) {
@@ -326,15 +328,39 @@ HeadlessLevel Load_Game_Data(const fs::path &directory, const Settings &settings
         }
         const auto static_data = Find_Asset(directory, map_archives, stem + ".lsd");
         const auto dynamic_data = Find_Asset(directory, map_archives, stem + ".ldd");
-        if (!level) {
-            level = HeadlessLevel::Load(static_data, dynamic_data, definitions,
+        if (!collision) {
+            auto level = HeadlessLevel::Load(static_data, dynamic_data, definitions,
                 Find_Optional_Asset(directory, map_archives, stem + ".ddb"));
+            collision = HeadlessCollision::Load(std::move(level), [&](const std::string &name) {
+                auto asset = Find_Optional_Asset(directory, core, name);
+                return asset ? asset : Find_Optional_Asset(directory, map_archives, name);
+            }, Find_Optional_Asset(directory, map_archives, stem + ".dep"));
         } else {
             Check_Chunks(static_data, stem + ".lsd");
             Check_Chunks(dynamic_data, stem + ".ldd");
         }
     }
-    return std::move(*level);
+    return std::move(*collision);
+}
+
+void Report_Static_Collision(const HeadlessCollision &collision)
+{
+    std::size_t starts = 0;
+    std::size_t hits = 0;
+    for (const auto &spawn : collision.Level().Spawners()) {
+        if (spawn.Enabled && spawn.SoldierStartup && !spawn.Primary) {
+            ++starts;
+            const auto position = spawn.Transform.Get_Translation();
+            const auto hit = collision.Cast_Ray(position + Vector3(0, 0, 2), position - Vector3(0, 0, 8),
+                COLLISION_TYPE_PHYSICAL);
+            if (hit && !hit->StartsInside) {
+                ++hits;
+            }
+        }
+    }
+    std::cout << "Loaded static W3D collision: " << collision.Collider_Count() << " colliders, "
+              << collision.Incomplete_Object_Count() << " static objects with incomplete geometry; "
+              << hits << '/' << starts << " soldier-start ground rays hit\n";
 }
 
 volatile std::sig_atomic_t stop_requested = 0;
@@ -399,14 +425,15 @@ int main(int argc, char **argv)
         }
         const auto directory = Resolve_Data_Directory(options.DataDir);
         const Settings settings = Load_Settings(options, directory);
-        const auto level = Load_Game_Data(directory, settings);
+        const auto collision = Load_Game_Data(directory, settings);
+        const auto &level = collision.Level();
         std::cout << "Validated game data for " << settings.Maps.size() << " map(s); first map: "
                   << settings.Maps.front() << '\n'
                   << "Loaded headless scene: " << level.Static_Objects().size() << " static objects in "
                   << level.Node_Count() << " spatial nodes, " << level.Buildings().size() << " buildings, "
                   << level.Spawners().size() << " spawners (" << level.Count_Player_Spawns(PLAYERTYPE_NOD)
-                  << " Nod and " << level.Count_Player_Spawns(PLAYERTYPE_GDI) << " GDI soldier starts)"
-                  << std::endl;
+                  << " Nod and " << level.Count_Player_Spawns(PLAYERTYPE_GDI) << " GDI soldier starts)\n";
+        Report_Static_Collision(collision);
         return options.CheckOnly ? 0 : Run_Headless(settings, options.BindAddress, bind_address);
     } catch (const std::exception &error) {
         std::cerr << "FDS: " << error.what() << '\n';
