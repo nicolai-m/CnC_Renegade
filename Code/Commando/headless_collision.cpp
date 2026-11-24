@@ -12,6 +12,7 @@
 #include "colmath.h"
 #include "coltype.h"
 #include "lineseg.h"
+#include "obbox.h"
 #include "quat.h"
 #include "tri.h"
 #include "w3d_file.h"
@@ -78,6 +79,20 @@ std::vector<ModelPart> Read_Subobjects(ChunkReader &reader)
     return objects;
 }
 
+Vector3 Sweep_Extent(const OBBoxClass &box)
+{
+    Vector3 extent;
+    box.Compute_Axis_Aligned_Extent(&extent);
+    // Retain the culling margin used by OBBoxCollisionTestClass.
+    return extent + Vector3(0.01f, 0.01f, 0.01f);
+}
+
+bool Prefer_Hit(const CastResultStruct &hit, const CastResultStruct &best, const Vector3 &move)
+{
+    return hit.Fraction < best.Fraction || (hit.Fraction == best.Fraction &&
+        Vector3::Dot_Product(hit.Normal, move) < Vector3::Dot_Product(best.Normal, move));
+}
+
 } // namespace
 
 struct HeadlessCollision::Geometry {
@@ -85,6 +100,7 @@ struct HeadlessCollision::Geometry {
         uint32 Vertices[3];
         Vector3 Normal;
         uint8 Surface;
+        bool HasArea;
     };
 
     enum class Type { Mesh, AlignedBox, OrientedBox };
@@ -93,7 +109,56 @@ struct HeadlessCollision::Geometry {
     AABoxClass Bounds;
     std::vector<Vector3> Vertices;
     std::vector<Triangle> Triangles;
+
+    TriClass Get_Triangle(const Triangle &triangle) const;
+    bool Sweep_Mesh(const OBBoxClass &box, const Vector3 &move, CastResultStruct &best) const;
 };
+
+TriClass HeadlessCollision::Geometry::Get_Triangle(const Triangle &triangle) const
+{
+    TriClass tri;
+    tri.V[0] = &Vertices[triangle.Vertices[0]];
+    tri.V[1] = &Vertices[triangle.Vertices[1]];
+    tri.V[2] = &Vertices[triangle.Vertices[2]];
+    tri.N = &triangle.Normal;
+    return tri;
+}
+
+bool HeadlessCollision::Geometry::Sweep_Mesh(const OBBoxClass &box, const Vector3 &move,
+    CastResultStruct &best) const
+{
+    CastResultStruct bounds_hit;
+    if (!CollisionMath::Collide(LineSegClass(box.Center, box.Center + move),
+            AABoxClass(Bounds.Center, Bounds.Extent + Sweep_Extent(box)), &bounds_hit)) {
+        return false;
+    }
+
+    const Vector3 stationary(0, 0, 0);
+    for (const auto &triangle : Triangles) {
+        if (!triangle.HasArea) {
+            continue;
+        }
+        CastResultStruct hit;
+        hit.ComputeContactPoint = true;
+        if (CollisionMath::Collide(box, move, Get_Triangle(triangle), stationary, &hit)) {
+            hit.SurfaceType = triangle.Surface;
+            if (hit.StartBad) {
+                best = hit;
+                return true;
+            }
+            if (Prefer_Hit(hit, best, move)) {
+                best = hit;
+            }
+        }
+    }
+    return best.Fraction < 1.0f;
+}
+
+AABoxClass HeadlessCollision::Collider::Aligned_Box() const
+{
+    // AABoxRenderObjClass keeps the center offset and extents world-aligned.
+    return AABoxClass(Transform.Get_Translation() + Shape->Bounds.Center, Shape->Bounds.Extent);
+}
 
 struct HeadlessCollision::Loader {
     struct Model {
@@ -177,8 +242,12 @@ struct HeadlessCollision::Loader {
             reader.Require(tri.Vindex[0] < shape->Vertices.size() && tri.Vindex[1] < shape->Vertices.size() &&
                 tri.Vindex[2] < shape->Vertices.size() && Finite(To_Vector(tri.Normal)),
                 "Invalid W3D triangle");
+            const auto &origin = shape->Vertices[tri.Vindex[0]];
+            const auto edge1 = shape->Vertices[tri.Vindex[1]] - origin;
+            const auto edge2 = shape->Vertices[tri.Vindex[2]] - origin;
+            const bool has_area = Vector3::Cross_Product(edge1, edge2).Length2() > 0.0f;
             shape->Triangles.push_back({{tri.Vindex[0], tri.Vindex[1], tri.Vindex[2]},
-                To_Vector(tri.Normal), static_cast<uint8>(tri.Attributes)});
+                To_Vector(tri.Normal), static_cast<uint8>(tri.Attributes), has_area});
         }
         Model model;
         model.Shape = std::move(shape);
@@ -454,12 +523,7 @@ std::optional<HeadlessCollision::RayHit> HeadlessCollision::Cast_Ray(const Vecto
                 result.Reset();
                 result.Fraction = nearest;
                 for (const auto &triangle : shape.Triangles) {
-                    TriClass tri;
-                    tri.V[0] = &shape.Vertices[triangle.Vertices[0]];
-                    tri.V[1] = &shape.Vertices[triangle.Vertices[1]];
-                    tri.V[2] = &shape.Vertices[triangle.Vertices[2]];
-                    tri.N = &triangle.Normal;
-                    if (CollisionMath::Collide(ray, tri, &result)) {
+                    if (CollisionMath::Collide(ray, shape.Get_Triangle(triangle), &result)) {
                         result.SurfaceType = triangle.Surface;
                     }
                 }
@@ -467,9 +531,7 @@ std::optional<HeadlessCollision::RayHit> HeadlessCollision::Cast_Ray(const Vecto
                     continue;
                 }
             } else {
-                // AABoxRenderObjClass keeps both the center offset and extents world-aligned.
-                const auto box = aligned ? AABoxClass(collider.Transform.Get_Translation() + shape.Bounds.Center,
-                    shape.Bounds.Extent) : shape.Bounds;
+                const auto box = aligned ? collider.Aligned_Box() : shape.Bounds;
                 if (!CollisionMath::Collide(ray, box, &result)) {
                     continue;
                 }
@@ -484,6 +546,56 @@ std::optional<HeadlessCollision::RayHit> HeadlessCollision::Cast_Ray(const Vecto
             }
             hit = RayHit{index, result.Fraction, start + result.Fraction * world_ray.Get_DP(),
                 normal, result.SurfaceType, false};
+        }
+    }
+    return hit;
+}
+
+std::optional<HeadlessCollision::BoxHit> HeadlessCollision::Sweep_Box(const AABoxClass &box, const Vector3 &move,
+    unsigned mask) const
+{
+    return Sweep_Box(OBBoxClass(box.Center, box.Extent), move, mask);
+}
+
+std::optional<HeadlessCollision::BoxHit> HeadlessCollision::Sweep_Box(const OBBoxClass &box, const Vector3 &move,
+    unsigned mask) const
+{
+    const Vector3 stationary(0, 0, 0);
+    CastResultStruct best;
+    std::optional<BoxHit> hit;
+    for (const auto index : Scene.Find_Static_Candidates(box.Center, box.Center + move, Sweep_Extent(box))) {
+        for (const auto &collider : Objects[index]) {
+            const auto &shape = *collider.Shape;
+            if (!(shape.Mask & mask)) {
+                continue;
+            }
+            CastResultStruct result;
+            result.ComputeContactPoint = true;
+            if (shape.Kind == Geometry::Type::AlignedBox) {
+                if (!CollisionMath::Collide(box, move, collider.Aligned_Box(), stationary, &result)) {
+                    continue;
+                }
+            } else {
+                OBBoxClass local_box;
+                OBBoxClass::Transform(collider.Inverse, box, &local_box);
+                Vector3 local_move;
+                Matrix3D::Rotate_Vector(collider.Inverse, move, &local_move);
+                const bool collided = shape.Kind == Geometry::Type::Mesh ?
+                    shape.Sweep_Mesh(local_box, local_move, result) :
+                    CollisionMath::Collide(local_box, local_move, shape.Bounds, stationary, &result);
+                if (!collided) {
+                    continue;
+                }
+                Matrix3D::Rotate_Vector(collider.Transform, result.Normal, &result.Normal);
+                result.ContactPoint = collider.Transform * result.ContactPoint;
+            }
+            if (result.StartBad) {
+                return BoxHit{index, 0, result.Normal, std::nullopt, result.SurfaceType, true};
+            }
+            if (Prefer_Hit(result, best, move)) {
+                best = result;
+                hit = BoxHit{index, result.Fraction, result.Normal, result.ContactPoint, result.SurfaceType, false};
+            }
         }
     }
     return hit;

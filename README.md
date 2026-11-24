@@ -70,14 +70,17 @@ UDP on `127.0.0.1` by default, with port `4848` if the INI does not specify one.
 `--bind` and `--port` override the address and port. `SIGINT` and `SIGTERM` stop
 it cleanly.
 
-The server uses the spatial tree to cast rays against static W3D triangles and
-collision boxes, including hierarchical models in their base pose. Startup
-reports loaded colliders, objects with incomplete geometry, and ground-ray hits
-at enabled soldier starts. Swept player and vehicle collision, animated and
-dynamic objects, the simulation loop, and game-session callbacks are still being
-ported, so the bootstrap refuses joins. Tests exercise scene loading, spatial
-queries, collision masks and hit results, the UDP handshake, reliable delivery,
-and bootstrap startup and shutdown.
+The server uses the spatial tree for rays and swept boxes against static W3D
+triangles and collision boxes, including hierarchical models in their base pose.
+Box sweeps take an axis-aligned or oriented hull and test translation at a fixed
+orientation. The result includes the first contact or an initial overlap.
+Startup reports both ground-ray and box-sweep results at enabled soldier starts.
+The box probe uses the soldier debug box dimensions with its feet 0.25 m above
+the saved position.
+The bootstrap refuses joins while player and vehicle movement, animated and
+dynamic objects, the simulation loop, and game-session callbacks are being
+ported. Tests exercise scene loading, collision masks and hit results, the UDP
+handshake, reliable delivery, and bootstrap startup and shutdown.
 
 
 ### Level Edit (Public Release)

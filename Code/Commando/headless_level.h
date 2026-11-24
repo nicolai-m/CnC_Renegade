@@ -60,6 +60,8 @@ public:
     // It does not test individual mesh geometry or collision flags.
     std::vector<std::size_t> Find_Static_Candidates(const Vector3 &point) const;
     std::vector<std::size_t> Find_Static_Candidates(const Vector3 &start, const Vector3 &end) const;
+    std::vector<std::size_t> Find_Static_Candidates(const Vector3 &start, const Vector3 &end,
+        const Vector3 &extent) const;
 
 private:
     HeadlessLevel() = default;

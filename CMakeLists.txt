@@ -46,6 +46,9 @@ add_library(renegade_level STATIC
     Code/Commando/headless_collision.cpp
     Code/Commando/headless_level.cpp
     Code/WWMath/colmathline.cpp
+    Code/WWMath/colmathobbobb.cpp
+    Code/WWMath/colmathobbtri.cpp
+    Code/WWMath/matrix3.cpp
     Code/WWMath/matrix3d.cpp
     Code/WWMath/quat.cpp
     Code/WWMath/tri.cpp

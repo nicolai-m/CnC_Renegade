@@ -384,10 +384,18 @@ std::vector<std::size_t> HeadlessLevel::Find_Static_Candidates(const Vector3 &po
 
 std::vector<std::size_t> HeadlessLevel::Find_Static_Candidates(const Vector3 &start, const Vector3 &end) const
 {
+    return Find_Static_Candidates(start, end, Vector3(0, 0, 0));
+}
+
+std::vector<std::size_t> HeadlessLevel::Find_Static_Candidates(const Vector3 &start, const Vector3 &end,
+    const Vector3 &extent) const
+{
     const LineSegClass ray(start, end);
     return Collect_Static_Candidates([&](const Bounds &box) {
+        const Bounds expanded{box.Center, box.Extent + extent};
         CastResultStruct result;
-        return box.Contains(end) || CollisionMath::Collide(ray, AABoxClass(box.Center, box.Extent), &result);
+        return expanded.Contains(end) ||
+            CollisionMath::Collide(ray, AABoxClass(expanded.Center, expanded.Extent), &result);
     });
 }
 

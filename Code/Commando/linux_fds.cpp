@@ -15,6 +15,7 @@
 #include <utility>
 #include <vector>
 
+#include "aabox.h"
 #include "chunkio.h"
 #include "coltype.h"
 #include "connect.h"
@@ -346,21 +347,37 @@ HeadlessCollision Load_Game_Data(const fs::path &directory, const Settings &sett
 void Report_Static_Collision(const HeadlessCollision &collision)
 {
     std::size_t starts = 0;
-    std::size_t hits = 0;
+    std::size_t ray_hits = 0;
+    std::size_t box_hits = 0;
+    std::size_t box_overlaps = 0;
+    // Use the dimensions of the soldier debug box for this startup probe.
+    const Vector3 probe_extent(0.3f, 0.3f, 1.0f);
+    const Vector3 ray_start(0, 0, 2);
+    const Vector3 ray_end(0, 0, -8);
+    const Vector3 foot_clearance(0, 0, 0.25f);
+    const Vector3 probe_center = foot_clearance + Vector3(0, 0, probe_extent.Z);
     for (const auto &spawn : collision.Level().Spawners()) {
         if (spawn.Enabled && spawn.SoldierStartup && !spawn.Primary) {
             ++starts;
             const auto position = spawn.Transform.Get_Translation();
-            const auto hit = collision.Cast_Ray(position + Vector3(0, 0, 2), position - Vector3(0, 0, 8),
-                COLLISION_TYPE_PHYSICAL);
-            if (hit && !hit->StartsInside) {
-                ++hits;
+            const auto ray = collision.Cast_Ray(position + ray_start, position + ray_end, COLLISION_TYPE_PHYSICAL);
+            if (ray && !ray->StartsInside) {
+                ++ray_hits;
+            }
+            const AABoxClass probe(position + probe_center, probe_extent);
+            if (const auto box = collision.Sweep_Box(probe, ray_end - foot_clearance, COLLISION_TYPE_PHYSICAL)) {
+                if (box->StartsInside) {
+                    ++box_overlaps;
+                } else {
+                    ++box_hits;
+                }
             }
         }
     }
     std::cout << "Loaded static W3D collision: " << collision.Collider_Count() << " colliders, "
               << collision.Incomplete_Object_Count() << " static objects with incomplete geometry; "
-              << hits << '/' << starts << " soldier-start ground rays hit\n";
+              << ray_hits << '/' << starts << " soldier-start ground rays hit; "
+              << box_hits << '/' << starts << " ground box sweeps hit (" << box_overlaps << " initial overlaps)\n";
 }
 
 volatile std::sig_atomic_t stop_requested = 0;

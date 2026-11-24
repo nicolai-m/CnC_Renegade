@@ -19,12 +19,14 @@
 #include <thread>
 #include <vector>
 
+#include "aabox.h"
 #include "coltype.h"
 #include "connect.h"
 #include "crc.h"
 #include "combatchunkid.h"
 #include "headless_collision.h"
 #include "netutil.h"
+#include "obbox.h"
 #include "playertype.h"
 #include "w3d_file.h"
 
@@ -164,7 +166,8 @@ std::string Collision_Data(uint32 last_vertex = 2)
     return Chunk(W3D_CHUNK_MESH, Chunk(W3D_CHUNK_MESH_HEADER3, Bytes(mesh), false) +
             Chunk(W3D_CHUNK_VERTICES, Bytes(vertices), false) +
             Chunk(W3D_CHUNK_TRIANGLES, Bytes(triangle), false)) +
-        box("legacy.cover", W3D_BOX_ATTRIBUTE_ORIENTED | W3D_MESH_FLAG_COLLISION_TYPE_PROJECTILE,
+        box("legacy.cover", W3D_BOX_ATTRIBUTE_ORIENTED | W3D_MESH_FLAG_COLLISION_TYPE_PROJECTILE |
+            W3D_MESH_FLAG_COLLISION_TYPE_VEHICLE,
             {0, 0, 0}, {0.25f, 0.75f, 0.25f}) +
         box("testmesh.camera", W3D_BOX_ATTRIBUTE_ALIGNED | W3D_MESH_FLAG_COLLISION_TYPE_CAMERA,
             {1, 0, 0}, {0.75f, 0.25f, 0.25f}) +
@@ -195,6 +198,58 @@ std::string Dynamic_Data()
             Chunk(910991407, Micro(2, sint32{300}) + Micro(3, sint32{42}), false))));
     const auto objects = Chunk(916991654, Chunk(916991653, building));
     return Chunk(1011991649, Chunk(CHUNKID_COMBAT, objects + spawners));
+}
+
+void Check_Box_Sweeps(const HeadlessCollision &collision)
+{
+    const Vector3 drop(0, 0, -4);
+    const Vector3 soldier_extent(0.3f, 0.3f, 0.5f);
+    const auto soldier = collision.Sweep_Box(AABoxClass(Vector3(6.5f, 0.125f, 3), soldier_extent),
+        drop, COLLISION_TYPE_PHYSICAL);
+    Check(soldier && soldier->ObjectIndex == 0 && !soldier->StartsInside &&
+        std::abs(soldier->Fraction - 0.625f) < 0.0001f && soldier->Normal == Vector3(0, 0, 1) &&
+        soldier->ContactPoint && std::abs(soldier->ContactPoint->Z) < 0.0001f &&
+        soldier->Surface == SURFACE_TYPE_DIRT, "Soldier sweep did not return the terrain contact");
+
+    const AABoxClass edge(Vector3(9.125f, 0.5f, 3), Vector3(1.5f, 0.25f, 0.5f));
+    Check(!collision.Cast_Ray(edge.Center, edge.Center + drop, COLLISION_TYPE_PHYSICAL) &&
+        collision.Sweep_Box(edge, drop, COLLISION_TYPE_PHYSICAL),
+        "The full box must reach terrain even when its center ray lies outside the spatial node");
+    Check(!collision.Sweep_Box(AABoxClass(Vector3(7.9f, 2, 3), Vector3(0.1f, 0.1f, 0.5f)),
+        drop, COLLISION_TYPE_PHYSICAL), "Triangle bounds alone must not block a sweep");
+
+    const AABoxClass touching(Vector3(6, 1, 0.5f), soldier_extent);
+    Check(!collision.Sweep_Box(touching, Vector3(0.25f, 0, 0), COLLISION_TYPE_PHYSICAL) &&
+        !collision.Sweep_Box(touching, -drop, COLLISION_TYPE_PHYSICAL), "Contact must allow sliding and moving away");
+    const auto overlap = collision.Sweep_Box(AABoxClass(Vector3(6, 1, 0.1f), soldier_extent),
+        Vector3(0, 0, 0), COLLISION_TYPE_PHYSICAL);
+    Check(overlap && overlap->StartsInside && overlap->Fraction == 0 && !overlap->ContactPoint &&
+        overlap->Surface == SURFACE_TYPE_DIRT, "Stationary ground penetration was not detected");
+
+    constexpr unsigned vehicle_mask = COLLISION_TYPE_PHYSICAL | COLLISION_TYPE_VEHICLE;
+    const auto yaw = Create_Z_Rotation_Matrix3(0.7853981634f);
+    const OBBoxClass vehicle(Vector3(6.5f, 2, 1.5f), Vector3(0.5f, 0.2f, 0.25f), yaw);
+    const Vector3 drive(0, -4, 0);
+    const float expected = (2.0f - 0.25f - vehicle.Project_To_Axis(Vector3(0, 1, 0))) / 4;
+    const auto cover = collision.Sweep_Box(vehicle, drive, vehicle_mask);
+    Check(cover && !cover->StartsInside && std::abs(cover->Fraction - expected) < 0.0001f &&
+        (cover->Normal - Vector3(0, 1, 0)).Length() < 0.0001f && cover->ContactPoint &&
+        std::abs(cover->ContactPoint->Y - 0.25f) < 0.0001f,
+        "Rotated vehicle sweep did not return a world-space contact on the vehicle collider");
+    Check(!collision.Sweep_Box(vehicle, drive, COLLISION_TYPE_PHYSICAL),
+        "The physical-only mask must ignore the vehicle collider");
+
+    const OBBoxClass vehicle_drop(Vector3(6.5f, 0.125f, 3), vehicle.Extent, yaw);
+    const auto first = collision.Sweep_Box(vehicle_drop, drop, vehicle_mask);
+    Check(first && !first->StartsInside && std::abs(first->Fraction - 0.25f) < 0.0001f &&
+        first->ContactPoint && std::abs(first->ContactPoint->Z - 1.75f) < 0.0001f,
+        "The nearer vehicle collider must stop the sweep before the terrain");
+
+    const OBBoxClass aligned_target(Vector3(7.5f, 0.125f, 3), vehicle.Extent, yaw);
+    const auto camera = collision.Sweep_Box(aligned_target, drop, COLLISION_TYPE_CAMERA);
+    Check(camera && !camera->StartsInside && camera->ContactPoint &&
+        std::abs(camera->ContactPoint->Z - 1.75f) < 0.0001f,
+        "The sweep lost the aligned collider offset within its rotated hierarchy");
 }
 
 std::string Definitions()
@@ -415,6 +470,7 @@ int main(int argc, char **argv)
             "Aligned aggregate box lost its translated center or world-aligned extents");
         Check(!collision.Cast_Ray(Vector3(7.9f, 2, 3), Vector3(7.9f, 2, -1), COLLISION_TYPE_PHYSICAL),
             "A ray that misses the terrain triangle but passes through its bounds must not hit");
+        Check_Box_Sweeps(collision);
 
         FdsProcess check(argv[1], fixture.Path, master, "--check");
         const auto check_status = check.Wait();
@@ -424,7 +480,7 @@ int main(int argc, char **argv)
         Check(check.Output().find("3 static objects in 3 spatial nodes, 1 buildings, 2 spawners") != std::string::npos,
             "FDS did not load the headless scene before startup");
         Check(check.Output().find("9 colliders, 0 static objects with incomplete geometry; "
-            "2/2 soldier-start ground rays hit") != std::string::npos,
+            "2/2 soldier-start ground rays hit; 2/2 ground box sweeps hit (0 initial overlaps)") != std::string::npos,
             "FDS did not load W3D collision from the selected map");
 
         FdsProcess server(argv[1], fixture.Path, master);
