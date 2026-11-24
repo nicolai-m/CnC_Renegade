@@ -20,6 +20,7 @@
 #include "coltype.h"
 #include "connect.h"
 #include "headless_collision.h"
+#include "headless_player_session.h"
 #include "headless_simulation.h"
 #include "mixarchive.h"
 #include "netutil.h"
@@ -423,14 +424,17 @@ int Run_Headless(const Settings &settings, const std::string &address, const in_
         throw std::runtime_error("Cannot bind UDP to " + address + ":" + std::to_string(settings.Port));
     }
 
-    HeadlessSimulation simulation(collision);
+    HeadlessPlayerSession session(collision, server);
+    server.Install_Server_Packet_Handler([&](cPacket &packet, int peer_id) { session.Receive_Control(packet, peer_id); });
+    server.Install_Server_Broken_Connection_Handler([&](int peer_id) { session.Remove_Player(peer_id); });
+    server.Install_Eviction_Handler([&](int peer_id) { session.Remove_Player(peer_id); });
     std::cout << "FDS bootstrap listening on " << address << ':' << server.Get_Local_Port()
               << " (game session pending; joins refused)" << std::endl;
     auto previous = HeadlessSimulation::Clock::now();
     while (!stop_requested) {
         const auto frame_start = HeadlessSimulation::Clock::now();
         server.Service_Read();
-        simulation.Advance(frame_start - previous);
+        session.Advance(frame_start - previous);
         previous = frame_start;
         server.Service_Send(true);
         std::this_thread::sleep_until(frame_start + std::chrono::milliseconds(10));

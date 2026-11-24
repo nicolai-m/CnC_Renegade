@@ -83,10 +83,12 @@ Soldiers use the debug-sized collision box, a fixed movement speed of 4 m/s,
 gravity, and sliding against static geometry. With `--check`, the server also
 reports whether it can place a grounded soldier for each team.
 
-The bootstrap refuses joins while client input and object updates, animated
-and dynamic collision, vehicle movement, and match rules are being ported.
-Tests exercise soldier spawns, movement and wall contacts, the UDP handshake,
-reliable delivery, and bootstrap startup and shutdown.
+The player session reads original `CClientControl` movement samples and sends
+the owning peer frequent soldier updates with server position and movement
+state. The UDP integration test attaches a soldier explicitly and exercises
+movement, collision, and update delivery. The bootstrap refuses joins while
+the original client login, map loading, and initial game object creation are
+being ported.
 
 
 ### Level Edit (Public Release)

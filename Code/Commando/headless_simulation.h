@@ -20,12 +20,15 @@ public:
         int PlayerType;
         int SpawnerId;
         Vector3 Position; // Feet in world space.
+        Vector3 Velocity;
+        float SpawnHeading;
         bool Grounded;
     };
 
     explicit HeadlessSimulation(const HeadlessCollision &collision);
 
     bool Spawn_Soldier(int player_id, int player_type);
+    void Remove_Soldier(int player_id);
     const Soldier *Find_Soldier(int player_id) const;
 
     // World-space movement axes in [-1, 1], held until the next input.

@@ -47,11 +47,18 @@ bool HeadlessSimulation::Spawn_Soldier(int player_id, int player_type)
             continue;
         }
         if (const auto position = Find_Stand_Position(spawner.Transform.Get_Translation(), SpawnDrop)) {
-            Soldiers.emplace(player_id, Actor{Soldier{player_type, spawner.Id, *position, true}});
+            const auto forward = spawner.Transform.Get_X_Vector();
+            Soldiers.emplace(player_id, Actor{Soldier{player_type, spawner.Id, *position, Vector3(0, 0, 0),
+                std::atan2(forward.Y, forward.X), true}});
             return true;
         }
     }
     return false;
+}
+
+void HeadlessSimulation::Remove_Soldier(int player_id)
+{
+    Soldiers.erase(player_id);
 }
 
 const HeadlessSimulation::Soldier *HeadlessSimulation::Find_Soldier(int player_id) const
@@ -125,6 +132,7 @@ void HeadlessSimulation::Tick()
     for (auto &entry : Soldiers) {
         auto &actor = entry.second;
         auto &soldier = actor.State;
+        const auto previous_position = soldier.Position;
         actor.VerticalSpeed -= Gravity * TickSeconds;
         const Vector3 velocity(actor.MoveInput.X * MoveSpeed, actor.MoveInput.Y * MoveSpeed, actor.VerticalSpeed);
         Slide_Soldier(soldier, TickSeconds * velocity);
@@ -135,5 +143,6 @@ void HeadlessSimulation::Tick()
             soldier.Position = *ground;
             actor.VerticalSpeed = 0;
         }
+        soldier.Velocity = (soldier.Position - previous_position) / TickSeconds;
     }
 }

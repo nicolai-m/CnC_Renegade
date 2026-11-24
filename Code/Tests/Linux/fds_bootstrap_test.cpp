@@ -26,9 +26,11 @@
 #include "crc.h"
 #include "combatchunkid.h"
 #include "headless_collision.h"
+#include "headless_player_session.h"
 #include "headless_simulation.h"
 #include "netutil.h"
 #include "obbox.h"
+#include "packetmgr.h"
 #include "playertype.h"
 #include "w3d_file.h"
 
@@ -453,6 +455,201 @@ void Check_Join_Refused(unsigned short port)
         "FDS bootstrap should refuse a join until the game session is ready");
 }
 
+constexpr UINT MovementTestToken = 0x52454e47u;
+constexpr int SoldierObject = 1500000000;
+constexpr int FirstControlObject = 2110000001;
+constexpr int TestBandwidth = 1000000;
+
+struct MovementSnapshot {
+    Vector3 Position;
+    Vector3 Velocity{0, 0, 0};
+    bool Airborne = false;
+};
+
+std::vector<MovementSnapshot> MovementSnapshots;
+
+ULONG Fixture_Position_Code(float coordinate)
+{
+    // The fixture map has extents [-20, 20] on each axis. The original
+    // client adds a one-metre margin and uses 8 bits for this range.
+    return static_cast<ULONG>(std::round((coordinate + 21.0f) * (255.0f / 42.0f)));
+}
+
+void Receive_Movement_Snapshot(cPacket &packet)
+{
+    int object;
+    BYTE dirty;
+    bool flag;
+    Check(packet.Get(object) == SoldierObject && packet.Get(dirty) == 1 &&
+        !packet.Get(flag) && !packet.Get(flag) && !packet.Get(flag),
+        "Server did not publish an original-format soldier update");
+    MovementSnapshot snapshot;
+    ULONG value;
+    for (int axis = 0; axis < 3; ++axis) {
+        packet.Get_Bits(value, 8);
+        snapshot.Position[axis] = -21.0f + static_cast<float>(value) * (42.0f / 255.0f);
+    }
+    packet.Get_Bits(value, 5);
+    Check(value == 0 || value == 5, "The soldier should publish the upright or airborne state");
+    snapshot.Airborne = value == 5;
+    packet.Get_Bits(value, 9);
+    if (snapshot.Airborne) {
+        packet.Get(snapshot.Velocity.X);
+        packet.Get(snapshot.Velocity.Y);
+        packet.Get(snapshot.Velocity.Z);
+    }
+    Check(!packet.Get(flag) && !packet.Get(flag), "Unexpected damage or host bone");
+    packet.Get_Bits(value, 24); // Aiming target.
+    packet.Get_Bits(value, 4); // Continuous control flags.
+    packet.Get_Bits(value, 32); // Four analog axes.
+    Check(packet.Is_Flushed(), "Soldier update had an unexpected field layout");
+    MovementSnapshots.push_back(snapshot);
+}
+
+void Write_Movement(cPacket &packet, int control_object, int owner, int soldier, float target_y)
+{
+    packet.Add(control_object);
+    packet.Add(static_cast<BYTE>(owner ? 15 : 1));
+    packet.Add(false);
+    if (owner) {
+        packet.Add(1018); // NETCLASSID_CLIENTCONTROL.
+        packet.Add(owner);
+    }
+    packet.Add(soldier);
+    if (soldier == -1) {
+        return;
+    }
+    packet.Add_Bits(0, 23); // One-time control flags.
+    packet.Add_Bits(0, 4); // Continuous control flags.
+    packet.Add_Bits(255, 8); // Full forward input.
+    packet.Add_Bits(128, 8); // Neutral strafe.
+    packet.Add_Bits(128, 8); // Neutral vertical input.
+    packet.Add_Bits(128, 8); // Neutral turning input.
+    packet.Add(false); // Sniping.
+    packet.Add(true); // Optional checksum follows.
+    packet.Add(12345);
+    packet.Add_Bits(Fixture_Position_Code(0), 8);
+    packet.Add_Bits(Fixture_Position_Code(target_y), 8);
+    packet.Add_Bits(Fixture_Position_Code(0), 8);
+}
+
+void Check_Player_Transport(const HeadlessCollision &collision)
+{
+    Check(cNetUtil::Protocol_Init(false), "IPv4 unavailable for player updates");
+    PacketManager.Set_Is_Server(true);
+    cConnection server;
+    Check(server.Init_As_Server(0, 2, true, INADDR_LOOPBACK), "Could not bind movement test server");
+    server.Set_Bandwidth_Budget_Out(TestBandwidth);
+    HeadlessPlayerSession session(collision, server);
+    server.Install_Application_Acceptance_Handler([](cPacket &packet) {
+        UINT token;
+        return packet.Get_Bits_Remaining() == 64 && packet.Get(token) == MovementTestToken ?
+            REFUSAL_CLIENT_ACCEPTED : REFUSAL_BY_APPLICATION;
+    });
+    server.Install_Conn_Handler([&](int id) {
+        Check(session.Attach_Player(id, PLAYERTYPE_GDI, SoldierObject), "Could not attach the test soldier");
+        server.Set_Rhost_Is_In_Game(id, true);
+    });
+    int received = 0;
+    server.Install_Server_Packet_Handler([&](cPacket &packet, int id) {
+        session.Receive_Control(packet, id);
+        ++received;
+    });
+    server.Install_Server_Broken_Connection_Handler([&](int id) { session.Remove_Player(id); });
+    server.Install_Eviction_Handler([&](int id) { session.Remove_Player(id); });
+
+    cConnection client;
+    client.Init_As_Client(htonl(INADDR_LOOPBACK), server.Get_Local_Port());
+    client.Set_Bandwidth_Budget_Out(TestBandwidth);
+    client.Install_Accept_Handler([] {});
+    client.Install_Client_Packet_Handler(Receive_Movement_Snapshot);
+    cPacket request;
+    request.Add(MovementTestToken);
+    request.Add(TestBandwidth);
+    client.Connect_Cs(request);
+
+    auto service_until = [&](auto ready) {
+        const auto deadline = std::chrono::steady_clock::now() + 2s;
+        do {
+            client.Service_Send(true);
+            server.Service_Read();
+            server.Service_Send(true);
+            client.Service_Read();
+            if (ready()) {
+                return;
+            }
+            std::this_thread::sleep_for(1ms);
+        } while (std::chrono::steady_clock::now() < deadline);
+        throw std::runtime_error("Timed out exchanging movement test packets");
+    };
+    service_until([&] { return client.Is_Established(); });
+    Check(client.Get_Local_Id() == 1, "Movement test has an unexpected peer ID");
+
+    const auto send = [&](cPacket &packet, BYTE mode) {
+        const auto before = received;
+        client.Send_Packet_To_Individual(packet, SERVER_RHOST_ID, mode);
+        service_until([&] { return received > before; });
+    };
+    const auto snapshot = [&](auto elapsed) {
+        const auto before = MovementSnapshots.size();
+        session.Advance(elapsed);
+        service_until([&] { return MovementSnapshots.size() > before; });
+        return MovementSnapshots.back();
+    };
+    const auto spawn = snapshot(50ms).Position;
+
+    cPacket wrong_owner;
+    Write_Movement(wrong_owner, FirstControlObject, 2, SoldierObject, 8);
+    send(wrong_owner, SEND_RELIABLE);
+    cPacket unregistered;
+    Write_Movement(unregistered, FirstControlObject, 0, SoldierObject, 8);
+    send(unregistered, SEND_UNRELIABLE);
+    Check(snapshot(100ms).Position == spawn, "An invalid control owner moved the soldier");
+
+    cPacket creation;
+    Write_Movement(creation, FirstControlObject, 1, -1, 0);
+    send(creation, SEND_RELIABLE);
+    cPacket wrong_soldier;
+    Write_Movement(wrong_soldier, FirstControlObject, 0, SoldierObject + 1, 8);
+    send(wrong_soldier, SEND_UNRELIABLE);
+    cPacket truncated;
+    Write_Movement(truncated, FirstControlObject, 0, SoldierObject, 8);
+    truncated.Set_Bit_Length(truncated.Get_Bit_Length() - 1);
+    send(truncated, SEND_UNRELIABLE);
+    Check(snapshot(100ms).Position == spawn, "Wrong-target or truncated input moved the soldier");
+
+    cPacket drive;
+    Write_Movement(drive, FirstControlObject, 0, SoldierObject, 8);
+    send(drive, SEND_UNRELIABLE);
+    Check(snapshot(100ms).Position.Y > spawn.Y + 0.2f, "Valid client movement did not reach the simulation");
+    const auto wall = snapshot(100ms).Position;
+    Check(std::abs(wall.Y - 2.448f) < 0.1f, "Networked soldier did not stop at the wall");
+
+    cPacket retreat;
+    Write_Movement(retreat, FirstControlObject, 0, SoldierObject, -8);
+    send(retreat, SEND_UNRELIABLE);
+    Check(snapshot(100ms).Position.Y < wall.Y - 0.2f, "Turning the aim did not change the movement direction");
+    const auto before_timeout = snapshot(120ms).Position;
+    Check(snapshot(100ms).Position == before_timeout, "Expired movement input continued driving the soldier");
+    session.Remove_Player(client.Get_Local_Id());
+    Check(session.Attach_Player(1, PLAYERTYPE_GDI, SoldierObject) && snapshot(50ms).Position == spawn,
+        "Reattaching a peer retained the previous soldier's position or input");
+
+    cPacket recreate;
+    Write_Movement(recreate, FirstControlObject + 1, 1, SoldierObject, -8);
+    send(recreate, SEND_RELIABLE);
+    snapshot(100ms);
+    MovementSnapshot edge;
+    for (int i = 0; i < 7; ++i) {
+        cPacket walk;
+        Write_Movement(walk, FirstControlObject + 1, 0, SoldierObject, -8);
+        send(walk, SEND_UNRELIABLE);
+        edge = snapshot(100ms);
+    }
+    Check(edge.Airborne && edge.Velocity.Z < 0.0f && edge.Position.Y < -0.3f,
+        "Falling off the floor did not publish airborne state and downward velocity");
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -523,6 +720,7 @@ int main(int argc, char **argv)
             "A ray that misses the terrain triangle but passes through its bounds must not hit");
         Check_Box_Sweeps(collision);
         Check_Soldier_Simulation(collision);
+        Check_Player_Transport(collision);
 
         FdsProcess check(argv[1], fixture.Path, master, "--check");
         const auto check_status = check.Wait();

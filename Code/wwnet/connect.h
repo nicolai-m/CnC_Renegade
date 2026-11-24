@@ -39,6 +39,9 @@
 #include "wwpacket.h"
 #include "packettype.h"
 
+#if defined(__linux__)
+#include <functional>
+#endif
 //
 // A server can have this many clients (a client has only 1 rhost: the server)
 // -1 is used as ID_UNKNOWN
@@ -80,12 +83,19 @@ class cMsgStatList;
 
 typedef void (*Accept_Handler)(void);
 typedef void (*Refusal_Handler)(REFUSAL_CODE refusal_code);
+#if defined(__linux__)
+using Server_Broken_Connection_Handler = std::function<void(int)>;
+using Eviction_Handler = std::function<void(int)>;
+using Conn_Handler = std::function<void(int)>;
+using Server_Packet_Handler = std::function<void(cPacket &, int)>;
+#else
 typedef void (*Server_Broken_Connection_Handler)(int broken_rhost_id);
-typedef void (*Client_Broken_Connection_Handler)(void);
 typedef void (*Eviction_Handler)(int evicted_rhost_id);
 typedef void (*Conn_Handler)(int new_rhost_id);
-typedef REFUSAL_CODE (*Application_Acceptance_Handler)(cPacket & packet);
 typedef void (*Server_Packet_Handler)(cPacket & packet, int rhost_id);
+#endif
+typedef void (*Client_Broken_Connection_Handler)(void);
+typedef REFUSAL_CODE (*Application_Acceptance_Handler)(cPacket & packet);
 typedef void (*Client_Packet_Handler)(cPacket & packet);
 
 extern char * Addr_As_String(sockaddr_in *addr);
