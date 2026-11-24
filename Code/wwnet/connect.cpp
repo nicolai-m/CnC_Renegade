@@ -70,7 +70,6 @@ UINT cConnection::TotalCompressedBytesSent		= 0;
 UINT cConnection::TotalUncompressedBytesSent		= 0;
 
 static const int		INVALID_RHOST_ID			= -1;
-static const int		MAX_WIRE_PEER_ID		= 127;
 
 
 //#ifdef WWDEBUG
@@ -291,10 +290,10 @@ void cConnection::Init_As_Client(ULONG server_ip, USHORT server_port, unsigned s
 
 //------------------------------------------------------------------------------------
 bool cConnection::Init_As_Server(USHORT server_port, int max_players,
-	bool is_dedicated_server, ULONG addr)
+	bool is_dedicated_server, ULONG addr, bool allow_port_fallback)
 {
 	WWDEBUG_SAY(("cConnection::Init_As_Server\n"));
-	if (InitDone || max_players < 1 || max_players > MAX_WIRE_PEER_ID ||
+	if (InitDone || max_players < 1 || max_players > MAX_PEER_ID ||
 		(server_port != 0 && server_port < MIN_SERVER_PORT)) {
 		return false;
 	}
@@ -302,7 +301,8 @@ bool cConnection::Init_As_Server(USHORT server_port, int max_players,
 	const bool single_player = cSinglePlayerData::Is_Single_Player();
 	if (!single_player) {
 		bool bound = false;
-		const int last_port = server_port == 0 ? 0 : MIN(server_port + 49, MAX_SERVER_PORT);
+		const int last_port = server_port != 0 && allow_port_fallback
+			? MIN(server_port + 49, MAX_SERVER_PORT) : server_port;
 		for (int port = server_port; port <= last_port && !bound; ++port) {
 			bound = Bind(static_cast<USHORT>(port), addr);
 		}
@@ -791,7 +791,7 @@ bool cConnection::Receive_Packet()
 
                int assigned_id = ID_UNKNOWN;
                packet.Get(assigned_id);
-               if (assigned_id <= SERVER_RHOST_ID || assigned_id > MAX_WIRE_PEER_ID) {
+               if (assigned_id <= SERVER_RHOST_ID || assigned_id > MAX_PEER_ID) {
                   return true;
                }
                LocalId = assigned_id;

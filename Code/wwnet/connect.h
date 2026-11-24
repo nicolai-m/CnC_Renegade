@@ -101,9 +101,10 @@ class cConnection
 		cConnection();
 		~cConnection();
 
+		enum { MAX_PEER_ID = 127 };
       void Init_As_Client(ULONG server_ip, USHORT server_port, unsigned short my_port = 0);
       bool Init_As_Server(USHORT server_port, int max_players,
-			bool is_dedicated_server, ULONG addr = 0);
+			bool is_dedicated_server, ULONG addr = 0, bool allow_port_fallback = true);
       void Connect_Cs(cPacket & app_data);
       void Send_Packet_To_Individual(cPacket & packet, int addressee, BYTE send_flags);
       bool Have_Id() const {return LocalId != ID_UNKNOWN;}

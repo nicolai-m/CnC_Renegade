@@ -22,11 +22,11 @@ If you wish to rebuild the source code and tools successfully you will need to f
 - Java Runtime Headers - (expected path `\Code\Tools\RenegadeGR\`)
 
 
-## Compiling (Win32 Only)
+## Building
 
 To use the compiled binaries, you must own the game. The C&C Ultimate Collection is available for purchase on [EA App](https://www.ea.com/en-gb/games/command-and-conquer/command-and-conquer-the-ultimate-collection/buy/pc) or [Steam](https://store.steampowered.com/bundle/39394/Command__Conquer_The_Ultimate_Collection/).
 
-### Renegade
+### Renegade (Win32)
 
 The quickest way to build all configurations in the project is to open `commando.dsw` in Microsoft Visual Studio C++ 6.0 (SP5 recommended for binary matching to patch 1.037) and select Build -> Batch Build, then hit the “Rebuild All” button.
 
@@ -42,17 +42,8 @@ It’s possible to build the Windows version of the FDS (Free Dedicated Server) 
 
 ### Linux Dedicated Server port (in progress)
 
-The Linux build compiles the original game-packet code, UDP transport, and peer
-connection layer for amd64 and arm64. Loopback tests cover the original wire
-layout, UDP checksums, packet coalescing, delta decompression, the connection
-handshake, and reliable delivery. The Linux connection layer supports direct UDP;
-the legacy Westwood Online NAT negotiation is available in the Windows build.
-
-The playable dedicated server still requires a headless entry point, game-session
-initialization, map loading, and the simulation loop.
-
-Run the network tests on either architecture with CMake 3.20 or newer and a C++17
-compiler.
+Build the native `renegade_fds` bootstrap on amd64 or arm64 with CMake 3.20 or
+newer and a C++17 compiler.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -60,9 +51,25 @@ cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
 
-Server acceptance requires starting on Linux with locally installed game data,
-loading a multiplayer map without a display or audio device, and joining a match
-with a compatible Renegade client on both server architectures.
+Use a locally installed copy of the game data. `--data-dir` accepts the game
+directory or its `Data` directory. `--config` accepts an existing `[Settings]`
+INI such as `svrcfg_cnc.ini`, or a `[Server]` INI with `GameType=LAN` and
+`Config=<filename>` referring to a settings INI in the data directory.
+
+```sh
+./build/renegade_fds --data-dir /path/to/game --config /path/to/svrcfg_cnc.ini --check
+./build/renegade_fds --data-dir /path/to/game --config /path/to/svrcfg_cnc.ini
+```
+
+The bootstrap validates the core assets and reads the configured maps’ static
+and dynamic chunk headers through the original chunk reader. With `--check` it
+exits after validation. Otherwise it listens for direct UDP on `127.0.0.1` by
+default, with port `4848` if the INI does not specify one. `--bind` and `--port`
+override the address and port. `SIGINT` and `SIGTERM` stop it cleanly.
+
+The bootstrap refuses joins until the game-session callbacks, map instantiation,
+and simulation loop are ported. The current tests cover the library’s UDP
+handshake and reliable delivery as well as bootstrap startup, refusal, and shutdown.
 
 
 ### Level Edit (Public Release)

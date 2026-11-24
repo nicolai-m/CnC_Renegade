@@ -42,6 +42,13 @@ target_include_directories(renegade_packet PUBLIC
     Code/wwutil
 )
 
+add_executable(renegade_fds
+    Code/Commando/linux_fds.cpp
+    Code/wwlib/chunkio.cpp
+    Code/wwlib/mixarchive.cpp
+)
+target_link_libraries(renegade_fds PRIVATE renegade_packet)
+
 include(CTest)
 if(BUILD_TESTING)
     add_executable(renegade_packet_test Code/Tests/Linux/packet_test.cpp)
@@ -55,4 +62,8 @@ if(BUILD_TESTING)
     add_executable(renegade_connection_test Code/Tests/Linux/connection_test.cpp)
     target_link_libraries(renegade_connection_test PRIVATE renegade_packet)
     add_test(NAME renegade_connection_handshake COMMAND renegade_connection_test)
+
+    add_executable(renegade_fds_test Code/Tests/Linux/fds_bootstrap_test.cpp)
+    target_link_libraries(renegade_fds_test PRIVATE renegade_packet)
+    add_test(NAME renegade_fds_bootstrap COMMAND renegade_fds_test $<TARGET_FILE:renegade_fds>)
 endif()
