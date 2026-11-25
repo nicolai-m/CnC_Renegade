@@ -30,6 +30,9 @@ public:
     static bool Client_Owns_Object_Id(int peer_id, int object_id);
 
 private:
+    static constexpr float WeaponSwitchSeconds = 1.0f; // WeaponClass::Select uses two half-second switch states.
+    enum class WeaponState { Switching, Ready, Charging, Firing, Reloading };
+
     struct Peer {
         int SoldierObject;
         Vector2 Forward;
@@ -41,10 +44,15 @@ private:
         bool Ready = true;
         std::vector<HeadlessSpawnWeapon> Weapons;
         int WeaponSlot = 0; // Slot zero is holstered, as in WeaponBagClass.
+        ULONG FireControls = 0;
+        bool ReloadRequested = false;
+        WeaponState WeaponAction = WeaponState::Switching;
+        float WeaponTimeRemaining = WeaponSwitchSeconds;
     };
 
     bool Read_Control(cPacket &packet, int peer_id, Peer &peer);
     static void Select_Weapon(Peer &peer, ULONG controls);
+    static void Advance_Weapon(Peer &peer, float seconds, ULONG fire_controls, bool reload);
     static void Init_Position_Encoders(const HeadlessCollision &collision, std::array<cEncoderTypeEntry, 3> &encoders);
     void Write_Position(cPacket &packet, const Vector3 &position);
     void Write_Frequent(cPacket &packet, int peer_id, const Peer &peer);

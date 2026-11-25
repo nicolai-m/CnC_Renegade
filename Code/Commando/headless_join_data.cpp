@@ -32,6 +32,8 @@ constexpr uint32 DefenseVariables = 7311607;
 constexpr uint32 ScriptList = 627001057;
 constexpr uint32 WeaponVariables = 1205091654;
 constexpr uint32 WeaponParent = 1205091655;
+constexpr uint32 AmmoVariables = 1206091429;
+constexpr uint32 AmmoParent = 1206091430;
 constexpr uint32 PowerupVariables = 909991657;
 constexpr uint32 TranslateVariables = 0x07141200;
 constexpr float MaxDefense = 2000.0f;
@@ -58,9 +60,22 @@ struct Record {
 };
 
 struct WeaponDefinition {
+    int Style = 1;
     float KeyNumber = 0;
     int ClipSize = 0;
     int MaxInventoryRounds = 100;
+    float ReloadSeconds = 0;
+    int PrimaryAmmo = 0;
+    int SecondaryAmmo = 0;
+    bool CanSnipe = false;
+};
+
+struct AmmoDefinition {
+    int Type = 0;
+    int BurstMax = 0;
+    int RoundCost = 1;
+    float RateOfFire = 1;
+    float ChargeSeconds = 0;
 };
 
 struct WeaponGrant {
@@ -71,6 +86,7 @@ struct WeaponGrant {
 
 struct EquipmentDefinitions {
     std::map<int, WeaponDefinition> Weapons;
+    std::map<int, AmmoDefinition> Ammo;
     std::map<std::string, WeaponGrant> Powerups;
 };
 
@@ -158,7 +174,17 @@ void Read_Weapon(BoundedChunkReader &reader, EquipmentDefinitions &equipment)
             reader.In_Chunk(DefinitionIdentity, [&] { Read_Identity(reader, definition_id, name); });
         } else if (id == WeaponVariables) {
             reader.Each_Micro([&](uint32 field) {
-                if (field == 29) {
+                if (field == 1) {
+                    weapon.Style = reader.Value<sint32>();
+                } else if (field == 9) {
+                    weapon.ReloadSeconds = reader.Value<float>();
+                } else if (field == 16) {
+                    weapon.CanSnipe = reader.Value<uint8>() != 0;
+                } else if (field == 27) {
+                    weapon.PrimaryAmmo = reader.Value<sint32>();
+                } else if (field == 28) {
+                    weapon.SecondaryAmmo = reader.Value<sint32>();
+                } else if (field == 29) {
                     weapon.ClipSize = reader.Value<sint32>();
                 } else if (field == 35) {
                     weapon.MaxInventoryRounds = reader.Value<sint32>();
@@ -171,6 +197,31 @@ void Read_Weapon(BoundedChunkReader &reader, EquipmentDefinitions &equipment)
     });
     if (definition_id > 0) {
         equipment.Weapons[definition_id] = weapon;
+    }
+}
+
+void Read_Ammo(BoundedChunkReader &reader, EquipmentDefinitions &equipment)
+{
+    int definition_id = 0;
+    std::string name;
+    AmmoDefinition ammo;
+    reader.Each_Chunk([&](uint32 id) {
+        if (id == AmmoParent) {
+            reader.In_Chunk(DefinitionIdentity, [&] { Read_Identity(reader, definition_id, name); });
+        } else if (id == AmmoVariables) {
+            reader.Each_Micro([&](uint32 field) {
+                switch (field) {
+                case 15: ammo.BurstMax = reader.Value<sint32>(); break;
+                case 27: ammo.ChargeSeconds = reader.Value<float>(); break;
+                case 31: ammo.RoundCost = reader.Value<sint32>(); break;
+                case 32: ammo.Type = reader.Value<sint32>(); break;
+                case 48: ammo.RateOfFire = reader.Value<float>(); break;
+                }
+            });
+        }
+    });
+    if (definition_id > 0) {
+        equipment.Ammo[definition_id] = ammo;
     }
 }
 
@@ -208,6 +259,10 @@ void Load_Presets(const GameDataFile &source, std::map<int, std::string> &physic
                     reader.In_Chunk(FactoryData, [&] { Read_Weapon(reader, equipment); });
                     return;
                 }
+                if (factory == CHUNKID_AMMO_DEF) {
+                    reader.In_Chunk(FactoryData, [&] { Read_Ammo(reader, equipment); });
+                    return;
+                }
                 if (factory == CHUNKID_GAME_OBJECT_DEF_POWERUP) {
                     std::string name;
                     WeaponGrant grant;
@@ -235,6 +290,27 @@ void Load_Presets(const GameDataFile &source, std::map<int, std::string> &physic
             });
         });
     });
+}
+
+std::optional<HeadlessFireMode> Get_Fire_Mode(const EquipmentDefinitions &equipment, int id, float charge_seconds)
+{
+    constexpr int NormalAmmo = 0;
+    constexpr float MaxShotsPerSecond = 1000;
+    const auto def = equipment.Ammo.find(id);
+    if (def == equipment.Ammo.end()) {
+        return std::nullopt;
+    }
+    const auto &ammo = def->second;
+    if (ammo.Type != NormalAmmo || ammo.BurstMax != 0 || ammo.RoundCost < 0 ||
+        !std::isfinite(ammo.RateOfFire) || ammo.RateOfFire <= 0 || ammo.RateOfFire > MaxShotsPerSecond ||
+        !std::isfinite(charge_seconds) || charge_seconds < 0) {
+        return std::nullopt;
+    }
+    const float interval = 1.0f / ammo.RateOfFire;
+    if (!std::isfinite(interval)) {
+        return std::nullopt;
+    }
+    return HeadlessFireMode{interval, charge_seconds, ammo.RoundCost};
 }
 
 void Load_Starting_Weapons(const Record &record, const EquipmentDefinitions &equipment, HeadlessSoldierPreset &soldier)
@@ -287,10 +363,24 @@ void Load_Starting_Weapons(const Record &record, const EquipmentDefinitions &equ
     }
     for (const auto &weapon : inventory) {
         if (weapon.Owned) {
-            const auto total = static_cast<std::int64_t>(weapon.Clip) + weapon.Inventory;
-            soldier.Weapons.push_back({weapon.DefinitionId, weapon.Inventory < 0 ? -1 :
-                static_cast<int>(std::min<std::int64_t>(total, std::numeric_limits<int>::max())),
-                equipment.Weapons.at(weapon.DefinitionId).KeyNumber});
+            const auto &def = equipment.Weapons.at(weapon.DefinitionId);
+            const float reload = std::isfinite(def.ReloadSeconds) ? std::max(0.0f, def.ReloadSeconds) : 0.0f;
+            HeadlessSpawnWeapon spawn{weapon.DefinitionId, def.KeyNumber, std::max(0, def.ClipSize),
+                weapon.Clip, weapon.Inventory, reload, {}, {}};
+            constexpr int RifleStyle = 2;
+            constexpr int HandgunStyle = 5;
+            // These stock weapon styles fire bullets. C4, beacons and launchers have separate behavior.
+            if (spawn.ClipSize > 0 && (def.Style == RifleStyle || def.Style == HandgunStyle)) {
+                const auto ammo = equipment.Ammo.find(def.PrimaryAmmo);
+                if (ammo != equipment.Ammo.end()) {
+                    const float charge = ammo->second.ChargeSeconds; // WeaponClass uses primary charge for both triggers.
+                    spawn.PrimaryFire = Get_Fire_Mode(equipment, def.PrimaryAmmo, charge);
+                    if (spawn.PrimaryFire && !def.CanSnipe) {
+                        spawn.SecondaryFire = Get_Fire_Mode(equipment, def.SecondaryAmmo, charge);
+                    }
+                }
+            }
+            soldier.Weapons.push_back(spawn);
         }
     }
     std::stable_sort(soldier.Weapons.begin(), soldier.Weapons.end(), [](const auto &first, const auto &second) {
@@ -345,6 +435,13 @@ uint32 Build_CRC(const std::string &text)
 }
 
 } // namespace
+
+int HeadlessSpawnWeapon::Total_Rounds() const
+{
+    // WeaponBagClass and SoldierGameObj both send -1 for an unlimited reserve.
+    const auto total = static_cast<std::int64_t>(ClipRounds) + ReserveRounds;
+    return ReserveRounds < 0 ? -1 : static_cast<int>(std::min<std::int64_t>(total, std::numeric_limits<int>::max()));
+}
 
 HeadlessJoinData Load_Headless_Join_Data(uint32 client_build, unsigned armor_types,
     const GameDataFile &strings, const GameDataFile &definitions, const std::optional<GameDataFile> &map_definitions,

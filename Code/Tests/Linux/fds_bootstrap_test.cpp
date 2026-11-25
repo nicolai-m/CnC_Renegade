@@ -332,10 +332,16 @@ std::string Definitions()
         return Chunk(0x20501, Chunk(0x00100101, Chunk(0x100, Micro(1, id), false) +
             Chunk(0x055ffe08, Micro(1, model), false)));
     };
-    auto weapon = [](sint32 id, sint32 clip, sint32 reserve, float key) {
+    auto weapon = [](sint32 id, sint32 clip, sint32 reserve, float key, sint32 style) {
         return Chunk(CHUNKID_WEAPON_DEF, Chunk(0x00100101,
             Chunk(1205091655, Chunk(0x100, Micro(1, id), false)) +
-            Chunk(1205091654, Micro(29, clip) + Micro(35, reserve) + Micro(37, key), false)));
+            Chunk(1205091654, Micro(1, style) + Micro(9, 0.35f) + Micro(27, sint32{640}) +
+                Micro(28, sint32{641}) + Micro(29, clip) + Micro(35, reserve) + Micro(37, key), false)));
+    };
+    auto ammo = [](sint32 id, sint32 cost) {
+        return Chunk(CHUNKID_AMMO_DEF, Chunk(0x00100101,
+            Chunk(1206091430, Chunk(0x100, Micro(1, id), false)) +
+            Chunk(1206091429, Micro(31, cost) + Micro(48, 2.0f), false)));
     };
     const auto powerup = Chunk(CHUNKID_GAME_OBJECT_DEF_POWERUP, Chunk(0x00100101,
         Chunk(909991656, Chunk(0x100, Micro(1, sint32{630}) + Micro(3, "pow_pistol"), false)) +
@@ -344,8 +350,8 @@ std::string Definitions()
         definition(100, PLAYERTYPE_NOD) + definition(200, PLAYERTYPE_GDI) +
         soldier(400, "CnC_Nod_Minigunner_0", 500) + soldier(401, "CnC_GDI_MiniGunner_0", 501) +
         physics(500, "test\\soldier0.w3d") + physics(501, "test\\soldier1.w3d") +
-        weapon(600, 40, 200, 2) + weapon(601, 40, 200, 2) + weapon(610, 12, 100, 1) +
-        weapon(620, 1, 0, 7) + powerup));
+        weapon(600, 40, 200, 2, 2) + weapon(601, 40, 200, 2, 2) + weapon(610, 12, 100, 1, 5) +
+        weapon(620, 1, 0, 7, 0) + ammo(640, 20) + ammo(641, 7) + powerup));
 }
 
 struct ArchiveEntry {
@@ -532,7 +538,8 @@ void Receive_Movement_Snapshot(cPacket &packet)
 }
 
 void Write_Movement(cPacket &packet, int control_object, int owner, int soldier, float target_y,
-    float position_extent = 21.0f, unsigned position_bits = 8, ULONG buttons = 0)
+    float position_extent = 21.0f, unsigned position_bits = 8, ULONG buttons = 0,
+    ULONG continuous = 0, bool moving = true)
 {
     packet.Add(control_object);
     packet.Add(static_cast<BYTE>(owner ? 15 : 1));
@@ -546,8 +553,8 @@ void Write_Movement(cPacket &packet, int control_object, int owner, int soldier,
         return;
     }
     packet.Add_Bits(buttons, ControlClass::NUM_BOOLEAN_ONE_TIME);
-    packet.Add_Bits(0, 4); // Continuous control flags.
-    packet.Add_Bits(255, 8); // Full forward input.
+    packet.Add_Bits(continuous, ControlClass::NUM_BOOLEAN_CONTINUOUS);
+    packet.Add_Bits(moving ? 255 : 128, 8); // Forward input.
     packet.Add_Bits(128, 8); // Neutral strafe.
     packet.Add_Bits(128, 8); // Neutral vertical input.
     packet.Add_Bits(128, 8); // Neutral turning input.
@@ -691,6 +698,8 @@ struct Join_Client_State {
     std::map<int, int> Soldiers;
     std::map<int, float> Y;
     std::map<int, int> SelectedWeapon;
+    std::map<int, int> Rounds;
+    std::map<int, ULONG> FireControls;
     std::set<int> Deleted;
     std::optional<float> OptionsTime;
     std::optional<int> GameDataTime;
@@ -821,20 +830,41 @@ float Read_Join_Position_Y(cPacket &packet, uint32 map_crc)
 
 std::vector<HeadlessSpawnWeapon> Fixture_Weapons(int team)
 {
-    return {{610, -1, 1}, {600 + team, 240, 2}, {620, 1, 7}};
+    const HeadlessFireMode primary{0.5f, 0, 20};
+    const HeadlessFireMode secondary{0.5f, 0, 7};
+    return {{610, 1, 12, 12, -1, 0.35f, primary, secondary},
+        {600 + team, 2, 40, 40, 200, 0.35f, primary, secondary},
+        {620, 7, 1, 1, 0, 0.35f, {}, {}}};
 }
 
-void Read_Held_Weapon(cPacket &packet, Join_Client_State &client, int object)
+void Read_Soldier_Frequent(cPacket &packet, Join_Client_State &client, int object)
 {
     Check(!Field<bool>(packet), "Soldier was unexpectedly in a vehicle");
     int id = 0;
+    int rounds = 0;
     if (Field<bool>(packet)) {
         id = Field<int>(packet);
-        const int rounds = Field<int>(packet);
-        Check((id == 610 && rounds == -1) || ((id == 600 || id == 601) && rounds == 240) ||
+        rounds = Field<int>(packet);
+        Check((id == 610 && rounds == -1) || ((id == 600 || id == 601) && rounds >= 0 && rounds <= 240) ||
             (id == 620 && rounds == 1), "Incorrect equipped weapon or ammo count");
     }
     client.SelectedWeapon[object] = id;
+    client.Rounds[object] = rounds;
+    client.Y[object] = Read_Join_Position_Y(packet, client.MapCRC);
+    ULONG state, bits;
+    packet.Get_Bits(state, 5);
+    packet.Get_Bits(bits, 9); // Human substate.
+    Check(state == 0 || state == 5, "Unexpected soldier state");
+    if (state == 5) {
+        for (int axis = 0; axis < 3; ++axis) {
+            Field<float>(packet);
+        }
+    }
+    Check(!Field<bool>(packet) && !Field<bool>(packet), "Unexpected damage or host bone");
+    Read_Join_Position_Y(packet, client.MapCRC); // Target position.
+    packet.Get_Bits(bits, ControlClass::NUM_BOOLEAN_CONTINUOUS);
+    client.FireControls[object] = bits;
+    packet.Get_Bits(bits, 32); // Analog controls.
 }
 
 void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
@@ -855,9 +885,8 @@ void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
     }
     if (dirty == 1) {
         Check(!deleting, "Unexpected deletion flag on soldier update");
-        Read_Held_Weapon(packet, client, object);
-        client.Y[object] = Read_Join_Position_Y(packet, client.MapCRC);
-        packet.Flush();
+        Read_Soldier_Frequent(packet, client, object);
+        Check(packet.Is_Flushed(), "Unexpected data in soldier update");
         return;
     }
     if (dirty == NetworkObjectClass::BIT_RARE) { // cPlayer update after loading.
@@ -925,12 +954,11 @@ void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
         Check(defense == 2 && Field<int>(packet) == static_cast<int>(inventory.size()),
             "Wrong shield type or size of the spawn inventory");
         for (const auto &weapon : inventory) {
-            Check(Field<int>(packet) == weapon.DefinitionId && Field<int>(packet) == weapon.Rounds,
+            Check(Field<int>(packet) == weapon.DefinitionId && Field<int>(packet) == weapon.Total_Rounds(),
                 "Spawn inventory did not include the armed preset and the scripted weapon grant");
         }
-        Read_Held_Weapon(packet, client, object);
+        Read_Soldier_Frequent(packet, client, object);
         Check(client.SelectedWeapon.at(object) == 600 + preset - first_preset, "The primary weapon must start equipped");
-        packet.Flush();
         break;
     }
     case 1012: { // cGameDataUpdateEvent.
@@ -1222,10 +1250,46 @@ void Check_Original_Join(unsigned short port, const std::string &definitions, co
         return FirstJoinClient.Y[first_soldier] > 2.25f && SecondJoinClient.Y[first_soldier] > 2.25f;
     });
 
-    const auto select = [&](ControlClass::BooleanControl button, int expected) {
+    const auto send_controls = [&](ULONG buttons, ULONG triggers) {
         cPacket input;
-        Write_Movement(input, FirstControlObject, 0, first_soldier, 8, 21.0f, 8, 1u << button);
+        Write_Movement(input, FirstControlObject, 0, first_soldier, 8, 21.0f, 8, buttons, triggers, false);
         first.Send_Packet_To_Individual(input, SERVER_RHOST_ID, SEND_UNRELIABLE);
+    };
+    const auto wait = [&](auto elapsed) {
+        const auto until = std::chrono::steady_clock::now() + elapsed;
+        Pump_Clients({&first, &second}, [&] { return std::chrono::steady_clock::now() >= until; });
+    };
+    const auto replicated = [&](int rounds, ULONG triggers) {
+        return FirstJoinClient.Rounds.at(first_soldier) == rounds &&
+            SecondJoinClient.Rounds.at(first_soldier) == rounds &&
+            FirstJoinClient.FireControls.at(first_soldier) == triggers &&
+            SecondJoinClient.FireControls.at(first_soldier) == triggers;
+    };
+    const auto fire = [&](ULONG trigger, int remaining) {
+        send_controls(0, trigger);
+        Pump_Clients({&first, &second}, [&] { return replicated(remaining, trigger); });
+    };
+    constexpr ULONG primary = 1;
+    constexpr ULONG secondary = 2;
+    fire(primary, 220);
+    Pump_Clients({&first, &second}, [&] { return replicated(220, 0); });
+    wait(300ms); // The first shot's half-second cooldown must finish before reloading.
+    send_controls(1u << ControlClass::BOOLEAN_WEAPON_RELOAD, primary);
+    Pump_Clients({&first, &second}, [&] { return replicated(220, primary); });
+    Pump_Clients({&first, &second}, [&] { return replicated(220, 0); });
+    wait(150ms); // The held trigger timed out before the reload could complete.
+    fire(secondary, 213);
+    wait(550ms);
+    fire(primary, 193); // Without the manual reload only 13 of the required 20 rounds would remain in the clip.
+    wait(550ms);
+    fire(primary, 180); // Empty the clip.
+    wait(900ms);
+    fire(primary, 160); // The server automatically refilled the clip from the remaining reserve.
+    send_controls(0, 0);
+    Pump_Clients({&first, &second}, [&] { return replicated(160, 0); });
+
+    const auto select = [&](ControlClass::BooleanControl button, int expected) {
+        send_controls(1u << button, 0);
         Pump_Clients({&first, &second}, [&] {
             return FirstJoinClient.SelectedWeapon.at(first_soldier) == expected &&
                 SecondJoinClient.SelectedWeapon.at(first_soldier) == expected;

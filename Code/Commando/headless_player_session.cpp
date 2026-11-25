@@ -5,6 +5,7 @@
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 
 #include "connect.h"
 #include "control.h"
@@ -27,6 +28,8 @@ constexpr UINT ObjectHeaderBits = 32 + 8 + 1;
 constexpr UINT HumanStateBits = 5;
 constexpr UINT HumanSubStateBits = 9;
 constexpr double PositionResolution = 0.2;
+constexpr ULONG FirePrimary = 1u << (ControlClass::BOOLEAN_WEAPON_FIRE_PRIMARY - ControlClass::BOOLEAN_CONTINUOUS_FIRST);
+constexpr ULONG FireSecondary = 1u << (ControlClass::BOOLEAN_WEAPON_FIRE_SECONDARY - ControlClass::BOOLEAN_CONTINUOUS_FIRST);
 
 Vector2 Left_Of(const Vector2 &forward)
 {
@@ -135,7 +138,7 @@ void HeadlessPlayerSession::Introduce_Soldier(int owner_id, int recipient, const
     packet.Add(static_cast<int>(peer.Weapons.size()));
     for (const auto &weapon : peer.Weapons) {
         packet.Add(weapon.DefinitionId);
-        packet.Add(weapon.Rounds);
+        packet.Add(weapon.Total_Rounds());
     }
     Write_Frequent(packet, owner_id, peer);
     Connection.Send_Packet_To_Individual(packet, recipient, SEND_RELIABLE);
@@ -150,6 +153,8 @@ void HeadlessPlayerSession::Set_Player_Loading(int peer_id, bool loading)
         if (loading) {
             peer.MoveAxes.Set(0, 0);
             peer.InputRemaining = {};
+            peer.FireControls = 0;
+            peer.ReloadRequested = false;
             Simulation.Set_Move_Input(peer_id, peer.MoveAxes);
         }
     }
@@ -177,6 +182,8 @@ void HeadlessPlayerSession::Reset_Map(const HeadlessCollision &collision)
         peer.Viewers.clear();
         peer.Weapons.clear();
         peer.WeaponSlot = 0;
+        peer.FireControls = 0;
+        peer.ReloadRequested = false;
     }
 }
 
@@ -243,6 +250,7 @@ bool HeadlessPlayerSession::Read_Control(cPacket &packet, int peer_id, Peer &pee
     packet.Get_Bits(one_time, ControlClass::NUM_BOOLEAN_ONE_TIME);
     ULONG bits;
     packet.Get_Bits(bits, ControlClass::NUM_BOOLEAN_CONTINUOUS);
+    const auto fire_controls = bits & (FirePrimary | FireSecondary);
     std::array<float, ControlClass::ANALOG_CONTROL_COUNT> analog;
     for (auto &value : analog) {
         packet.Get_Bits(bits, AnalogEncoder.Get_Bit_Precision());
@@ -280,8 +288,79 @@ bool HeadlessPlayerSession::Read_Control(cPacket &packet, int peer_id, Peer &pee
         std::clamp(world_move.Y, -1.0f, 1.0f)));
     peer.InputRemaining = InputTimeout;
     peer.ControlObject = object_id;
+    const auto previous_slot = peer.WeaponSlot;
     Select_Weapon(peer, one_time);
+    if (peer.WeaponSlot != previous_slot) {
+        peer.WeaponAction = WeaponState::Switching;
+        peer.WeaponTimeRemaining = WeaponSwitchSeconds;
+        peer.ReloadRequested = false;
+    }
+    peer.FireControls = fire_controls;
+    peer.ReloadRequested |= (one_time & (1u << ControlClass::BOOLEAN_WEAPON_RELOAD)) != 0;
     return true;
+}
+
+void HeadlessPlayerSession::Advance_Weapon(Peer &peer, float seconds, ULONG fire_controls, bool reload)
+{
+    if (peer.WeaponSlot == 0) {
+        return;
+    }
+    auto &weapon = peer.Weapons[peer.WeaponSlot - 1];
+    if (!weapon.PrimaryFire) {
+        return;
+    }
+    const HeadlessFireMode *mode = nullptr;
+    if (fire_controls & FirePrimary) {
+        mode = &*weapon.PrimaryFire;
+    } else if ((fire_controls & FireSecondary) && weapon.SecondaryFire) {
+        mode = &*weapon.SecondaryFire;
+    }
+    const auto start_reload = [&] {
+        peer.WeaponAction = WeaponState::Reloading;
+        peer.WeaponTimeRemaining = weapon.ReloadSeconds;
+    };
+    if (reload && peer.WeaponAction == WeaponState::Ready && weapon.ReserveRounds != 0) {
+        start_reload();
+    }
+    while (seconds > 0) {
+        if (peer.WeaponAction == WeaponState::Ready) {
+            if (weapon.ClipRounds == 0 && weapon.ReserveRounds != 0) {
+                start_reload();
+            } else if (mode && weapon.ClipRounds > 0) {
+                peer.WeaponAction = WeaponState::Charging;
+                peer.WeaponTimeRemaining = mode->ChargeSeconds;
+            } else {
+                return;
+            }
+        }
+        if (peer.WeaponTimeRemaining > seconds) {
+            peer.WeaponTimeRemaining -= seconds;
+            return;
+        }
+        seconds -= peer.WeaponTimeRemaining;
+        switch (peer.WeaponAction) {
+        case WeaponState::Charging:
+            peer.WeaponAction = WeaponState::Firing;
+            peer.WeaponTimeRemaining = mode ? mode->ShotInterval : weapon.PrimaryFire->ShotInterval;
+            if (mode) {
+                weapon.ClipRounds = std::max(0, weapon.ClipRounds - mode->RoundCost);
+            }
+            continue;
+        case WeaponState::Reloading: {
+            int added = weapon.ClipSize - weapon.ClipRounds;
+            if (weapon.ReserveRounds >= 0) {
+                added = std::min(added, weapon.ReserveRounds);
+                weapon.ReserveRounds -= added;
+            }
+            weapon.ClipRounds += added;
+            break;
+        }
+        default:
+            break;
+        }
+        peer.WeaponAction = WeaponState::Ready;
+        peer.WeaponTimeRemaining = 0;
+    }
 }
 
 void HeadlessPlayerSession::Select_Weapon(Peer &peer, ULONG controls)
@@ -331,11 +410,19 @@ void HeadlessPlayerSession::Advance(HeadlessSimulation::Clock::duration elapsed)
     if (elapsed <= Duration::zero()) {
         return;
     }
+    const auto weapon_elapsed = std::min(elapsed, std::chrono::duration_cast<Duration>(100ms));
     for (auto &[id, peer] : Peers) {
+        if (peer.Ready) {
+            const auto held = std::min(weapon_elapsed, peer.InputRemaining);
+            const bool reload = std::exchange(peer.ReloadRequested, false);
+            Advance_Weapon(peer, std::chrono::duration<float>(held).count(), peer.FireControls, reload);
+            Advance_Weapon(peer, std::chrono::duration<float>(weapon_elapsed - held).count(), 0, false);
+        }
         if (peer.InputRemaining > Duration::zero()) {
             peer.InputRemaining -= std::min(elapsed, peer.InputRemaining);
             if (peer.InputRemaining == Duration::zero()) {
                 peer.MoveAxes.Set(0, 0);
+                peer.FireControls = 0;
                 Simulation.Set_Move_Input(id, peer.MoveAxes);
             }
         }
@@ -365,10 +452,13 @@ void HeadlessPlayerSession::Write_Frequent(cPacket &packet, int peer_id, const P
     const auto &soldier = *Simulation.Find_Soldier(peer_id);
     packet.Add(false); // In vehicle.
     packet.Add(peer.WeaponSlot != 0);
+    ULONG fire_controls = 0;
     if (peer.WeaponSlot != 0) {
         const auto &weapon = peer.Weapons[peer.WeaponSlot - 1];
         packet.Add(weapon.DefinitionId);
-        packet.Add(weapon.Rounds);
+        packet.Add(weapon.Total_Rounds());
+        if (weapon.PrimaryFire) { fire_controls |= peer.FireControls & FirePrimary; }
+        if (weapon.SecondaryFire) { fire_controls |= peer.FireControls & FireSecondary; }
     }
     Write_Position(packet, soldier.Position);
     packet.Add_Bits(soldier.Grounded ? HumanStateClass::UPRIGHT : HumanStateClass::AIRBORNE, HumanStateBits);
@@ -389,7 +479,7 @@ void HeadlessPlayerSession::Write_Frequent(cPacket &packet, int peer_id, const P
     packet.Add(false); // Special damage.
     packet.Add(false); // Attached to a host bone.
     Write_Position(packet, peer.Target);
-    packet.Add_Bits(0, ControlClass::NUM_BOOLEAN_CONTINUOUS);
+    packet.Add_Bits(fire_controls, ControlClass::NUM_BOOLEAN_CONTINUOUS);
     const float analog[] = {peer.MoveAxes.X, peer.MoveAxes.Y, 0, 0};
     for (const auto value : analog) {
         ULONG bits;

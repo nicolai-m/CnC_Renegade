@@ -4,15 +4,29 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "headless_collision.h"
 
+struct HeadlessFireMode {
+    float ShotInterval;
+    float ChargeSeconds;
+    int RoundCost;
+};
+
 struct HeadlessSpawnWeapon {
     int DefinitionId;
-    int Rounds; // Total rounds. The original protocol sends -1 for unlimited ammo.
     float KeyNumber;
+    int ClipSize;
+    int ClipRounds;
+    int ReserveRounds;
+    float ReloadSeconds;
+    std::optional<HeadlessFireMode> PrimaryFire;
+    std::optional<HeadlessFireMode> SecondaryFire;
+
+    int Total_Rounds() const;
 };
 
 struct HeadlessSoldierPreset {

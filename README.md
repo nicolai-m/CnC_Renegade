@@ -104,8 +104,11 @@ peers receive position and movement updates for the soldiers known to them.
 The minigunner starts with the weapons and ammunition in its original preset
 and the weapon grants from `M00_GrantPowerup_Created`. The server sends the
 inventory on spawn and synchronizes weapon selection, including number keys,
-cycling, and holstering. Server-side firing, damage, and mine detonation are
-still being ported.
+cycling, and holstering. For the stock rifles and pistol, the server tracks
+magazine and reserve rounds, uses the original firing rates and reload times,
+and synchronizes trigger state and remaining ammunition. Both manual and
+automatic reloads use the weapon's reserve. Projectile hits, damage, and C4
+placement and detonation are still being ported.
 
 `TimeLimitMinutes` starts counting down when the server starts the loaded map.
 Clients receive the remaining round time when joining and after loading the
@@ -122,10 +125,10 @@ tiebreaker. Scoring and combat-based victory rules are still being ported.
 
 The two-client UDP fixture covers login, map readiness, movement replication,
 the remaining time for a late join, spawn inventory, weapon selection visible
-to both peers, object removal, and LAN announcements and withdrawal. The round
-fixture advances the server clock
-through a timeout and checks the announced map, its spawn and position encoding,
-movement after a reload, and the end of the map cycle.
+to both peers, firing and reloads, object removal, and LAN announcements and
+withdrawal. The round fixture advances the server clock through a timeout and
+checks the announced map, its spawn and position encoding, movement after a
+map reload, and the end of the map cycle.
 
 On Linux arm64 and with the Linux amd64 build running under QEMU, graphical EA
 1.038 Windows clients loaded `C&C_Field.mix`, spawned and displayed another
