@@ -317,6 +317,10 @@ void HeadlessJoin::Send_Game_Options(int recipient)
         packet.Add(false);
     }
     packet.Add_Wide_Terminated_String(Options.Motd.c_str(), true);
+    // Extra fields from cGameDataCnc::Export_Tier_2_Data.
+    packet.Add(false); // Base destruction ends the game.
+    packet.Add(false); // Beacon placement ends the game.
+    packet.Add(0); // Starting credits.
     packet.Add(static_cast<float>(Options.TimeLimit * 60));
     packet.Add(HostedGameNumber);
     packet.Add(0); // Mod CRC.

@@ -732,7 +732,10 @@ void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
         packet.Get_Bits(flags, 7);
         WCHAR motd[100];
         packet.Get_Wide_Terminated_String(motd, 100, true);
-        Check(std::u16string(motd) == u"Ready" && Field<float>(packet) == 1380.0f &&
+        Check(std::u16string(motd) == u"Ready", "Wrong message of the day in game options");
+        Check(!Field<bool>(packet) && !Field<bool>(packet) && Field<int>(packet) == 0,
+            "Incorrect C&C victory options or starting credits");
+        Check(Field<float>(packet) == 1380.0f &&
             Field<int>(packet) == 1 && Field<uint32>(packet) == 0 && Field<uint32>(packet) == TestMapCRC,
             "The original game options packet had an incorrect footer");
         client.HasOptions = true;
