@@ -22,6 +22,7 @@ public:
     void Introduce_Soldier(int owner_id, int recipient, const HeadlessSoldierPreset &preset, unsigned armor_types);
     void Set_Player_Loading(int peer_id, bool loading);
     void Remove_Player(int peer_id);
+    void Reset_Soldiers();
     void Receive_Control(cPacket &packet, int peer_id);
     void Advance(HeadlessSimulation::Clock::duration elapsed);
     static bool Client_Owns_Object_Id(int peer_id, int object_id);

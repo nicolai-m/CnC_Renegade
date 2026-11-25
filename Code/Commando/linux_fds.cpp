@@ -680,6 +680,9 @@ int Run_Headless(const Settings &settings, const Options &options, const in_addr
     auto previous = HeadlessSimulation::Clock::now();
     while (!stop_requested) {
         const auto frame_start = HeadlessSimulation::Clock::now();
+        if (join) {
+            join->Update_Round(frame_start);
+        }
         server.Service_Read();
         if (join) {
             join->Close_Pending();

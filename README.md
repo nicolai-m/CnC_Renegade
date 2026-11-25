@@ -103,12 +103,17 @@ peers receive position and movement updates for the soldiers known to them.
 
 `TimeLimitMinutes` starts counting down when the server starts the loaded map.
 Clients receive the remaining round time when joining and after loading the
-map. A value of `0` disables the time limit. Round-ending rules and map
-rotation are still being ported.
+map. A value of `0` disables the time limit. When the timer expires, the server
+sends the original results event. After a ten-second intermission it restarts
+the current map on the existing connections and spawns players as each client
+finishes reloading. Both teams currently have zero points, so the result uses
+Nod as the tiebreaker. Scoring, combat-based victory rules, and rotation to
+other maps are still being ported.
 
 The two-client UDP fixture covers login, map readiness, movement replication,
 the remaining time for a late join, object removal when a player leaves, and
-LAN announcements and withdrawal.
+LAN announcements and withdrawal. The round fixture advances the server clock
+through a timeout and checks the result, reload, and movement in the next round.
 
 On Linux arm64 and with the Linux amd64 build running under QEMU, graphical EA
 1.038 Windows clients loaded `C&C_Field.mix`, spawned and displayed another

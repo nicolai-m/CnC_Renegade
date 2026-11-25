@@ -5,6 +5,7 @@
 #include <chrono>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 
@@ -25,9 +26,12 @@ struct HeadlessJoinOptions {
 
 class HeadlessJoin {
 public:
+    using Clock = std::chrono::steady_clock;
+
     HeadlessJoin(cConnection &connection, HeadlessPlayerSession &session, const HeadlessJoinData &data,
         const HeadlessJoinOptions &options);
 
+    void Update_Round(Clock::time_point now);
     REFUSAL_CODE Accept(cPacket &packet);
     void Connected(int peer_id);
     void Receive(cPacket &packet, int peer_id);
@@ -36,7 +40,7 @@ public:
     void Write_Lan_Announcement(cPacket &packet, uint32 address, uint32 sequence, bool hosting) const;
 
 private:
-    using Clock = std::chrono::steady_clock;
+    enum class LoadState { Loading, Ready, AwaitingReload };
 
     struct Peer {
         std::u16string Name;
@@ -44,25 +48,33 @@ private:
         int Team = -1;
         int PlayerObject = 0;
         int SoldierObject = 0;
-        bool Loading = true;
+        LoadState State = LoadState::Loading;
     };
 
     void Receive_Bio(cPacket &packet, int peer_id, Peer &peer);
     void Set_Loading(int peer_id, Peer &peer, bool loading);
+    void Spawn_Player(int peer_id, Peer &peer);
+    void Begin_Intermission();
+    void Restart_Round();
     Clock::duration Time_Remaining() const;
     void Write_Game_Info(cPacket &packet, uint32 address) const;
     void Send_Game_Options(int recipient);
     void Send_Game_Data(int recipient);
+    void Send_Round_Result(int recipient);
     void Send_Team(int recipient, int team);
     void Send_Player(int recipient, int player_id, const Peer &peer, bool creation);
     void Introduce_Soldier(int recipient, int player_id, const Peer &peer);
+    void Delete_Object(int recipient, int object);
 
     cConnection &Connection;
     HeadlessPlayerSession &Session;
     const HeadlessJoinData &Data;
     const HeadlessJoinOptions &Options;
     const uint32 MapCrc;
-    const Clock::time_point RoundEnd;
+    Clock::time_point FrameTime;
+    Clock::time_point RoundEnd;
+    std::optional<Clock::time_point> IntermissionEnd;
+    int HostedGameNumber = 1;
     std::u16string PendingName;
     std::map<int, Peer> Peers;
     std::set<int> Closing;

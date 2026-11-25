@@ -66,7 +66,9 @@ bool HeadlessPlayerSession::Attach_Player(int peer_id, int player_type, int sold
     const auto &soldier = *Simulation.Find_Soldier(peer_id);
     const Vector2 forward(std::cos(soldier.SpawnHeading), std::sin(soldier.SpawnHeading));
     const auto target = soldier.Position + Vector3(forward.X, forward.Y, SoldierEyeHeight);
-    auto &peer = Peers.emplace(peer_id, Peer{soldier_object_id, forward, target}).first->second;
+    const auto previous = Peers.find(peer_id);
+    const int control = previous == Peers.end() ? 0 : previous->second.ControlObject;
+    auto &peer = Peers.insert_or_assign(peer_id, Peer{soldier_object_id, forward, target, control}).first->second;
     peer.Viewers.insert(peer_id);
     return true;
 }
@@ -134,6 +136,16 @@ void HeadlessPlayerSession::Remove_Player(int peer_id)
     Simulation.Remove_Soldier(peer_id);
     for (auto &[id, peer] : Peers) {
         peer.Viewers.erase(peer_id);
+    }
+}
+
+void HeadlessPlayerSession::Reset_Soldiers()
+{
+    for (auto &[id, peer] : Peers) {
+        Set_Player_Loading(id, true);
+        Simulation.Remove_Soldier(id);
+        peer.SoldierObject = 0;
+        peer.Viewers.clear();
     }
 }
 

@@ -29,9 +29,11 @@
 #include "crc.h"
 #include "combatchunkid.h"
 #include "headless_collision.h"
+#include "headless_join.h"
 #include "headless_player_session.h"
 #include "headless_simulation.h"
 #include "netutil.h"
+#include "networkobject.h"
 #include "obbox.h"
 #include "packetmgr.h"
 #include "playertype.h"
@@ -679,6 +681,7 @@ struct Join_Client_State {
     std::set<int> Deleted;
     std::optional<float> OptionsTime;
     std::optional<int> GameDataTime;
+    int Round = 1;
 };
 
 Join_Client_State FirstJoinClient;
@@ -762,6 +765,30 @@ private:
     uint32 LastSequence = 0;
 };
 
+void Read_Player(cPacket &packet, Join_Client_State &client, int object, bool creation)
+{
+    if (creation) {
+        WCHAR name[64];
+        packet.Get_Wide_Terminated_String(name, 64);
+        Check(std::u16string(name) == u"First" || std::u16string(name) == u"Second", "Unexpected player name");
+    }
+    const int id = Field<int>(packet);
+    Check(creation ? client.Players.emplace(id, object).second : client.Players.at(id) == object,
+        "Incorrect player object identity");
+    Check(Field<int>(packet) == 0, "Unexpected ladder points");
+    const int team = Field<int>(packet);
+    Check((team == PLAYERTYPE_GDI || team == PLAYERTYPE_NOD) && Field<int>(packet) == 100 &&
+        Field<int>(packet) == 0, "Incorrect team, damage scale or ping");
+    const bool in_game = Field<bool>(packet);
+    Check((in_game || !creation) && !Field<bool>(packet) && Field<bool>(packet), "Incorrect player state");
+    ULONG ranking;
+    packet.Get_Bits(ranking, 32);
+    packet.Get_Bits(ranking, 32);
+    for (int i = 0; i < 4; ++i) {
+        Check(Field<uint32>(packet) == 0, "Unexpected player statistics");
+    }
+}
+
 void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
 {
     const int object = Field<int>(packet);
@@ -769,6 +796,12 @@ void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
     const bool deleting = Field<bool>(packet);
     if (dirty == 0 && deleting) {
         client.Deleted.insert(object);
+        const auto old_soldier = std::find_if(client.Soldiers.begin(), client.Soldiers.end(), [object](const auto &entry) {
+            return entry.second == object;
+        });
+        if (old_soldier != client.Soldiers.end()) {
+            client.Soldiers.erase(old_soldier);
+        }
         Check(packet.Is_Flushed(), "Unexpected data in object deletion");
         return;
     }
@@ -778,6 +811,11 @@ void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
         packet.Get_Bits(position, 16);
         client.Y[object] = -21.0f + static_cast<float>(position & 0xffu) * (42.0f / 255.0f);
         packet.Flush();
+        return;
+    }
+    if (dirty == NetworkObjectClass::BIT_RARE) { // cPlayer update after loading.
+        Read_Player(packet, client, object, false);
+        Check(!deleting && packet.Is_Flushed(), "Incorrect player update after loading");
         return;
     }
     Check(dirty == 15, "Unexpected object update in the join sequence");
@@ -806,26 +844,10 @@ void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
         client.OptionsTime = remaining;
         break;
     }
-    case 1011: { // cPlayer.
+    case 1011: // cPlayer.
         Check(!deleting, "The player object was immediately deleted");
-        WCHAR name[64];
-        packet.Get_Wide_Terminated_String(name, 64);
-        const int id = Field<int>(packet);
-        Check(client.Players.emplace(id, object).second &&
-            (std::u16string(name) == u"First" || std::u16string(name) == u"Second"), "Incorrect player creation");
-        Check(Field<int>(packet) == 0, "Unexpected ladder points");
-        const int team = Field<int>(packet);
-        Check((team == PLAYERTYPE_GDI || team == PLAYERTYPE_NOD) && Field<int>(packet) == 100 &&
-            Field<int>(packet) == 0 && Field<bool>(packet) && !Field<bool>(packet) && Field<bool>(packet),
-            "Incorrect player state on join");
-        ULONG ranking;
-        packet.Get_Bits(ranking, 32);
-        packet.Get_Bits(ranking, 32);
-        for (int i = 0; i < 4; ++i) {
-            Check(Field<uint32>(packet) == 0, "Unexpected player statistics");
-        }
+        Read_Player(packet, client, object, true);
         break;
-    }
     case 1000: { // Soldier GameObj with factory data and all update tiers.
         const int preset = Field<int>(packet);
         ULONG position;
@@ -857,10 +879,22 @@ void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
     }
     case 1012: { // cGameDataUpdateEvent.
         const int remaining = Field<int>(packet);
-        Check(client.OptionsTime && remaining > 0 && remaining <= *client.OptionsTime &&
-            Field<int>(packet) == 1 && !client.Soldiers.empty(),
+        const float limit = client.Round == 1 ? client.OptionsTime.value() : 1380.0f;
+        Check(remaining > 0 && remaining <= limit && Field<int>(packet) == client.Round && !client.Soldiers.empty(),
             "Incorrect game clock after map load");
         client.GameDataTime = remaining;
+        break;
+    }
+    case 1003: { // cWinEvent.
+        Check(deleting && Field<int>(packet) == PLAYERTYPE_NOD && Field<int>(packet) == -99999 &&
+            Field<int>(packet) == client.Round && !Field<bool>(packet) && Field<int>(packet) == 2 &&
+            Field<uint32>(packet) == 1380, "Incorrect timed round result");
+        WCHAR mvp[64];
+        packet.Get_Wide_Terminated_String(mvp, 64, true);
+        Check(*mvp == 0 && Field<int>(packet) == 0 && Field<uint32>(packet) == 0 &&
+            Field<uint32>(packet) == TestMapCRC, "Incorrect next map or MVP data");
+        ++client.Round;
+        client.GameDataTime.reset();
         break;
     }
     default:
@@ -921,10 +955,115 @@ void Send_Bio(cConnection &client, const WCHAR *name, int team, int id_offset, c
     client.Send_Packet_To_Individual(packet, SERVER_RHOST_ID, SEND_RELIABLE);
 }
 
+void Send_Loading(cConnection &client, int id_offset, bool loading)
+{
+    const int owner = client.Get_Local_Id();
+    cPacket packet;
+    packet.Add(FirstControlObject + (owner - 1) * 100000 + id_offset);
+    packet.Add(static_cast<BYTE>(15));
+    packet.Add(false);
+    packet.Add(1027); // NETCLASSID_LOADINGEVENT.
+    packet.Add(owner);
+    packet.Add(loading);
+    client.Send_Packet_To_Individual(packet, SERVER_RHOST_ID, SEND_RELIABLE);
+}
+
+void Check_Round_Restart(const HeadlessCollision &collision)
+{
+    FirstJoinClient = {};
+    SecondJoinClient = {};
+    const HeadlessJoinData data{42, 1, 2, 2, {{{400, "soldier0", 100, 50, 1}, {401, "soldier1", 100, 50, 1}}}};
+    HeadlessJoinOptions options;
+    options.Map = "C&C_Test.mix";
+    options.Owner = u"FixtureHost";
+    options.Title = u"Join fixture";
+    options.Motd = u"Ready";
+    options.Password = u"testpass";
+    options.Address = htonl(INADDR_LOOPBACK);
+    options.TimeLimit = 23;
+    cConnection server;
+    Check(server.Init_As_Server(0, 16, true, INADDR_LOOPBACK), "Could not bind round test server");
+    server.Set_Bandwidth_Budget_Out(TestBandwidth);
+    JoinPort = server.Get_Local_Port();
+    JoinKey = data.VersionKey;
+    HeadlessPlayerSession session(collision, server);
+    HeadlessJoin join(server, session, data, options);
+    server.Install_Application_Acceptance_Handler([&](cPacket &packet) { return join.Accept(packet); });
+    server.Install_Conn_Handler([&](int id) { join.Connected(id); });
+    int received = 0;
+    server.Install_Server_Packet_Handler([&](cPacket &packet, int id) {
+        join.Receive(packet, id);
+        ++received;
+    });
+
+    cConnection first;
+    cConnection second;
+    const auto pump = [&](const auto &ready) {
+        Pump_Clients({&first, &second}, [&] {
+            server.Service_Read();
+            join.Close_Pending();
+            server.Service_Send(true);
+            return ready();
+        });
+    };
+    Connect_Join_Client(first, u"First", u"testpass", JoinKey, Receive_First_Join);
+    Connect_Join_Client(second, u"Second", u"testpass", JoinKey, Receive_Second_Join);
+    pump([&] { return FirstJoinClient.OptionsTime && SecondJoinClient.OptionsTime; });
+    Check(first.Get_Local_Id() == 1 && second.Get_Local_Id() == 2, "Unexpected round test peer IDs");
+    cPacket control;
+    Write_Movement(control, FirstControlObject, 1, -1, 0);
+    first.Send_Packet_To_Individual(control, SERVER_RHOST_ID, SEND_RELIABLE);
+    Send_Bio(first, u"First", PLAYERTYPE_GDI, 1, "C&C_Test.mix");
+    Send_Bio(second, u"Second", PLAYERTYPE_NOD, 1, "C&C_Test.mix");
+    pump([&] { return FirstJoinClient.Soldiers.size() == 2 && SecondJoinClient.Soldiers.size() == 2; });
+    const auto old_soldiers = FirstJoinClient.Soldiers;
+    const auto players = FirstJoinClient.Players;
+
+    const auto expired = HeadlessJoin::Clock::now() + 23min;
+    join.Update_Round(expired);
+    pump([&] { return FirstJoinClient.Round == 2 && SecondJoinClient.Round == 2; });
+
+    const auto finish_loading = [&](cConnection &client) {
+        const int before = received;
+        Send_Loading(client, 2, true);
+        Send_Loading(client, 3, false);
+        pump([&] { return received >= before + 2; });
+    };
+    join.Update_Round(expired + 9s);
+    finish_loading(first);
+    Check(FirstJoinClient.Soldiers == old_soldiers && !FirstJoinClient.GameDataTime,
+        "A client that loaded early must wait for intermission to end");
+
+    join.Update_Round(expired + 10s);
+    pump([&] { return FirstJoinClient.GameDataTime && SecondJoinClient.Soldiers.empty(); });
+    Check(*FirstJoinClient.GameDataTime == 1380 && FirstJoinClient.Soldiers.size() == 1 &&
+        FirstJoinClient.Soldiers.at(1) != old_soldiers.at(1) && !SecondJoinClient.GameDataTime,
+        "Only the ready player should respawn with a reset clock when the next round starts");
+
+    join.Update_Round(expired + 11s);
+    finish_loading(second);
+    pump([&] { return SecondJoinClient.GameDataTime && FirstJoinClient.Soldiers.size() == 2 &&
+        SecondJoinClient.Soldiers.size() == 2; });
+    Check(*SecondJoinClient.GameDataTime == 1379 && SecondJoinClient.Soldiers.at(2) != old_soldiers.at(2) &&
+        FirstJoinClient.Soldiers == SecondJoinClient.Soldiers && FirstJoinClient.Players == players &&
+        SecondJoinClient.Players == players, "Round restart did not preserve the players and replace their soldiers");
+
+    const int new_soldier = FirstJoinClient.Soldiers.at(1);
+    const int before = received;
+    cPacket movement;
+    Write_Movement(movement, FirstControlObject, 0, new_soldier, 8);
+    first.Send_Packet_To_Individual(movement, SERVER_RHOST_ID, SEND_UNRELIABLE);
+    pump([&] { return received > before; });
+    session.Advance(100ms);
+    pump([&] { return FirstJoinClient.Y[new_soldier] > 2.25f && SecondJoinClient.Y[new_soldier] > 2.25f; });
+}
+
 void Check_Original_Join(unsigned short port, const std::string &definitions, const std::string &armor,
     LanReceiver &lan)
 {
     Check(cNetUtil::Protocol_Init(false), "IPv4 unavailable for the join test");
+    FirstJoinClient = {};
+    SecondJoinClient = {};
     JoinPort = port;
     const std::string version = "RENEGADE 1234 strings.tdb 145 ";
     auto ddb_crc = CRC::Memory(reinterpret_cast<const unsigned char *>(definitions.data()), definitions.size());
@@ -1066,6 +1205,7 @@ int main(int argc, char **argv)
         Check_Box_Sweeps(collision);
         Check_Soldier_Simulation(collision);
         Check_Player_Transport(collision);
+        Check_Round_Restart(collision);
 
         FdsProcess check(argv[1], fixture.Path, master, "--check");
         const auto check_status = check.Wait();
