@@ -26,6 +26,7 @@
 #include "aabox.h"
 #include "coltype.h"
 #include "connect.h"
+#include "control.h"
 #include "crc.h"
 #include "combatchunkid.h"
 #include "headless_collision.h"
@@ -321,16 +322,30 @@ std::string Definitions()
         const auto identity = Chunk(0x100, Micro(1, id) + Micro(3, name), false);
         const auto defense = Chunk(7311607, Micro(0, 100.0f) + Micro(3, 50.0f) + Micro(5, uint32{1}), false);
         const auto physical = Chunk(418001829, Chunk(909991657, Micro(18, physics), false));
-        return Chunk(CHUNKID_GAME_OBJECT_DEF_SOLDIER, Chunk(0x00100101, identity + defense + physical));
+        const auto weapons = Chunk(418001830, Micro(11, sint32{600 + id - 400}) + Micro(12, sint32{500}) +
+            Micro(14, sint32{620}), false);
+        const auto scripts = Chunk(627001057, Micro(2, "M00_GrantPowerup_Created") + Micro(3, "POW_Pistol"), false);
+        return Chunk(CHUNKID_GAME_OBJECT_DEF_SOLDIER,
+            Chunk(0x00100101, identity + defense + physical + weapons + scripts));
     };
     auto physics = [](sint32 id, const char (&model)[18]) {
         return Chunk(0x20501, Chunk(0x00100101, Chunk(0x100, Micro(1, id), false) +
             Chunk(0x055ffe08, Micro(1, model), false)));
     };
+    auto weapon = [](sint32 id, sint32 clip, sint32 reserve, float key) {
+        return Chunk(CHUNKID_WEAPON_DEF, Chunk(0x00100101,
+            Chunk(1205091655, Chunk(0x100, Micro(1, id), false)) +
+            Chunk(1205091654, Micro(29, clip) + Micro(35, reserve) + Micro(37, key), false)));
+    };
+    const auto powerup = Chunk(CHUNKID_GAME_OBJECT_DEF_POWERUP, Chunk(0x00100101,
+        Chunk(909991656, Chunk(0x100, Micro(1, sint32{630}) + Micro(3, "pow_pistol"), false)) +
+        Chunk(909991657, Micro(8, sint32{610}) + Micro(9, uint8{1}) + Micro(10, sint32{-1}), false)));
     return Chunk(CHUNKID_SAVELOAD_DEFMGR, Chunk(0x101,
         definition(100, PLAYERTYPE_NOD) + definition(200, PLAYERTYPE_GDI) +
         soldier(400, "CnC_Nod_Minigunner_0", 500) + soldier(401, "CnC_GDI_MiniGunner_0", 501) +
-        physics(500, "test\\soldier0.w3d") + physics(501, "test\\soldier1.w3d")));
+        physics(500, "test\\soldier0.w3d") + physics(501, "test\\soldier1.w3d") +
+        weapon(600, 40, 200, 2) + weapon(601, 40, 200, 2) + weapon(610, 12, 100, 1) +
+        weapon(620, 1, 0, 7) + powerup));
 }
 
 struct ArchiveEntry {
@@ -517,7 +532,7 @@ void Receive_Movement_Snapshot(cPacket &packet)
 }
 
 void Write_Movement(cPacket &packet, int control_object, int owner, int soldier, float target_y,
-    float position_extent = 21.0f, unsigned position_bits = 8)
+    float position_extent = 21.0f, unsigned position_bits = 8, ULONG buttons = 0)
 {
     packet.Add(control_object);
     packet.Add(static_cast<BYTE>(owner ? 15 : 1));
@@ -530,7 +545,7 @@ void Write_Movement(cPacket &packet, int control_object, int owner, int soldier,
     if (soldier == -1) {
         return;
     }
-    packet.Add_Bits(0, 23); // One-time control flags.
+    packet.Add_Bits(buttons, ControlClass::NUM_BOOLEAN_ONE_TIME);
     packet.Add_Bits(0, 4); // Continuous control flags.
     packet.Add_Bits(255, 8); // Full forward input.
     packet.Add_Bits(128, 8); // Neutral strafe.
@@ -561,7 +576,7 @@ void Check_Player_Transport(const HeadlessCollision &collision)
             REFUSAL_CLIENT_ACCEPTED : REFUSAL_BY_APPLICATION;
     });
     server.Install_Conn_Handler([&](int id) {
-        Check(session.Attach_Player(id, PLAYERTYPE_GDI, SoldierObject), "Could not attach the test soldier");
+        Check(session.Attach_Player(id, PLAYERTYPE_GDI, SoldierObject, {}), "Could not attach the test soldier");
         server.Set_Rhost_Is_In_Game(id, true);
     });
     int received = 0;
@@ -646,7 +661,7 @@ void Check_Player_Transport(const HeadlessCollision &collision)
     const auto before_timeout = snapshot(120ms).Position;
     Check(snapshot(100ms).Position == before_timeout, "Expired movement input continued driving the soldier");
     session.Remove_Player(client.Get_Local_Id());
-    Check(session.Attach_Player(1, PLAYERTYPE_GDI, SoldierObject) && snapshot(50ms).Position == spawn,
+    Check(session.Attach_Player(1, PLAYERTYPE_GDI, SoldierObject, {}) && snapshot(50ms).Position == spawn,
         "Reattaching a peer retained the previous soldier's position or input");
 
     cPacket recreate;
@@ -675,6 +690,7 @@ struct Join_Client_State {
     std::map<int, int> Players; // Peer ID to network object ID.
     std::map<int, int> Soldiers;
     std::map<int, float> Y;
+    std::map<int, int> SelectedWeapon;
     std::set<int> Deleted;
     std::optional<float> OptionsTime;
     std::optional<int> GameDataTime;
@@ -803,6 +819,24 @@ float Read_Join_Position_Y(cPacket &packet, uint32 map_crc)
     return y;
 }
 
+std::vector<HeadlessSpawnWeapon> Fixture_Weapons(int team)
+{
+    return {{610, -1, 1}, {600 + team, 240, 2}, {620, 1, 7}};
+}
+
+void Read_Held_Weapon(cPacket &packet, Join_Client_State &client, int object)
+{
+    Check(!Field<bool>(packet), "Soldier was unexpectedly in a vehicle");
+    int id = 0;
+    if (Field<bool>(packet)) {
+        id = Field<int>(packet);
+        const int rounds = Field<int>(packet);
+        Check((id == 610 && rounds == -1) || ((id == 600 || id == 601) && rounds == 240) ||
+            (id == 620 && rounds == 1), "Incorrect equipped weapon or ammo count");
+    }
+    client.SelectedWeapon[object] = id;
+}
+
 void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
 {
     const int object = Field<int>(packet);
@@ -820,7 +854,8 @@ void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
         return;
     }
     if (dirty == 1) {
-        Check(!deleting && !Field<bool>(packet) && !Field<bool>(packet), "Unexpected soldier update flags");
+        Check(!deleting, "Unexpected deletion flag on soldier update");
+        Read_Held_Weapon(packet, client, object);
         client.Y[object] = Read_Join_Position_Y(packet, client.MapCRC);
         packet.Flush();
         return;
@@ -886,8 +921,15 @@ void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
         packet.Get_Bits(defense, 11);
         Check(defense == 51, "Wrong initial shield");
         packet.Get_Bits(defense, 2);
-        Check(defense == 2 && Field<int>(packet) == 0 && !Field<bool>(packet) && !Field<bool>(packet),
-            "Wrong shield type or initial weapons");
+        const auto inventory = Fixture_Weapons(preset - first_preset);
+        Check(defense == 2 && Field<int>(packet) == static_cast<int>(inventory.size()),
+            "Wrong shield type or size of the spawn inventory");
+        for (const auto &weapon : inventory) {
+            Check(Field<int>(packet) == weapon.DefinitionId && Field<int>(packet) == weapon.Rounds,
+                "Spawn inventory did not include the armed preset and the scripted weapon grant");
+        }
+        Read_Held_Weapon(packet, client, object);
+        Check(client.SelectedWeapon.at(object) == 600 + preset - first_preset, "The primary weapon must start equipped");
         packet.Flush();
         break;
     }
@@ -989,7 +1031,8 @@ void Check_Map_Rotation(const HeadlessCollision &collision, const HeadlessCollis
     FirstJoinClient = {};
     SecondJoinClient = {};
     LateJoinClient = {};
-    const HeadlessJoinData data{42, 1, 2, 2, {{{400, "soldier0", 100, 50, 1}, {401, "soldier1", 100, 50, 1}}}};
+    const HeadlessJoinData data{42, 1, 2, 2, {{{400, "soldier0", 100, 50, 1, Fixture_Weapons(0), 600},
+        {401, "soldier1", 100, 50, 1, Fixture_Weapons(1), 601}}}};
     auto next_data = data;
     next_data.Soldiers[PLAYERTYPE_NOD].DefinitionId = 410;
     next_data.Soldiers[PLAYERTYPE_GDI].DefinitionId = 411;
@@ -1178,6 +1221,21 @@ void Check_Original_Join(unsigned short port, const std::string &definitions, co
     Pump_Clients({&first, &second}, [&] {
         return FirstJoinClient.Y[first_soldier] > 2.25f && SecondJoinClient.Y[first_soldier] > 2.25f;
     });
+
+    const auto select = [&](ControlClass::BooleanControl button, int expected) {
+        cPacket input;
+        Write_Movement(input, FirstControlObject, 0, first_soldier, 8, 21.0f, 8, 1u << button);
+        first.Send_Packet_To_Individual(input, SERVER_RHOST_ID, SEND_UNRELIABLE);
+        Pump_Clients({&first, &second}, [&] {
+            return FirstJoinClient.SelectedWeapon.at(first_soldier) == expected &&
+                SecondJoinClient.SelectedWeapon.at(first_soldier) == expected;
+        });
+    };
+    select(ControlClass::BOOLEAN_WEAPON_NEXT, 620);
+    select(ControlClass::BOOLEAN_WEAPON_PREV, 601);
+    select(ControlClass::BOOLEAN_SELECT_WEAPON_1, 610);
+    select(ControlClass::BOOLEAN_SELECT_NO_WEAPON, 0);
+    select(ControlClass::BOOLEAN_WEAPON_NEXT, 610);
 
     cPacket goodbye;
     goodbye.Add(FirstControlObject + 3);

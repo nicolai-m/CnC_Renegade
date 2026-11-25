@@ -305,7 +305,7 @@ void HeadlessJoin::Request_Reload(int peer_id, Peer &peer)
 
 void HeadlessJoin::Spawn_Player(int peer_id, Peer &peer)
 {
-    if (!Session.Attach_Player(peer_id, peer.Team, NextObject)) {
+    if (!Session.Attach_Player(peer_id, peer.Team, NextObject, Maps[MapIndex].Join.Soldiers[peer.Team])) {
         Closing.insert(peer_id);
         return;
     }

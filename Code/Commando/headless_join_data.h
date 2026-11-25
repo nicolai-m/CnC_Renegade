@@ -5,8 +5,15 @@
 #include <array>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "headless_collision.h"
+
+struct HeadlessSpawnWeapon {
+    int DefinitionId;
+    int Rounds; // Total rounds. The original protocol sends -1 for unlimited ammo.
+    float KeyNumber;
+};
 
 struct HeadlessSoldierPreset {
     int DefinitionId = 0;
@@ -14,6 +21,8 @@ struct HeadlessSoldierPreset {
     int Health = 0;
     int Shield = 0;
     unsigned ShieldType = 0;
+    std::vector<HeadlessSpawnWeapon> Weapons;
+    int StartingWeapon = 0;
 };
 
 struct HeadlessJoinData {

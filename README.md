@@ -101,6 +101,12 @@ The join sends the original teams and game options and waits for the client's
 post-load biography before creating its player and soldier objects. Connected
 peers receive position and movement updates for the soldiers known to them.
 
+The minigunner starts with the weapons and ammunition in its original preset
+and the weapon grants from `M00_GrantPowerup_Created`. The server sends the
+inventory on spawn and synchronizes weapon selection, including number keys,
+cycling, and holstering. Server-side firing, damage, and mine detonation are
+still being ported.
+
 `TimeLimitMinutes` starts counting down when the server starts the loaded map.
 Clients receive the remaining round time when joining and after loading the
 map. A value of `0` disables the time limit. When the timer expires, the server
@@ -115,8 +121,9 @@ Both teams currently have zero points, so the result uses Nod as the
 tiebreaker. Scoring and combat-based victory rules are still being ported.
 
 The two-client UDP fixture covers login, map readiness, movement replication,
-the remaining time for a late join, object removal when a player leaves, and
-LAN announcements and withdrawal. The round fixture advances the server clock
+the remaining time for a late join, spawn inventory, weapon selection visible
+to both peers, object removal, and LAN announcements and withdrawal. The round
+fixture advances the server clock
 through a timeout and checks the announced map, its spawn and position encoding,
 movement after a reload, and the end of the map cycle.
 
@@ -140,8 +147,7 @@ its transition. The unchanged client switched from `C&C_Field.mix` to
 `C&C_Under.mix` and back over the same connection.
 
 Graphical testing on native Linux amd64, multiple-map testing with a client
-that handles the full map set, weapons, and match rules are
-still pending.
+that handles the full map set, combat, and match rules are still pending.
 
 
 ### Level Edit (Public Release)

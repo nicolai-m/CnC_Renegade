@@ -5,13 +5,14 @@
 #include <array>
 #include <map>
 #include <set>
+#include <vector>
 
 #include "encodertypeentry.h"
+#include "headless_join_data.h"
 #include "headless_simulation.h"
 
 class cConnection;
 class cPacket;
-struct HeadlessSoldierPreset;
 
 class HeadlessPlayerSession {
 public:
@@ -19,7 +20,7 @@ public:
     static void Validate_Map(const HeadlessCollision &collision);
 
     // The joining client must know the soldier's network object before the first update.
-    bool Attach_Player(int peer_id, int player_type, int soldier_object_id);
+    bool Attach_Player(int peer_id, int player_type, int soldier_object_id, const HeadlessSoldierPreset &preset);
     void Introduce_Soldier(int owner_id, int recipient, const HeadlessSoldierPreset &preset, unsigned armor_types);
     void Set_Player_Loading(int peer_id, bool loading);
     void Remove_Player(int peer_id);
@@ -38,9 +39,12 @@ private:
         HeadlessSimulation::Clock::duration InputRemaining{};
         std::set<int> Viewers;
         bool Ready = true;
+        std::vector<HeadlessSpawnWeapon> Weapons;
+        int WeaponSlot = 0; // Slot zero is holstered, as in WeaponBagClass.
     };
 
     bool Read_Control(cPacket &packet, int peer_id, Peer &peer);
+    static void Select_Weapon(Peer &peer, ULONG controls);
     static void Init_Position_Encoders(const HeadlessCollision &collision, std::array<cEncoderTypeEntry, 3> &encoders);
     void Write_Position(cPacket &packet, const Vector3 &position);
     void Write_Frequent(cPacket &packet, int peer_id, const Peer &peer);

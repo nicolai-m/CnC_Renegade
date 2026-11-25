@@ -67,7 +67,8 @@ void HeadlessPlayerSession::Init_Position_Encoders(const HeadlessCollision &coll
     }
 }
 
-bool HeadlessPlayerSession::Attach_Player(int peer_id, int player_type, int soldier_object_id)
+bool HeadlessPlayerSession::Attach_Player(int peer_id, int player_type, int soldier_object_id,
+    const HeadlessSoldierPreset &preset)
 {
     if (peer_id <= SERVER_RHOST_ID || peer_id > Connection.Get_Max_RHost() ||
         !Connection.Get_Remote_Host(peer_id) || soldier_object_id <= 0 ||
@@ -82,6 +83,13 @@ bool HeadlessPlayerSession::Attach_Player(int peer_id, int player_type, int sold
     const auto previous = Peers.find(peer_id);
     const int control = previous == Peers.end() ? 0 : previous->second.ControlObject;
     auto &peer = Peers.insert_or_assign(peer_id, Peer{soldier_object_id, forward, target, control}).first->second;
+    peer.Weapons = preset.Weapons;
+    const auto starting_weapon = std::find_if(peer.Weapons.begin(), peer.Weapons.end(), [&](const auto &weapon) {
+        return weapon.DefinitionId == preset.StartingWeapon;
+    });
+    if (starting_weapon != peer.Weapons.end()) {
+        peer.WeaponSlot = static_cast<int>(starting_weapon - peer.Weapons.begin()) + 1;
+    }
     peer.Viewers.insert(peer_id);
     return true;
 }
@@ -124,7 +132,11 @@ void HeadlessPlayerSession::Introduce_Soldier(int owner_id, int recipient, const
     packet.Add_Bits(code, vitals.Get_Bit_Precision());
     armor.Scale(preset.ShieldType, code);
     packet.Add_Bits(code, armor.Get_Bit_Precision());
-    packet.Add(0); // Weapon list size.
+    packet.Add(static_cast<int>(peer.Weapons.size()));
+    for (const auto &weapon : peer.Weapons) {
+        packet.Add(weapon.DefinitionId);
+        packet.Add(weapon.Rounds);
+    }
     Write_Frequent(packet, owner_id, peer);
     Connection.Send_Packet_To_Individual(packet, recipient, SEND_RELIABLE);
     peer.Viewers.insert(recipient);
@@ -163,6 +175,8 @@ void HeadlessPlayerSession::Reset_Map(const HeadlessCollision &collision)
         peer.MoveAxes.Set(0, 0);
         peer.InputRemaining = {};
         peer.Viewers.clear();
+        peer.Weapons.clear();
+        peer.WeaponSlot = 0;
     }
 }
 
@@ -225,8 +239,10 @@ bool HeadlessPlayerSession::Read_Control(cPacket &packet, int peer_id, Peer &pee
     if (packet.Get_Bits_Remaining() < control_bits + 2 + target_bits) {
         return false;
     }
+    ULONG one_time;
+    packet.Get_Bits(one_time, ControlClass::NUM_BOOLEAN_ONE_TIME);
     ULONG bits;
-    packet.Get_Bits(bits, control_flags);
+    packet.Get_Bits(bits, ControlClass::NUM_BOOLEAN_CONTINUOUS);
     std::array<float, ControlClass::ANALOG_CONTROL_COUNT> analog;
     for (auto &value : analog) {
         packet.Get_Bits(bits, AnalogEncoder.Get_Bit_Precision());
@@ -264,7 +280,40 @@ bool HeadlessPlayerSession::Read_Control(cPacket &packet, int peer_id, Peer &pee
         std::clamp(world_move.Y, -1.0f, 1.0f)));
     peer.InputRemaining = InputTimeout;
     peer.ControlObject = object_id;
+    Select_Weapon(peer, one_time);
     return true;
+}
+
+void HeadlessPlayerSession::Select_Weapon(Peer &peer, ULONG controls)
+{
+    const auto slots = static_cast<int>(peer.Weapons.size()) + 1;
+    const auto select = [&](int direction, int key) {
+        for (int step = 1; step < slots; ++step) {
+            const int slot = (peer.WeaponSlot + direction * step + slots) % slots;
+            if (slot != 0) {
+                const float number = peer.Weapons[slot - 1].KeyNumber;
+                if (key < 0 || (number > -1 && number < 10 && static_cast<int>(number) == key)) {
+                    peer.WeaponSlot = slot;
+                    return;
+                }
+            }
+        }
+    };
+    const auto pressed = [controls](int button) { return (controls & (1u << button)) != 0; };
+    if (pressed(ControlClass::BOOLEAN_WEAPON_NEXT)) {
+        select(1, -1);
+    }
+    if (pressed(ControlClass::BOOLEAN_WEAPON_PREV)) {
+        select(-1, -1);
+    }
+    if (pressed(ControlClass::BOOLEAN_SELECT_NO_WEAPON)) {
+        peer.WeaponSlot = 0;
+    }
+    for (int key = 0; key <= 9; ++key) {
+        if (pressed(ControlClass::BOOLEAN_SELECT_WEAPON_0 + key)) {
+            select(1, key);
+        }
+    }
 }
 
 bool HeadlessPlayerSession::Client_Owns_Object_Id(int peer_id, int object_id)
@@ -315,7 +364,12 @@ void HeadlessPlayerSession::Write_Frequent(cPacket &packet, int peer_id, const P
 {
     const auto &soldier = *Simulation.Find_Soldier(peer_id);
     packet.Add(false); // In vehicle.
-    packet.Add(false); // Holding a weapon.
+    packet.Add(peer.WeaponSlot != 0);
+    if (peer.WeaponSlot != 0) {
+        const auto &weapon = peer.Weapons[peer.WeaponSlot - 1];
+        packet.Add(weapon.DefinitionId);
+        packet.Add(weapon.Rounds);
+    }
     Write_Position(packet, soldier.Position);
     packet.Add_Bits(soldier.Grounded ? HumanStateClass::UPRIGHT : HumanStateClass::AIRBORNE, HumanStateBits);
     const auto left = Left_Of(peer.Forward);
