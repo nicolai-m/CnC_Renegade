@@ -62,6 +62,7 @@ struct HeadlessArmorType {
 };
 
 using HeadlessArmorTable = std::vector<HeadlessArmorType>;
+unsigned Headless_Armor_Index(const HeadlessArmorTable &armor, int save_id);
 
 struct HeadlessJoinData {
     std::uint32_t VersionKey = 0;

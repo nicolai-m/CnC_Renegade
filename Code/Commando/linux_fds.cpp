@@ -323,6 +323,8 @@ Settings Load_Settings(const Options &options, const fs::path &data_dir)
         }
         const auto friendly = Fold_Ascii(Setting(rules->second, "isfriendlyfirepermitted"));
         result.Join.FriendlyFire = !friendly.empty() && std::string_view("yt1").find(friendly.front()) != std::string_view::npos;
+        const auto base_win = Fold_Ascii(Setting(rules->second, "basedestructionendsgame"));
+        result.Join.BaseDestructionEndsGame = base_win.empty() || std::string_view("nf0").find(base_win.front()) == std::string_view::npos;
         const auto loop = Fold_Ascii(Setting(rules->second, "domapsloop"));
         if (!loop.empty() && std::string_view("nf0").find(loop.front()) != std::string_view::npos) {
             result.Join.LoopMaps = false;

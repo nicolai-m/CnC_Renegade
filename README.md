@@ -116,9 +116,9 @@ absorption and skin multipliers come from `armor.ini`. At zero health the
 server stops accepting the soldier's inputs. After two seconds it deletes
 the old soldier and spawns a new minigunner with the same team and fresh
 health, shield, and starting inventory. The player and round stay active.
-Set `IsFriendlyFirePermitted=yes` in `[Settings]` to enable damage between
-teammates. It defaults to off. Skeletal hit zones, damage to vehicles and
-buildings, and C4 placement and detonation remain open.
+Set `IsFriendlyFirePermitted=yes` in `[Settings]` to enable damage to allies
+and their buildings. It defaults to off. Skeletal hit zones, vehicle damage,
+and C4 placement and detonation remain open.
 
 The server records kills and deaths on the player and team objects and sends
 the original kill notification to players in the match. A respawn preserves the
@@ -129,6 +129,12 @@ Minigunner hits award the damage points and kill bonus defined on the victim's
 preset. Shield damage counts in unscaled units, as in the Windows damage
 calculation. Points apply to the player and team. Positive awards also grant
 credits to the player, and friendly fire deducts points.
+
+Rifle and pistol hits also damage buildings. The server associates static map
+components with their buildings and applies the armor defined for the target
+component, including the alternate armor of the Master Control Terminal.
+Clients receive the original building health and destruction updates.
+Building damage and destruction award preset points and credits.
 
 `TimeLimitMinutes` starts counting down when the server starts the loaded map.
 Clients receive the remaining round time when joining and after loading the
@@ -141,8 +147,12 @@ existing connections and spawns players as each client finishes loading.
 `DoMapsLoop=yes` returns to the first map after the last. With `DoMapsLoop=no`,
 the server withdraws its LAN entry and exits after the final intermission.
 At the time limit the team with the highest score wins, with kills breaking a
-points tie. An exact tie goes to Nod. A new round clears scores and credits.
-Building and beacon victory conditions are still being ported.
+points tie. An exact tie goes to Nod. Destroying the last building on an
+opposing team wins the round and awards the original base destruction bonus.
+Set `BaseDestructionEndsGame=no` in `[Settings]` to keep playing after a base is
+destroyed. A new round clears scores and credits and restores the buildings.
+Beacon victory and building functions such as power and production are still
+being ported.
 
 The two-client UDP fixture covers login, map readiness, movement replication,
 the remaining time for a late join, spawn inventory, weapon selection visible
@@ -153,6 +163,9 @@ announcements and withdrawal.
 The round fixture advances the server clock through a timeout
 and checks the timed result and tiebreakers, the announced map, its spawn and
 position encoding, movement after a map reload, and the end of the map cycle.
+The building fixture checks exterior and terminal armor, replicated damage
+and destruction, points and credits, both settings for the base destruction
+rule, and restored buildings in the next round.
 
 On Linux arm64 and with the Linux amd64 build running under QEMU, graphical EA
 1.038 Windows clients loaded `C&C_Field.mix`, spawned and displayed another

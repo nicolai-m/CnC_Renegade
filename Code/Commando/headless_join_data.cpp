@@ -485,6 +485,12 @@ int HeadlessSpawnWeapon::Total_Rounds() const
     return ReserveRounds < 0 ? -1 : static_cast<int>(std::min<std::int64_t>(total, std::numeric_limits<int>::max()));
 }
 
+unsigned Headless_Armor_Index(const HeadlessArmorTable &armor, int save_id)
+{
+    const auto found = std::find_if(armor.begin(), armor.end(), [=](const auto &type) { return type.SaveId == save_id; });
+    return found == armor.end() ? 0 : static_cast<unsigned>(found - armor.begin());
+}
+
 HeadlessJoinData Load_Headless_Join_Data(uint32 client_build, const HeadlessArmorTable &armor,
     const GameDataFile &strings, const GameDataFile &definitions, const std::optional<GameDataFile> &map_definitions,
     const HeadlessCollision::FindAsset &find_core_asset)
@@ -504,10 +510,6 @@ HeadlessJoinData Load_Headless_Join_Data(uint32 client_build, const HeadlessArmo
     if (map_definitions) {
         Load_Presets(*map_definitions, physics, soldiers, equipment);
     }
-    const auto armor_index = [&](int save_id) -> unsigned {
-        const auto found = std::find_if(armor.begin(), armor.end(), [=](const auto &type) { return type.SaveId == save_id; });
-        return found == armor.end() ? 0 : static_cast<unsigned>(found - armor.begin());
-    };
     for (std::size_t team = 0; team < soldiers.size(); ++team) {
         const auto &record = soldiers[team];
         const auto model = physics.find(record.PhysicsId);
@@ -518,8 +520,8 @@ HeadlessJoinData Load_Headless_Join_Data(uint32 client_build, const HeadlessArmo
         }
         result.Soldiers[team] = record.Soldier;
         result.Soldiers[team].Model = model->second;
-        result.Soldiers[team].Skin = armor_index(record.SkinSaveId);
-        result.Soldiers[team].ShieldType = armor_index(record.ShieldSaveId);
+        result.Soldiers[team].Skin = Headless_Armor_Index(armor, record.SkinSaveId);
+        result.Soldiers[team].ShieldType = Headless_Armor_Index(armor, record.ShieldSaveId);
         Load_Starting_Weapons(record, equipment, result.Soldiers[team]);
     }
     return result;

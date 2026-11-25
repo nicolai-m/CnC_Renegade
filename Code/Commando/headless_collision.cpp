@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -479,7 +481,7 @@ struct HeadlessCollision::Loader {
 };
 
 HeadlessCollision::HeadlessCollision(HeadlessLevel level)
-    : Scene(std::move(level)), Objects(Scene.Static_Objects().size())
+    : Scene(std::move(level)), Objects(Scene.Static_Objects().size()), BuildingOwners(Objects.size())
 {
 }
 
@@ -489,12 +491,49 @@ HeadlessCollision HeadlessCollision::Load(HeadlessLevel level, const FindAsset &
     HeadlessCollision collision(std::move(level));
     Loader loader(find_asset, map_dependencies);
     const auto &objects = collision.Scene.Static_Objects();
+    const auto &buildings = collision.Scene.Buildings();
+    std::vector<std::string> prefixes;
+    for (const auto &building : buildings) {
+        prefixes.push_back(Fold_Name(building.MeshPrefix));
+    }
     for (std::size_t i = 0; i < objects.size(); ++i) {
         const auto &object = objects[i];
-        if (!loader.Add_Model(Fold_Name(object.AssetName), object.Transform, collision.Objects[i])) {
+        const auto name = Fold_Name(object.AssetName);
+        const auto &colliders = collision.Objects[i];
+        if (!loader.Add_Model(name, object.Transform, collision.Objects[i])) {
             ++collision.IncompleteObjects;
         }
-        collision.ColliderCount += collision.Objects[i].size();
+        collision.ColliderCount += colliders.size();
+        if (colliders.empty() || (!object.BuildingAggregate && name.find_first_of("#^") == std::string::npos)) {
+            continue;
+        }
+        // The original collects named parts by their world-space bounds, including meshes at the origin.
+        const auto world_box = [](const Collider &collider) {
+            if (collider.Shape->Kind == Geometry::Type::AlignedBox) {
+                return collider.Aligned_Box();
+            }
+            auto bounds = collider.Shape->Bounds;
+            bounds.Transform(collider.Transform);
+            return bounds;
+        };
+        auto bounds = world_box(colliders.front());
+        for (std::size_t j = 1; j < colliders.size(); ++j) {
+            bounds.Add_Box(world_box(colliders[j]));
+        }
+        const auto separator = name.find('.');
+        const auto part = std::string_view(name).substr(separator == std::string::npos ? 0 : separator + 1);
+        float closest = std::numeric_limits<float>::infinity();
+        for (std::size_t j = 0; j < buildings.size(); ++j) {
+            const auto &building = buildings[j];
+            if (prefixes[j].empty() || part.compare(0, prefixes[j].size(), prefixes[j]) != 0) {
+                continue;
+            }
+            const float distance = (bounds.Center - building.CollectionCenter).Length2();
+            if (distance <= building.CollectionRadius * building.CollectionRadius && distance < closest) {
+                closest = distance;
+                collision.BuildingOwners[i] = j;
+            }
+        }
     }
     return collision;
 }

@@ -15,6 +15,7 @@
 #include "combatchunkid.h"
 #include "lineseg.h"
 #include "playertype.h"
+#include "wwphysids.h"
 
 namespace {
 
@@ -31,7 +32,11 @@ constexpr uint32 DefinitionObjects = 0x101;
 constexpr uint32 DefinitionVariables = 0x100;
 constexpr uint32 FactoryData = 0x00100101;
 constexpr uint32 BuildingVariables = 207011121;
+constexpr uint32 BuildingDefinitionVariables = 207011031;
 constexpr uint32 DamageableVariables = 207011214;
+constexpr uint32 DamageableDefinitionVariables = 207011206;
+constexpr uint32 DefenseVariables = 914991020;
+constexpr uint32 AggregateDefinitionVariables = 8281442;
 constexpr uint32 GameObjectVariables = 910991407;
 
 // PhysicsSceneClass and AABTreeCullSystemClass chunk IDs.
@@ -86,12 +91,66 @@ struct SpawnDefinition {
     bool SoldierStartup = false;
 };
 
-void Load_Spawn_Definitions(const GameDataFile &data, std::map<int, SpawnDefinition> &definitions)
+bool Is_Building(uint32 factory);
+
+struct BuildingDefinition {
+    std::string MeshPrefix;
+    unsigned MCTSkin = 0;
+    std::optional<int> PlayerType;
+};
+
+struct MapDefinitions {
+    std::map<int, SpawnDefinition> Spawners;
+    std::map<int, BuildingDefinition> Buildings;
+    std::map<int, bool> AggregateMCT;
+};
+
+void Read_Building_Definition(LevelReader &reader, int &definition_id, BuildingDefinition &building,
+    bool &mct, int depth = 0)
+{
+    reader.Require(depth < 24, "Building definition chunks are nested too deeply");
+    reader.Each_Chunk([&](uint32 id) {
+        if (id == DefinitionVariables || id == BuildingDefinitionVariables || id == DamageableDefinitionVariables ||
+            id == AggregateDefinitionVariables) {
+            reader.Each_Micro([&](uint32 field) {
+                if (id == DefinitionVariables && field == 1) {
+                    definition_id = reader.Value<sint32>();
+                } else if (id == BuildingDefinitionVariables && field == 1) {
+                    building.MeshPrefix = reader.Read_String();
+                } else if (id == BuildingDefinitionVariables && field == 2) {
+                    building.MCTSkin = reader.Value<uint32>();
+                } else if (id == DamageableDefinitionVariables && field == 6) {
+                    building.PlayerType = reader.Value<sint32>();
+                } else if (id == AggregateDefinitionVariables && field == 4) {
+                    mct = reader.Value<uint8>() != 0;
+                }
+            });
+        } else if (reader.Has_Children()) {
+            Read_Building_Definition(reader, definition_id, building, mct, depth + 1);
+        }
+    });
+}
+
+void Load_Map_Definitions(const GameDataFile &data, MapDefinitions &definitions)
 {
     LevelReader reader(data);
     reader.In_Chunk(CHUNKID_SAVELOAD_DEFMGR, [&] {
         reader.In_Chunk(DefinitionObjects, [&] {
             reader.Each_Chunk([&](uint32 id) {
+                const bool aggregate = id == PHYSICS_CHUNKID_BUILDINGAGGREGATEDEF;
+                if (aggregate || Is_Building(id - 1)) { // A building's definition follows its object factory.
+                    int definition_id = 0;
+                    BuildingDefinition building;
+                    bool mct = false;
+                    reader.In_Chunk(FactoryData, [&] { Read_Building_Definition(reader, definition_id, building, mct); });
+                    reader.Require(definition_id > 0, "Building definition is missing its ID");
+                    if (aggregate) {
+                        definitions.AggregateMCT[definition_id] = mct;
+                    } else {
+                        definitions.Buildings[definition_id] = std::move(building);
+                    }
+                    return;
+                }
                 if (id != CHUNKID_SPAWNER_DEF) {
                     return;
                 }
@@ -119,7 +178,7 @@ void Load_Spawn_Definitions(const GameDataFile &data, std::map<int, SpawnDefinit
                     });
                 });
                 reader.Require(definition_id > 0, "Spawner definition is missing its ID");
-                definitions[definition_id] = definition;
+                definitions.Spawners[definition_id] = definition;
             });
         });
     });
@@ -174,7 +233,19 @@ void Read_Building_Parts(LevelReader &reader, HeadlessLevel::Building &building,
 {
     reader.Require(depth < 24, "Building inheritance chunks are nested too deeply");
     reader.Each_Chunk([&](uint32 part) {
-        if (part == GameObjectVariables || part == BuildingVariables || part == DamageableVariables) {
+        if (part == DefenseVariables) {
+            reader.Each_Micro([&](uint32 field) {
+                switch (field) {
+                case 3: building.Health = reader.Value<float>(); break;
+                case 4: building.HealthMax = reader.Value<float>(); break;
+                case 5: building.SkinSaveId = reader.Value<sint32>(); break;
+                case 6: building.Shield = reader.Value<float>(); break;
+                case 8: building.ShieldSaveId = reader.Value<sint32>(); break;
+                case 13: building.DamagePoints = reader.Value<float>(); break;
+                case 14: building.DeathPoints = reader.Value<float>(); break;
+                }
+            });
+        } else if (part == GameObjectVariables || part == BuildingVariables || part == DamageableVariables) {
             reader.Each_Micro([&](uint32 field) {
                 if (part == GameObjectVariables && field == 2) {
                     building.DefinitionId = reader.Value<sint32>();
@@ -187,6 +258,13 @@ void Read_Building_Parts(LevelReader &reader, HeadlessLevel::Building &building,
                     has_position = true;
                 } else if (part == BuildingVariables && field == 2) {
                     building.Powered = reader.Value<uint8>() != 0;
+                } else if (part == BuildingVariables && field == 3) {
+                    const auto sphere = reader.Value<std::array<float, 4>>();
+                    const auto center = IOVector3Struct{sphere[0], sphere[1], sphere[2]};
+                    reader.Require(Is_Finite(center) && std::isfinite(sphere[3]) && sphere[3] >= 0,
+                        "Invalid building collection sphere");
+                    building.CollectionCenter = Vector(center);
+                    building.CollectionRadius = sphere[3];
                 } else if (part == DamageableVariables && field == 1) {
                     building.PlayerType = reader.Value<sint32>();
                     has_team = true;
@@ -206,6 +284,8 @@ void Read_Static_Parts(LevelReader &reader, HeadlessLevel::StaticObject &object,
             reader.Each_Micro([&](uint32 field) {
                 if (part == PhysVariables && field == 3) {
                     object.Flags = reader.Value<uint32>();
+                } else if (part == PhysVariables && field == 6) {
+                    object.DefinitionId = reader.Value<sint32>();
                 } else if (part == PhysVariables && field == 7) {
                     object.InstanceId = reader.Value<uint32>();
                 } else if (part == ModelVariables && field == 1) {
@@ -325,10 +405,17 @@ void HeadlessLevel::Load_Static(const GameDataFile &data)
 void HeadlessLevel::Load_Dynamic(const GameDataFile &data, const GameDataFile &definitions,
     const std::optional<GameDataFile> &map_definitions)
 {
-    std::map<int, SpawnDefinition> spawner_definitions;
-    Load_Spawn_Definitions(definitions, spawner_definitions);
+    MapDefinitions map;
+    Load_Map_Definitions(definitions, map);
     if (map_definitions) {
-        Load_Spawn_Definitions(*map_definitions, spawner_definitions);
+        Load_Map_Definitions(*map_definitions, map);
+    }
+    for (auto &object : LevelStaticObjects) {
+        object.BuildingAggregate = object.FactoryId == PHYSICS_CHUNKID_BUILDINGAGGREGATE;
+        if (object.BuildingAggregate) {
+            const auto def = map.AggregateMCT.find(object.DefinitionId);
+            object.MCT = def != map.AggregateMCT.end() && def->second;
+        }
     }
     LevelReader reader(data);
     reader.In_Chunk(LevelData, [&] {
@@ -337,7 +424,7 @@ void HeadlessLevel::Load_Dynamic(const GameDataFile &data, const GameDataFile &d
                 if (part == CombatSpawners) {
                     reader.Each_Chunk([&](uint32 id) {
                         if (id == SpawnerData) {
-                            LevelSpawners.push_back(Read_Spawner(reader, spawner_definitions));
+                            LevelSpawners.push_back(Read_Spawner(reader, map.Spawners));
                         }
                     });
                 } else if (part == GameObjectManager) {
@@ -355,7 +442,20 @@ void HeadlessLevel::Load_Dynamic(const GameDataFile &data, const GameDataFile &d
                             });
                             reader.Require(has_position && has_team && building.DefinitionId > 0,
                                 "Building is missing serialized gameplay state");
-                            LevelBuildings.push_back(building);
+                            reader.Require(std::isfinite(building.Health) && std::isfinite(building.HealthMax) &&
+                                building.Health >= 0 && building.Health <= building.HealthMax &&
+                                std::isfinite(building.Shield) && building.Shield >= 0 &&
+                                std::isfinite(building.DamagePoints) && std::isfinite(building.DeathPoints),
+                                "Invalid building defense data");
+                            if (building.CollectionCenter == Vector3(0, 0, 0)) {
+                                building.CollectionCenter = building.Position;
+                            }
+                            if (const auto def = map.Buildings.find(building.DefinitionId); def != map.Buildings.end()) {
+                                building.MeshPrefix = def->second.MeshPrefix;
+                                building.MCTSkin = def->second.MCTSkin;
+                                building.PlayerType = def->second.PlayerType.value_or(building.PlayerType);
+                            }
+                            LevelBuildings.push_back(std::move(building));
                         });
                     });
                 }

@@ -36,6 +36,17 @@ public:
         int PlayerType = 0;
         bool Powered = true;
         Vector3 Position{0, 0, 0};
+        Vector3 CollectionCenter{0, 0, 0};
+        float CollectionRadius = 50;
+        std::string MeshPrefix;
+        float Health = 0;
+        float HealthMax = 0;
+        float Shield = 0;
+        int SkinSaveId = 0;
+        int ShieldSaveId = 0;
+        unsigned MCTSkin = 0;
+        float DamagePoints = 0;
+        float DeathPoints = 0;
     };
 
     struct StaticObject {
@@ -44,6 +55,9 @@ public:
         std::uint32_t Flags = 0;
         std::string AssetName;
         Matrix3D Transform{true};
+        int DefinitionId = 0;
+        bool BuildingAggregate = false;
+        bool MCT = false;
     };
 
     static HeadlessLevel Load(const GameDataFile &static_data, const GameDataFile &dynamic_data,

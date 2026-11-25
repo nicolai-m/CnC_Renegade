@@ -17,8 +17,9 @@ class cPacket;
 
 class HeadlessPlayerSession {
 public:
-    struct SoldierHit {
+    struct CombatHit {
         int VictimPeer;
+        int VictimTeam;
         int ShooterSoldier; // A network ID, which cannot be reused by a new connection.
         double DamagePoints;
         float DeathPoints;
@@ -31,6 +32,9 @@ public:
     // The joining client must know the soldier's network object before the first update.
     bool Attach_Player(int peer_id, int player_type, int soldier_object_id, const HeadlessSoldierPreset &preset);
     void Introduce_Soldier(int owner_id, int recipient, const HeadlessSoldierPreset &preset);
+    int Initialize_Buildings(int next_object);
+    void Introduce_Buildings(int recipient);
+    bool Base_Is_Destroyed(int team) const;
     void Set_Combat_Rules(const HeadlessArmorTable &armor, bool friendly_fire);
     void Set_Player_Loading(int peer_id, bool loading);
     bool Soldier_Is_Dead(int peer_id) const;
@@ -39,7 +43,7 @@ public:
     void Reset_Map(const HeadlessCollision &collision);
     void Receive_Control(cPacket &packet, int peer_id);
     void Advance(HeadlessSimulation::Clock::duration elapsed);
-    std::vector<SoldierHit> Take_Soldier_Hits();
+    std::vector<CombatHit> Take_Combat_Hits();
     static bool Client_Owns_Object_Id(int peer_id, int object_id);
 
 private:
@@ -79,6 +83,15 @@ private:
         float RemainingTravel;
     };
 
+    struct BuildingState {
+        int ObjectId = 0;
+        float Health = 0;
+        unsigned Skin = 0;
+        unsigned ShieldType = 0;
+        int State = -1;
+        bool Changed = false;
+    };
+
     bool Read_Control(cPacket &packet, int peer_id, Peer &peer);
     static void Clear_Soldier(Peer &peer);
     static void Select_Weapon(Peer &peer, ULONG controls);
@@ -86,12 +99,17 @@ private:
     void Fire_Bullet(int player_id, const Peer &peer, const HeadlessBulletDefinition &definition);
     bool Trace_Bullet(const Bullet &bullet, const Vector3 &end);
     void Apply_Bullet_Damage(int player_id, Peer &peer, const Bullet &bullet);
+    void Apply_Building_Damage(const HeadlessCollision::RayHit &terrain, const Bullet &bullet);
     void Advance_Bullets(float seconds);
     static void Init_Position_Encoders(const HeadlessCollision &collision, std::array<cEncoderTypeEntry, 3> &encoders);
     void Write_Position(cPacket &packet, const Vector3 &position);
+    void Write_Defense(cPacket &packet, float health, float shield, unsigned shield_type);
     void Write_Occasional(cPacket &packet, const Peer &peer);
     void Write_Frequent(cPacket &packet, int peer_id, const Peer &peer);
     void Publish_Player(int peer_id, Peer &peer);
+    void Send_Building(std::size_t index, int recipient, BYTE dirty);
+    void Publish_Buildings();
+    void Clear_Buildings();
 
     HeadlessSimulation Simulation;
     cConnection &Connection;
@@ -104,7 +122,11 @@ private:
     cEncoderTypeEntry ArmorEncoder;
     std::mt19937 SpreadRandom;
     std::vector<Bullet> Bullets;
-    std::vector<SoldierHit> Hits;
+    std::vector<CombatHit> Hits;
+    std::vector<BuildingState> Buildings;
+    std::set<int> BuildingViewers;
+    cEncoderTypeEntry BuildingRadiusEncoder;
+    cEncoderTypeEntry BuildingStateEncoder;
     HeadlessSimulation::Clock::duration PublishElapsed{};
 };
 

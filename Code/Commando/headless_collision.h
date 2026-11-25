@@ -41,6 +41,7 @@ public:
 
     // Cast against static W3D geometry, using a mask from coltype.h.
     std::optional<RayHit> Cast_Ray(const Vector3 &start, const Vector3 &end, unsigned mask) const;
+    std::optional<std::size_t> Building_For_Object(std::size_t object) const { return BuildingOwners[object]; }
 
     // Translate a box with its orthonormal basis held fixed, using a mask from coltype.h.
     // Zero displacement checks for penetration, which has no unique contact point.
@@ -63,6 +64,7 @@ private:
 
     HeadlessLevel Scene;
     std::vector<std::vector<Collider>> Objects;
+    std::vector<std::optional<std::size_t>> BuildingOwners;
     std::size_t ColliderCount = 0;
     std::size_t IncompleteObjects = 0;
 };

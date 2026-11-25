@@ -30,6 +30,7 @@ struct HeadlessJoinOptions {
     int RadarMode = 1;
     bool LoopMaps = true;
     bool FriendlyFire = false;
+    bool BaseDestructionEndsGame = true;
 };
 
 class HeadlessJoin {
@@ -81,9 +82,9 @@ private:
     void Spawn_Player(int peer_id, Peer &peer, bool respawning = false);
     void Delete_Soldier(Peer &peer);
     void Request_Reload(int peer_id, Peer &peer);
-    void Begin_Intermission();
+    void Begin_Intermission(int winning_team, int reason);
     void Restart_Round();
-    void Record_Hit(const HeadlessPlayerSession::SoldierHit &hit, CombatChanges &changes);
+    void Record_Hit(const HeadlessPlayerSession::CombatHit &hit, CombatChanges &changes);
     void Send_Combat_Stats(const CombatChanges &changes);
     void Reset_Combat_Stats();
     Clock::duration Time_Remaining() const;
@@ -104,10 +105,13 @@ private:
     uint32 MapCrc;
     bool CycleEnding = false;
     Clock::time_point FrameTime;
+    Clock::time_point RoundStart;
     Clock::time_point RoundEnd;
     std::optional<Clock::time_point> IntermissionEnd;
     int HostedGameNumber = 1;
     int LastWinningTeam = 0;
+    int LastWinReason = 2;
+    uint32 LastRoundSeconds = 0;
     std::u16string PendingName;
     std::map<int, Peer> Peers;
     std::set<int> Closing;

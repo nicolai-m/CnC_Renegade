@@ -43,6 +43,7 @@ target_include_directories(renegade_packet PUBLIC
 )
 
 add_library(renegade_level STATIC
+    Code/Combat/buildingstate.cpp
     Code/Commando/headless_collision.cpp
     Code/Commando/headless_join.cpp
     Code/Commando/headless_join_data.cpp
@@ -61,6 +62,7 @@ add_library(renegade_level STATIC
 )
 target_link_libraries(renegade_level PUBLIC renegade_packet)
 target_include_directories(renegade_level PUBLIC Code/Commando Code/Combat Code/ww3d2 Code/wwsaveload)
+target_include_directories(renegade_level PRIVATE Code/wwphys)
 
 add_executable(renegade_fds Code/Commando/linux_fds.cpp)
 target_link_libraries(renegade_fds PRIVATE renegade_level)

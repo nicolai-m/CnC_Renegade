@@ -18,6 +18,8 @@ constexpr unsigned MaxNickname = 64;
 constexpr BYTE LanMessagePosition = 0; // LAN_MESSAGE_POSITION.
 constexpr int CncGameType = 2; // cGameData::GAME_TYPE_CNC.
 constexpr int TimeExpired = 2; // cGameData::WIN_TYPE_TIME.
+constexpr int BaseDestroyed = 3; // cGameData::WIN_TYPE_BASE_DESTRUCTION.
+constexpr float BaseDestructionReward = 5000;
 constexpr int UnknownPlayer = -99999; // PLAYER_ID_UNKNOWN.
 constexpr std::chrono::seconds IntermissionDuration{10};
 // Headless soldiers wait out the original corpse interval starting at zero health.
@@ -80,10 +82,11 @@ uint32 Map_CRC(std::string map)
 HeadlessJoin::HeadlessJoin(cConnection &connection, HeadlessPlayerSession &session,
     const std::vector<HeadlessMap> &maps, const HeadlessJoinOptions &options)
     : Connection(connection), Session(session), Maps(maps), Options(options), MapCrc(Map_CRC(maps.at(0).Name)),
-      FrameTime(Clock::now()), RoundEnd(FrameTime + std::chrono::minutes(options.TimeLimit)),
+      FrameTime(Clock::now()), RoundStart(FrameTime), RoundEnd(FrameTime + std::chrono::minutes(options.TimeLimit)),
       Teams{NextObject--, NextObject--}
 {
     Session.Set_Combat_Rules(Maps[0].Join.Armor, Options.FriendlyFire);
+    NextObject = Session.Initialize_Buildings(NextObject);
 }
 
 bool HeadlessJoin::Update_Round(Clock::time_point now)
@@ -97,14 +100,17 @@ bool HeadlessJoin::Update_Round(Clock::time_point now)
             Restart_Round();
         }
     } else if (Options.TimeLimit > 0 && now >= RoundEnd) {
-        Begin_Intermission();
+        const auto &nod = TeamStats[PLAYERTYPE_NOD];
+        const auto &gdi = TeamStats[PLAYERTYPE_GDI];
+        const int winner = std::tie(gdi.Score, gdi.Kills) > std::tie(nod.Score, nod.Kills) ? PLAYERTYPE_GDI : PLAYERTYPE_NOD;
+        Begin_Intermission(winner, TimeExpired);
     }
     return true;
 }
 
 void HeadlessJoin::Update_Combat()
 {
-    const auto hits = Session.Take_Soldier_Hits();
+    const auto hits = Session.Take_Combat_Hits();
     if (IntermissionEnd) {
         return;
     }
@@ -112,6 +118,21 @@ void HeadlessJoin::Update_Combat()
         CombatChanges changes;
         for (const auto &hit : hits) {
             Record_Hit(hit, changes);
+        }
+        if (Options.BaseDestructionEndsGame && std::any_of(hits.begin(), hits.end(), [](const auto &hit) {
+                return hit.Fatal && hit.VictimPeer == 0;
+            })) {
+            const int loser = Session.Base_Is_Destroyed(PLAYERTYPE_GDI) ? PLAYERTYPE_GDI :
+                (Session.Base_Is_Destroyed(PLAYERTYPE_NOD) ? PLAYERTYPE_NOD : -1);
+            if (loser >= 0) {
+                const int winner = loser == PLAYERTYPE_GDI ? PLAYERTYPE_NOD : PLAYERTYPE_GDI;
+                auto &score = TeamStats[winner].Score;
+                score = std::max(score + BaseDestructionReward, TeamStats[loser].Score + 1);
+                changes.Teams[winner] |= NetworkObjectClass::BIT_OCCASIONAL;
+                Send_Combat_Stats(changes);
+                Begin_Intermission(winner, BaseDestroyed);
+                return;
+            }
         }
         Send_Combat_Stats(changes);
     }
@@ -129,29 +150,30 @@ void HeadlessJoin::Update_Combat()
     }
 }
 
-void HeadlessJoin::Record_Hit(const HeadlessPlayerSession::SoldierHit &hit, CombatChanges &changes)
+void HeadlessJoin::Record_Hit(const HeadlessPlayerSession::CombatHit &hit, CombatChanges &changes)
 {
-    const auto victim = Peers.find(hit.VictimPeer);
-    if (victim == Peers.end()) {
+    if (hit.VictimTeam != PLAYERTYPE_GDI && hit.VictimTeam != PLAYERTYPE_NOD) {
         return;
     }
     const auto shooter = std::find_if(Peers.begin(), Peers.end(), [&](const auto &entry) {
         return entry.second.SoldierObject == hit.ShooterSoldier;
     });
-    auto &defeated = victim->second;
-    if (hit.Fatal) {
-        ++defeated.Stats.Deaths;
-        ++TeamStats[defeated.Team].Deaths;
-        changes.Players.insert(victim->first);
-        changes.Teams[defeated.Team] |= NetworkObjectClass::BIT_RARE;
+    const bool soldier_death = hit.Fatal && hit.VictimPeer != 0;
+    if (soldier_death) {
+        if (const auto victim = Peers.find(hit.VictimPeer); victim != Peers.end()) {
+            ++victim->second.Stats.Deaths;
+            ++TeamStats[hit.VictimTeam].Deaths;
+            changes.Players.insert(hit.VictimPeer);
+            changes.Teams[hit.VictimTeam] |= NetworkObjectClass::BIT_RARE;
+        }
     }
-    if (shooter == Peers.end() || shooter == victim) {
+    if (shooter == Peers.end() || shooter->first == hit.VictimPeer) {
         return;
     }
     auto &attacker = shooter->second;
     auto &team = TeamStats[attacker.Team];
     if (hit.DamagePoints != 0 || (hit.Fatal && hit.DeathPoints != 0)) {
-        const double sign = attacker.Team == defeated.Team ? -1.0 : 1.0;
+        const double sign = attacker.Team == hit.VictimTeam ? -1.0 : 1.0;
         const auto add_points = [&](double amount) {
             constexpr double limit = std::numeric_limits<float>::max();
             const double points = sign * amount;
@@ -168,7 +190,7 @@ void HeadlessJoin::Record_Hit(const HeadlessPlayerSession::SoldierHit &hit, Comb
         changes.Players.insert(shooter->first);
         changes.Teams[attacker.Team] |= NetworkObjectClass::BIT_OCCASIONAL;
     }
-    if (!hit.Fatal) {
+    if (!soldier_death) {
         return;
     }
 
@@ -180,7 +202,7 @@ void HeadlessJoin::Record_Hit(const HeadlessPlayerSession::SoldierHit &hit, Comb
     cPacket kill_message;
     Write_Creation(kill_message, NextObject--, NETCLASSID_PLAYERKILL, true);
     kill_message.Add(shooter->first);
-    kill_message.Add(victim->first);
+    kill_message.Add(hit.VictimPeer);
     for (const auto &[recipient, peer] : Peers) {
         if (peer.PlayerObject != 0) {
             Connection.Send_Packet_To_Individual(kill_message, recipient, SEND_RELIABLE);
@@ -221,11 +243,12 @@ void HeadlessJoin::Reset_Combat_Stats()
     Send_Combat_Stats(changes);
 }
 
-void HeadlessJoin::Begin_Intermission()
+void HeadlessJoin::Begin_Intermission(int winning_team, int reason)
 {
-    const auto &nod = TeamStats[PLAYERTYPE_NOD];
-    const auto &gdi = TeamStats[PLAYERTYPE_GDI];
-    LastWinningTeam = std::tie(gdi.Score, gdi.Kills) > std::tie(nod.Score, nod.Kills) ? PLAYERTYPE_GDI : PLAYERTYPE_NOD;
+    LastWinningTeam = winning_team;
+    LastWinReason = reason;
+    LastRoundSeconds = reason == TimeExpired ? static_cast<uint32>(Options.TimeLimit * 60) :
+        static_cast<uint32>(std::chrono::duration_cast<std::chrono::seconds>(FrameTime - RoundStart).count());
     IntermissionEnd = FrameTime + IntermissionDuration;
     if (MapIndex + 1 < Maps.size()) {
         ++MapIndex;
@@ -245,6 +268,7 @@ void HeadlessJoin::Begin_Intermission()
 void HeadlessJoin::Restart_Round()
 {
     IntermissionEnd.reset();
+    RoundStart = FrameTime;
     RoundEnd = FrameTime + std::chrono::minutes(Options.TimeLimit);
     ++HostedGameNumber;
     Reset_Combat_Stats();
@@ -254,6 +278,7 @@ void HeadlessJoin::Restart_Round()
     }
     Session.Reset_Map(Maps[MapIndex].Collision);
     Session.Set_Combat_Rules(Maps[MapIndex].Join.Armor, Options.FriendlyFire);
+    NextObject = Session.Initialize_Buildings(NextObject);
     for (auto &[id, peer] : Peers) {
         if (peer.State == LoadState::Ready) {
             Spawn_Player(id, peer);
@@ -461,6 +486,7 @@ void HeadlessJoin::Spawn_Player(int peer_id, Peer &peer, bool respawning)
         }
     }
     if (!respawning) {
+        Session.Introduce_Buildings(peer_id);
         Send_Game_Data(peer_id);
     }
 }
@@ -490,6 +516,7 @@ void HeadlessJoin::Set_Loading(int peer_id, Peer &peer, bool loading)
         }
     }
     if (!loading) {
+        Session.Introduce_Buildings(peer_id);
         Send_Game_Data(peer_id);
     }
 }
@@ -594,7 +621,7 @@ void HeadlessJoin::Send_Game_Options(int recipient)
     }
     packet.Add_Wide_Terminated_String(Options.Motd.c_str(), true);
     // Extra fields from cGameDataCnc::Export_Tier_2_Data.
-    packet.Add(false); // Base destruction ends the game.
+    packet.Add(Options.BaseDestructionEndsGame);
     packet.Add(false); // Beacon placement ends the game.
     packet.Add(0); // Starting credits.
     packet.Add(std::chrono::duration<float>(Time_Remaining()).count());
@@ -622,8 +649,8 @@ void HeadlessJoin::Send_Round_Result(int recipient)
     // Clients finishing a previous map after the next round began still need its current round number.
     packet.Add(IntermissionEnd ? HostedGameNumber : HostedGameNumber - 1);
     packet.Add(CycleEnding);
-    packet.Add(TimeExpired);
-    packet.Add(static_cast<uint32>(Options.TimeLimit * 60));
+    packet.Add(LastWinReason);
+    packet.Add(LastRoundSeconds);
     packet.Add_Wide_Terminated_String(u"", true); // MVP name.
     packet.Add(0); // MVP count.
     packet.Add(0); // Mod CRC.
