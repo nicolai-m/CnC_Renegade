@@ -39,10 +39,22 @@ HeadlessPlayerSession::HeadlessPlayerSession(const HeadlessCollision &collision,
     : Simulation(collision), Connection(connection)
 {
     AnalogEncoder.Init(-1.0, 1.0, 0.01); // ControlClass::Set_Precision
+    Init_Position_Encoders(collision, PositionEncoders);
+}
+
+void HeadlessPlayerSession::Validate_Map(const HeadlessCollision &collision)
+{
+    std::array<cEncoderTypeEntry, 3> encoders;
+    Init_Position_Encoders(collision, encoders);
+}
+
+void HeadlessPlayerSession::Init_Position_Encoders(const HeadlessCollision &collision,
+    std::array<cEncoderTypeEntry, 3> &encoders)
+{
     const auto &bounds = collision.Level().World_Bounds();
     const auto minimum = bounds.Center - bounds.Extent;
     const auto maximum = bounds.Center + bounds.Extent;
-    for (std::size_t axis = 0; axis < PositionEncoders.size(); ++axis) {
+    for (std::size_t axis = 0; axis < encoders.size(); ++axis) {
         const double min = static_cast<double>(minimum[axis]) - 1;
         const double max = static_cast<double>(maximum[axis]) + 1;
         // CombatGameModeClass::Compute_World_Size uses 32-bit position codes at most.
@@ -50,7 +62,8 @@ HeadlessPlayerSession::HeadlessPlayerSession(const HeadlessCollision &collision,
             max - min > PositionResolution * std::numeric_limits<ULONG>::max()) {
             throw std::runtime_error("Map extents exceed the network position range");
         }
-        PositionEncoders[axis].Init(min, max, PositionResolution);
+        encoders[axis].Invalidate();
+        encoders[axis].Init(min, max, PositionResolution);
     }
 }
 
@@ -139,12 +152,16 @@ void HeadlessPlayerSession::Remove_Player(int peer_id)
     }
 }
 
-void HeadlessPlayerSession::Reset_Soldiers()
+void HeadlessPlayerSession::Reset_Map(const HeadlessCollision &collision)
 {
+    Init_Position_Encoders(collision, PositionEncoders);
+    Simulation = HeadlessSimulation(collision);
+    PublishElapsed = {};
     for (auto &[id, peer] : Peers) {
-        Set_Player_Loading(id, true);
-        Simulation.Remove_Soldier(id);
+        peer.Ready = false;
         peer.SoldierObject = 0;
+        peer.MoveAxes.Set(0, 0);
+        peer.InputRemaining = {};
         peer.Viewers.clear();
     }
 }

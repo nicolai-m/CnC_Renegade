@@ -42,7 +42,7 @@ bool HeadlessSimulation::Spawn_Soldier(int player_id, int player_type)
         return false;
     }
 
-    for (const auto &spawner : Collision.Level().Spawners()) {
+    for (const auto &spawner : Collision.get().Level().Spawners()) {
         if (!spawner.Enabled || !spawner.SoldierStartup || spawner.Primary || spawner.PlayerType != player_type) {
             continue;
         }
@@ -97,7 +97,7 @@ void HeadlessSimulation::Advance(Clock::duration elapsed)
 
 std::optional<Vector3> HeadlessSimulation::Find_Stand_Position(const Vector3 &position, float drop) const
 {
-    const auto hit = Collision.Sweep_Box(Soldier_Box(position), Vector3(0, 0, -drop), COLLISION_TYPE_PHYSICAL);
+    const auto hit = Collision.get().Sweep_Box(Soldier_Box(position), Vector3(0, 0, -drop), COLLISION_TYPE_PHYSICAL);
     if (!hit || hit->StartsInside || hit->Normal.Z < WalkableNormalZ) {
         return std::nullopt;
     }
@@ -107,7 +107,7 @@ std::optional<Vector3> HeadlessSimulation::Find_Stand_Position(const Vector3 &po
 void HeadlessSimulation::Slide_Soldier(Soldier &soldier, Vector3 move) const
 {
     for (int contact = 0; contact < MaxSlideContacts && move.Length2() > MinMove * MinMove; ++contact) {
-        const auto hit = Collision.Sweep_Box(Soldier_Box(soldier.Position), move, COLLISION_TYPE_PHYSICAL);
+        const auto hit = Collision.get().Sweep_Box(Soldier_Box(soldier.Position), move, COLLISION_TYPE_PHYSICAL);
         if (!hit) {
             soldier.Position += move;
             return;

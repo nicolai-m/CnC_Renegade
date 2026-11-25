@@ -61,11 +61,11 @@ INI such as `svrcfg_cnc.ini`, or a `[Server]` INI with `GameType=LAN` and
 ./build/renegade_fds --data-dir /path/to/game --config /path/to/svrcfg_cnc.ini
 ```
 
-The bootstrap loads the first configured map into a headless scene using the
-original chunk reader. It restores the map bounds and spatial tree, static object
-model references and transforms, building state, and spawner placements with
-their team definitions. It also checks the other maps’ chunk headers. With
-`--check` it exits after loading and validation. Otherwise it listens for direct
+The bootstrap loads the configured maps into headless scenes using the original
+chunk reader. It restores map bounds and spatial trees, static object model
+references and transforms, building state, and spawner placements with their
+team definitions. With `--check` it exits after loading and validation.
+Otherwise it listens for direct
 UDP on `127.0.0.1` by default, with port `4848` if the INI does not specify one.
 `--bind` and `--port` override the address and port. `SIGINT` and `SIGTERM` stop
 it cleanly.
@@ -104,16 +104,21 @@ peers receive position and movement updates for the soldiers known to them.
 `TimeLimitMinutes` starts counting down when the server starts the loaded map.
 Clients receive the remaining round time when joining and after loading the
 map. A value of `0` disables the time limit. When the timer expires, the server
-sends the original results event. After a ten-second intermission it restarts
-the current map on the existing connections and spawns players as each client
-finishes reloading. Both teams currently have zero points, so the result uses
-Nod as the tiebreaker. Scoring, combat-based victory rules, and rotation to
-other maps are still being ported.
+sends the original results event with the next map and advertises that map for
+new joins. After a ten-second intermission it starts the next round over the
+existing connections and spawns players as each client finishes loading.
+`MapName` selects the initial map. Subsequent maps come from `MapName00` through
+`MapName99` in order, with a matching `MapName00` counted once. The default
+`DoMapsLoop=yes` returns to the first map after the last. With `DoMapsLoop=no`,
+the server withdraws its LAN entry and exits after the final intermission.
+Both teams currently have zero points, so the result uses Nod as the
+tiebreaker. Scoring and combat-based victory rules are still being ported.
 
 The two-client UDP fixture covers login, map readiness, movement replication,
 the remaining time for a late join, object removal when a player leaves, and
 LAN announcements and withdrawal. The round fixture advances the server clock
-through a timeout and checks the result, reload, and movement in the next round.
+through a timeout and checks the announced map, its spawn and position encoding,
+movement after a reload, and the end of the map cycle.
 
 On Linux arm64 and with the Linux amd64 build running under QEMU, graphical EA
 1.038 Windows clients loaded `C&C_Field.mix`, spawned and displayed another
@@ -128,9 +133,14 @@ server running `C&C_Field.mix`. Both amd64 servers sent LAN announcements
 under QEMU, and a direct connection to the `Skirmish00.mix` server loaded the
 map and spawned the player. For testing other maps with this particular
 client, use a separate client copy with only the target `.mix` in `Data`.
+For the graphical rotation test, a separate copy registered the second map's
+archive at startup under a filename sorting before the first map. The test
+made each target map name the final `Data\*.mix` search result just before
+its transition. The unchanged client switched from `C&C_Field.mix` to
+`C&C_Under.mix` and back over the same connection.
 
 Graphical testing on native Linux amd64, multiple-map testing with a client
-that handles the full map set, weapons, match rules, and map rotation are
+that handles the full map set, weapons, and match rules are
 still pending.
 
 

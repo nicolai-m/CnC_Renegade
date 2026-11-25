@@ -3,6 +3,7 @@
 #define HEADLESS_SIMULATION_H
 
 #include <chrono>
+#include <functional>
 #include <map>
 #include <optional>
 
@@ -46,7 +47,7 @@ private:
     void Slide_Soldier(Soldier &soldier, Vector3 move) const;
     void Tick();
 
-    const HeadlessCollision &Collision;
+    std::reference_wrapper<const HeadlessCollision> Collision;
     std::map<int, Actor> Soldiers;
     Clock::duration TimeAccumulated = Clock::duration::zero();
 };

@@ -73,34 +73,43 @@ uint32 Map_CRC(std::string map)
 } // namespace
 
 HeadlessJoin::HeadlessJoin(cConnection &connection, HeadlessPlayerSession &session,
-    const HeadlessJoinData &data, const HeadlessJoinOptions &options)
-    : Connection(connection), Session(session), Data(data), Options(options), MapCrc(Map_CRC(options.Map)),
+    const std::vector<HeadlessMap> &maps, const HeadlessJoinOptions &options)
+    : Connection(connection), Session(session), Maps(maps), Options(options), MapCrc(Map_CRC(maps.at(0).Name)),
       FrameTime(Clock::now()), RoundEnd(FrameTime + std::chrono::minutes(options.TimeLimit)),
       Teams{NextObject--, NextObject--}
 {
 }
 
-void HeadlessJoin::Update_Round(Clock::time_point now)
+bool HeadlessJoin::Update_Round(Clock::time_point now)
 {
     FrameTime = now;
     if (IntermissionEnd) {
         if (now >= *IntermissionEnd) {
+            if (CycleEnding) {
+                return false;
+            }
             Restart_Round();
         }
     } else if (Options.TimeLimit > 0 && now >= RoundEnd) {
         Begin_Intermission();
     }
+    return true;
 }
 
 void HeadlessJoin::Begin_Intermission()
 {
     IntermissionEnd = FrameTime + IntermissionDuration;
+    if (MapIndex + 1 < Maps.size()) {
+        ++MapIndex;
+    } else if (Options.LoopMaps) {
+        MapIndex = 0;
+    } else {
+        CycleEnding = true;
+    }
+    MapCrc = Map_CRC(Maps[MapIndex].Name);
     for (auto &[id, peer] : Peers) {
         if (peer.PlayerObject != 0 && peer.State == LoadState::Ready) {
-            Send_Round_Result(id);
-            peer.State = LoadState::AwaitingReload;
-            Connection.Set_Rhost_Is_In_Game(id, false);
-            Session.Set_Player_Loading(id, true);
+            Request_Reload(id, peer);
         }
     }
 }
@@ -120,7 +129,7 @@ void HeadlessJoin::Restart_Round()
             peer.SoldierObject = 0;
         }
     }
-    Session.Reset_Soldiers();
+    Session.Reset_Map(Maps[MapIndex].Collision);
     for (auto &[id, peer] : Peers) {
         if (peer.State == LoadState::Ready) {
             Spawn_Player(id, peer);
@@ -130,6 +139,9 @@ void HeadlessJoin::Restart_Round()
 
 REFUSAL_CODE HeadlessJoin::Accept(cPacket &packet)
 {
+    if (CycleEnding) {
+        return REFUSAL_BY_APPLICATION;
+    }
     std::u16string name;
     std::u16string password;
     UINT key;
@@ -141,7 +153,7 @@ REFUSAL_CODE HeadlessJoin::Accept(cPacket &packet)
     if (!Options.Password.empty() && password != Options.Password) {
         return REFUSAL_BAD_PASSWORD;
     }
-    if (key != Data.VersionKey) {
+    if (key != Maps[MapIndex].Join.VersionKey) {
         return REFUSAL_VERSION_MISMATCH;
     }
     // cConnection reads the bandwidth after this callback returns.
@@ -162,7 +174,9 @@ REFUSAL_CODE HeadlessJoin::Accept(cPacket &packet)
 
 void HeadlessJoin::Connected(int peer_id)
 {
-    Peers.try_emplace(peer_id).first->second.Name = std::move(PendingName);
+    auto &peer = Peers.try_emplace(peer_id).first->second;
+    peer.Name = std::move(PendingName);
+    peer.MapIndex = MapIndex;
     Connection.Set_Rhost_Is_In_Game(peer_id, false);
     Send_Team(peer_id, PLAYERTYPE_NOD);
     Send_Team(peer_id, PLAYERTYPE_GDI);
@@ -207,7 +221,7 @@ void HeadlessJoin::Receive(cPacket &packet, int peer_id)
         return;
     }
     if (class_id == NETCLASSID_CLIENTCONTROL) {
-        if (peer.PlayerObject != 0) {
+        if (peer.SoldierObject != 0) {
             Session.Receive_Control(packet, peer_id);
             return;
         }
@@ -242,7 +256,7 @@ void HeadlessJoin::Receive_Bio(cPacket &packet, int peer_id, Peer &peer)
     UINT clan;
     packet.Get(team);
     packet.Get(clan);
-    if (!Read_String(packet, map, 255) || !packet.Is_Flushed() || !Same_Ascii_Name(map, Options.Map)) {
+    if (!Read_String(packet, map, 255) || !packet.Is_Flushed() || !Same_Ascii_Name(map, Maps[peer.MapIndex].Name)) {
         return;
     }
     if (team != PLAYERTYPE_NOD && team != PLAYERTYPE_GDI) {
@@ -254,10 +268,39 @@ void HeadlessJoin::Receive_Bio(cPacket &packet, int peer_id, Peer &peer)
         team = balance > 0 ? PLAYERTYPE_GDI : PLAYERTYPE_NOD;
     }
     peer.Team = team;
-    peer.State = LoadState::Ready;
-    if (!IntermissionEnd) {
-        Spawn_Player(peer_id, peer);
+    if (!Same_Ascii_Name(map, Maps[MapIndex].Name)) {
+        Request_Reload(peer_id, peer);
+    } else {
+        peer.State = LoadState::Ready;
+        if (!IntermissionEnd) {
+            Spawn_Player(peer_id, peer);
+        }
     }
+}
+
+void HeadlessJoin::Create_Player(int peer_id, Peer &peer)
+{
+    peer.PlayerObject = NextObject--;
+    for (const auto &[id, other] : Peers) {
+        if (other.PlayerObject != 0) {
+            Send_Player(peer_id, id, other, true);
+            if (id != peer_id) {
+                Send_Player(id, peer_id, peer, true);
+            }
+        }
+    }
+}
+
+void HeadlessJoin::Request_Reload(int peer_id, Peer &peer)
+{
+    peer.MapIndex = MapIndex;
+    peer.State = LoadState::AwaitingReload;
+    Connection.Set_Rhost_Is_In_Game(peer_id, false);
+    Session.Set_Player_Loading(peer_id, true);
+    if (peer.PlayerObject == 0) {
+        Create_Player(peer_id, peer);
+    }
+    Send_Round_Result(peer_id);
 }
 
 void HeadlessJoin::Spawn_Player(int peer_id, Peer &peer)
@@ -269,7 +312,7 @@ void HeadlessJoin::Spawn_Player(int peer_id, Peer &peer)
     peer.SoldierObject = NextObject--;
     const bool joining = peer.PlayerObject == 0;
     if (joining) {
-        peer.PlayerObject = NextObject--;
+        Create_Player(peer_id, peer);
     }
     if (peer.InitialControl) {
         Session.Receive_Control(*peer.InitialControl, peer_id);
@@ -280,12 +323,7 @@ void HeadlessJoin::Spawn_Player(int peer_id, Peer &peer)
         if (other.PlayerObject == 0) {
             continue;
         }
-        if (joining) {
-            Send_Player(peer_id, id, other, true);
-            if (id != peer_id) {
-                Send_Player(id, peer_id, peer, true);
-            }
-        } else if (other.State == LoadState::Ready) {
+        if (!joining && other.State == LoadState::Ready) {
             Send_Player(id, peer_id, peer, false);
         }
         if (other.SoldierObject != 0) {
@@ -302,6 +340,10 @@ void HeadlessJoin::Set_Loading(int peer_id, Peer &peer, bool loading)
 {
     if (peer.PlayerObject == 0 || (loading ? peer.State == LoadState::Loading : peer.State != LoadState::Loading)) {
         return; // Initial readiness comes from cBioEvent after Load_Level.
+    }
+    if (!loading && !CycleEnding && !Same_Ascii_Name(Maps[peer.MapIndex].Name, Maps[MapIndex].Name)) {
+        Request_Reload(peer_id, peer);
+        return;
     }
     peer.State = loading ? LoadState::Loading : LoadState::Ready;
     if (IntermissionEnd) {
@@ -366,6 +408,7 @@ void HeadlessJoin::Send_Team(int recipient, int team)
 
 void HeadlessJoin::Write_Lan_Announcement(cPacket &packet, uint32 address, uint32 sequence, bool hosting) const
 {
+    hosting = hosting && !CycleEnding;
     packet.Add(LanMessagePosition);
     packet.Add_Wide_Terminated_String(Options.Owner.c_str());
     packet.Add(sequence);
@@ -378,15 +421,16 @@ void HeadlessJoin::Write_Lan_Announcement(cPacket &packet, uint32 address, uint3
 
 void HeadlessJoin::Write_Game_Info(cPacket &packet, uint32 address) const
 {
+    const auto &data = Maps[MapIndex].Join;
     packet.Add(address);
     packet.Add_Wide_Terminated_String(Options.Owner.c_str());
     packet.Add_Wide_Terminated_String(Options.Title.c_str(), true);
     packet.Add(static_cast<int>(Connection.Get_Local_Port()));
     packet.Add(static_cast<int>(Peers.size()));
     packet.Add(Connection.Get_Max_RHost());
-    packet.Add(Data.VersionKey);
-    packet.Add(Data.ExeCRC);
-    packet.Add(Data.StringsCRC);
+    packet.Add(data.VersionKey);
+    packet.Add(data.ExeCRC);
+    packet.Add(data.StringsCRC);
     packet.Add(true); // Dedicated.
     packet.Add(false); // Team changing.
     packet.Add(!Options.Password.empty());
@@ -440,8 +484,9 @@ void HeadlessJoin::Send_Round_Result(int recipient)
     Write_Creation(packet, NextObject--, NETCLASSID_WIN, true);
     packet.Add(static_cast<int>(PLAYERTYPE_NOD)); // Both teams currently score zero. Break the tie by team order.
     packet.Add(UnknownPlayer);
-    packet.Add(HostedGameNumber);
-    packet.Add(false); // The map cycle continues.
+    // Clients finishing a previous map after the next round began still need its current round number.
+    packet.Add(IntermissionEnd ? HostedGameNumber : HostedGameNumber - 1);
+    packet.Add(CycleEnding);
     packet.Add(TimeExpired);
     packet.Add(static_cast<uint32>(Options.TimeLimit * 60));
     packet.Add_Wide_Terminated_String(u"", true); // MVP name.
@@ -488,5 +533,6 @@ void HeadlessJoin::Delete_Object(int recipient, int object)
 
 void HeadlessJoin::Introduce_Soldier(int recipient, int player_id, const Peer &peer)
 {
-    Session.Introduce_Soldier(player_id, recipient, Data.Soldiers[peer.Team], Data.ArmorTypes);
+    const auto &data = Maps[MapIndex].Join;
+    Session.Introduce_Soldier(player_id, recipient, data.Soldiers[peer.Team], data.ArmorTypes);
 }

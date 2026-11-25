@@ -101,9 +101,9 @@ std::string Tree_Node(float x, float extent, uint32 children)
     return Chunk(0x101, Chunk(0x104, variables, false) + Chunk(0x103, "", false));
 }
 
-std::string Static_Data(uint32 last_link = 2)
+std::string Static_Data(uint32 last_link = 2, float world_extent = 20)
 {
-    const auto tree = Chunk(1, Bytes(uint32{0x10000}), false) + Tree_Node(0, 20, 3) +
+    const auto tree = Chunk(1, Bytes(uint32{0x10000}), false) + Tree_Node(0, world_extent, 3) +
         Tree_Node(6, 3, 0) + Tree_Node(-6, 3, 0);
     auto linked_object = [](uint32 node, uint32 id, float x) {
         const std::array<float, 12> transform{1, 0, 0, x, 0, 1, 0, 0, 0, 0, 1, 0};
@@ -196,10 +196,10 @@ std::string Collision_Data(uint32 last_vertex = 2)
                 part("testmesh.wall", 0)));
 }
 
-std::string Dynamic_Data()
+std::string Dynamic_Data(float spawn_y = 2)
 {
-    auto spawner = [](sint32 id, sint32 definition, float x) {
-        const std::array<float, 12> transform{1, 0, 0, x, 0, 1, 0, 2, 0, 0, 1, 3};
+    auto spawner = [spawn_y](sint32 id, sint32 definition, float x) {
+        const std::array<float, 12> transform{1, 0, 0, x, 0, 1, 0, spawn_y, 0, 0, 1, 3};
         return Chunk(1014991133, Chunk(1014991054,
             Micro(1, id) + Micro(2, transform) + Micro(3, definition) + Micro(6, uint8{1}), false));
     };
@@ -485,13 +485,6 @@ struct MovementSnapshot {
 
 std::vector<MovementSnapshot> MovementSnapshots;
 
-ULONG Fixture_Position_Code(float coordinate)
-{
-    // The fixture map has extents [-20, 20] on each axis. The original
-    // client adds a one-metre margin and uses 8 bits for this range.
-    return static_cast<ULONG>(std::round((coordinate + 21.0f) * (255.0f / 42.0f)));
-}
-
 void Receive_Movement_Snapshot(cPacket &packet)
 {
     int object;
@@ -523,7 +516,8 @@ void Receive_Movement_Snapshot(cPacket &packet)
     MovementSnapshots.push_back(snapshot);
 }
 
-void Write_Movement(cPacket &packet, int control_object, int owner, int soldier, float target_y)
+void Write_Movement(cPacket &packet, int control_object, int owner, int soldier, float target_y,
+    float position_extent = 21.0f, unsigned position_bits = 8)
 {
     packet.Add(control_object);
     packet.Add(static_cast<BYTE>(owner ? 15 : 1));
@@ -545,9 +539,12 @@ void Write_Movement(cPacket &packet, int control_object, int owner, int soldier,
     packet.Add(false); // Sniping.
     packet.Add(true); // Optional checksum follows.
     packet.Add(12345);
-    packet.Add_Bits(Fixture_Position_Code(0), 8);
-    packet.Add_Bits(Fixture_Position_Code(target_y), 8);
-    packet.Add_Bits(Fixture_Position_Code(0), 8);
+    const float max_code = static_cast<float>((1u << position_bits) - 1);
+    for (const float coordinate : {0.0f, target_y, 0.0f}) {
+        const auto code = static_cast<ULONG>(std::round((coordinate + position_extent) * max_code /
+            (position_extent * 2)));
+        packet.Add_Bits(code, position_bits);
+    }
 }
 
 void Check_Player_Transport(const HeadlessCollision &collision)
@@ -682,15 +679,19 @@ struct Join_Client_State {
     std::optional<float> OptionsTime;
     std::optional<int> GameDataTime;
     int Round = 1;
+    uint32 MapCRC = 0;
+    bool CycleEnded = false;
 };
 
 Join_Client_State FirstJoinClient;
 Join_Client_State SecondJoinClient;
+Join_Client_State LateJoinClient;
 unsigned short JoinPort;
 uint32 JoinKey;
 const uint32 TestMapCRC = CRC::String("C&C_TEST.MIX");
+const uint32 NextMapCRC = CRC::String("C&C_NEXT.MIX");
 
-int Check_Game_Info(cPacket &packet)
+int Check_Game_Info(cPacket &packet, uint32 map_crc = TestMapCRC)
 {
     Check(Field<uint32>(packet) == htonl(INADDR_LOOPBACK), "Wrong advertised server address");
     WCHAR owner[64];
@@ -704,7 +705,7 @@ int Check_Game_Info(cPacket &packet)
         Field<uint32>(packet) != 0 && Field<uint32>(packet) != 0, "Wrong version or capacity in game info");
     Check(Field<bool>(packet) && !Field<bool>(packet) && Field<bool>(packet) &&
         !Field<bool>(packet) && !Field<bool>(packet), "Incorrect game info flags");
-    Check(Field<uint32>(packet) == TestMapCRC && Field<uint32>(packet) == 0, "Wrong map in game info");
+    Check(Field<uint32>(packet) == map_crc && Field<uint32>(packet) == 0, "Wrong map in game info");
     return players;
 }
 
@@ -770,7 +771,8 @@ void Read_Player(cPacket &packet, Join_Client_State &client, int object, bool cr
     if (creation) {
         WCHAR name[64];
         packet.Get_Wide_Terminated_String(name, 64);
-        Check(std::u16string(name) == u"First" || std::u16string(name) == u"Second", "Unexpected player name");
+        const std::u16string nickname(name);
+        Check(nickname == u"First" || nickname == u"Second" || nickname == u"Late", "Unexpected player name");
     }
     const int id = Field<int>(packet);
     Check(creation ? client.Players.emplace(id, object).second : client.Players.at(id) == object,
@@ -779,14 +781,26 @@ void Read_Player(cPacket &packet, Join_Client_State &client, int object, bool cr
     const int team = Field<int>(packet);
     Check((team == PLAYERTYPE_GDI || team == PLAYERTYPE_NOD) && Field<int>(packet) == 100 &&
         Field<int>(packet) == 0, "Incorrect team, damage scale or ping");
-    const bool in_game = Field<bool>(packet);
-    Check((in_game || !creation) && !Field<bool>(packet) && Field<bool>(packet), "Incorrect player state");
+    Field<bool>(packet); // In game.
+    Check(!Field<bool>(packet) && Field<bool>(packet), "Incorrect player state");
     ULONG ranking;
     packet.Get_Bits(ranking, 32);
     packet.Get_Bits(ranking, 32);
     for (int i = 0; i < 4; ++i) {
         Check(Field<uint32>(packet) == 0, "Unexpected player statistics");
     }
+}
+
+float Read_Join_Position_Y(cPacket &packet, uint32 map_crc)
+{
+    const unsigned bits = map_crc == NextMapCRC ? 10 : 8;
+    const float extent = map_crc == NextMapCRC ? 61.0f : 21.0f;
+    ULONG coordinate;
+    packet.Get_Bits(coordinate, bits); // X.
+    packet.Get_Bits(coordinate, bits);
+    const auto y = -extent + static_cast<float>(coordinate) * (2 * extent / ((1u << bits) - 1));
+    packet.Get_Bits(coordinate, bits); // Z.
+    return y;
 }
 
 void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
@@ -807,9 +821,7 @@ void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
     }
     if (dirty == 1) {
         Check(!deleting && !Field<bool>(packet) && !Field<bool>(packet), "Unexpected soldier update flags");
-        ULONG position;
-        packet.Get_Bits(position, 16);
-        client.Y[object] = -21.0f + static_cast<float>(position & 0xffu) * (42.0f / 255.0f);
+        client.Y[object] = Read_Join_Position_Y(packet, client.MapCRC);
         packet.Flush();
         return;
     }
@@ -842,6 +854,7 @@ void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
             Field<int>(packet) == 1 && Field<uint32>(packet) == 0 && Field<uint32>(packet) == TestMapCRC,
             "The original game options packet had an incorrect footer");
         client.OptionsTime = remaining;
+        client.MapCRC = TestMapCRC;
         break;
     }
     case 1011: // cPlayer.
@@ -850,8 +863,8 @@ void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
         break;
     case 1000: { // Soldier GameObj with factory data and all update tiers.
         const int preset = Field<int>(packet);
-        ULONG position;
-        packet.Get_Bits(position, 24);
+        const int first_preset = client.MapCRC == NextMapCRC ? 410 : 400;
+        client.Y[object] = Read_Join_Position_Y(packet, client.MapCRC);
         const float facing = Field<float>(packet);
         const int owner = Field<int>(packet);
         Check(facing == 0 && client.Players.count(owner) == 1 && client.Soldiers.emplace(owner, object).second,
@@ -860,10 +873,11 @@ void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
         char animation[32];
         packet.Get_Terminated_String(model, sizeof(model));
         packet.Get_Terminated_String(animation, sizeof(animation), true);
-        Check((preset == 400 || preset == 401) && std::string(model) == (preset == 400 ? "soldier0" : "soldier1") &&
-            *animation == 0, "The soldier did not use the preset from objects.ddb");
+        Check((preset == first_preset || preset == first_preset + 1) &&
+            std::string(model) == (preset == first_preset ? "soldier0" : "soldier1") && *animation == 0,
+            "The soldier did not use the current map's preset");
         Check(Field<int>(packet) == 0 && Field<int>(packet) == 0 && Field<int>(packet) == 3 &&
-            Field<int>(packet) == 0 && Field<int>(packet) == 0 && Field<int>(packet) == preset - 400 &&
+            Field<int>(packet) == 0 && Field<int>(packet) == 0 && Field<int>(packet) == preset - first_preset &&
             !Field<bool>(packet) && Field<int>(packet) == preset && !Field<bool>(packet),
             "Incorrect soldier rare fields");
         ULONG defense;
@@ -887,12 +901,13 @@ void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
     }
     case 1003: { // cWinEvent.
         Check(deleting && Field<int>(packet) == PLAYERTYPE_NOD && Field<int>(packet) == -99999 &&
-            Field<int>(packet) == client.Round && !Field<bool>(packet) && Field<int>(packet) == 2 &&
-            Field<uint32>(packet) == 1380, "Incorrect timed round result");
+            Field<int>(packet) == client.Round, "Incorrect timed round result");
+        client.CycleEnded = Field<bool>(packet);
+        Check(Field<int>(packet) == 2 && Field<uint32>(packet) == 1380, "Incorrect reason or duration for round end");
         WCHAR mvp[64];
         packet.Get_Wide_Terminated_String(mvp, 64, true);
-        Check(*mvp == 0 && Field<int>(packet) == 0 && Field<uint32>(packet) == 0 &&
-            Field<uint32>(packet) == TestMapCRC, "Incorrect next map or MVP data");
+        Check(*mvp == 0 && Field<int>(packet) == 0 && Field<uint32>(packet) == 0, "Incorrect MVP or mod data");
+        client.MapCRC = Field<uint32>(packet);
         ++client.Round;
         client.GameDataTime.reset();
         break;
@@ -905,6 +920,7 @@ void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
 
 void Receive_First_Join(cPacket &packet) { Receive_Join_Packet(packet, FirstJoinClient); }
 void Receive_Second_Join(cPacket &packet) { Receive_Join_Packet(packet, SecondJoinClient); }
+void Receive_Late_Join(cPacket &packet) { Receive_Join_Packet(packet, LateJoinClient); }
 
 template<class CheckReady>
 void Pump_Clients(std::initializer_list<cConnection *> connections, CheckReady ready)
@@ -968,26 +984,31 @@ void Send_Loading(cConnection &client, int id_offset, bool loading)
     client.Send_Packet_To_Individual(packet, SERVER_RHOST_ID, SEND_RELIABLE);
 }
 
-void Check_Round_Restart(const HeadlessCollision &collision)
+void Check_Map_Rotation(const HeadlessCollision &collision, const HeadlessCollision &next_collision, bool loop)
 {
     FirstJoinClient = {};
     SecondJoinClient = {};
+    LateJoinClient = {};
     const HeadlessJoinData data{42, 1, 2, 2, {{{400, "soldier0", 100, 50, 1}, {401, "soldier1", 100, 50, 1}}}};
+    auto next_data = data;
+    next_data.Soldiers[PLAYERTYPE_NOD].DefinitionId = 410;
+    next_data.Soldiers[PLAYERTYPE_GDI].DefinitionId = 411;
+    const std::vector<HeadlessMap> maps{{"C&C_Test.mix", collision, data}, {"C&C_Next.mix", next_collision, next_data}};
     HeadlessJoinOptions options;
-    options.Map = "C&C_Test.mix";
     options.Owner = u"FixtureHost";
     options.Title = u"Join fixture";
     options.Motd = u"Ready";
     options.Password = u"testpass";
     options.Address = htonl(INADDR_LOOPBACK);
     options.TimeLimit = 23;
+    options.LoopMaps = loop;
     cConnection server;
     Check(server.Init_As_Server(0, 16, true, INADDR_LOOPBACK), "Could not bind round test server");
     server.Set_Bandwidth_Budget_Out(TestBandwidth);
     JoinPort = server.Get_Local_Port();
     JoinKey = data.VersionKey;
-    HeadlessPlayerSession session(collision, server);
-    HeadlessJoin join(server, session, data, options);
+    HeadlessPlayerSession session(maps.front().Collision, server);
+    HeadlessJoin join(server, session, maps, options);
     server.Install_Application_Acceptance_Handler([&](cPacket &packet) { return join.Accept(packet); });
     server.Install_Conn_Handler([&](int id) { join.Connected(id); });
     int received = 0;
@@ -998,8 +1019,9 @@ void Check_Round_Restart(const HeadlessCollision &collision)
 
     cConnection first;
     cConnection second;
+    cConnection late;
     const auto pump = [&](const auto &ready) {
-        Pump_Clients({&first, &second}, [&] {
+        Pump_Clients({&first, &second, &late}, [&] {
             server.Service_Read();
             join.Close_Pending();
             server.Service_Send(true);
@@ -1008,7 +1030,8 @@ void Check_Round_Restart(const HeadlessCollision &collision)
     };
     Connect_Join_Client(first, u"First", u"testpass", JoinKey, Receive_First_Join);
     Connect_Join_Client(second, u"Second", u"testpass", JoinKey, Receive_Second_Join);
-    pump([&] { return FirstJoinClient.OptionsTime && SecondJoinClient.OptionsTime; });
+    Connect_Join_Client(late, u"Late", u"testpass", JoinKey, Receive_Late_Join);
+    pump([&] { return FirstJoinClient.OptionsTime && SecondJoinClient.OptionsTime && LateJoinClient.OptionsTime; });
     Check(first.Get_Local_Id() == 1 && second.Get_Local_Id() == 2, "Unexpected round test peer IDs");
     cPacket control;
     Write_Movement(control, FirstControlObject, 1, -1, 0);
@@ -1020,13 +1043,22 @@ void Check_Round_Restart(const HeadlessCollision &collision)
     const auto players = FirstJoinClient.Players;
 
     const auto expired = HeadlessJoin::Clock::now() + 23min;
-    join.Update_Round(expired);
+    Check(join.Update_Round(expired), "The first map must continue into intermission");
     pump([&] { return FirstJoinClient.Round == 2 && SecondJoinClient.Round == 2; });
+    Check(FirstJoinClient.MapCRC == NextMapCRC && SecondJoinClient.MapCRC == NextMapCRC &&
+        !FirstJoinClient.CycleEnded && !SecondJoinClient.CycleEnded, "Round result did not name the next map");
+    cPacket announcement;
+    join.Write_Lan_Announcement(announcement, options.Address, 1, true);
+    Check(Field<BYTE>(announcement) == 0, "Unexpected LAN announcement type");
+    WCHAR owner[64];
+    announcement.Get_Wide_Terminated_String(owner, 64);
+    Check(Field<uint32>(announcement) == 1 && Field<bool>(announcement) && Field<int>(announcement) == 2 &&
+        Check_Game_Info(announcement, NextMapCRC) == 3, "LAN discovery must advertise the incoming map");
 
-    const auto finish_loading = [&](cConnection &client) {
+    const auto finish_loading = [&](cConnection &client, int offset = 2) {
         const int before = received;
-        Send_Loading(client, 2, true);
-        Send_Loading(client, 3, false);
+        Send_Loading(client, offset, true);
+        Send_Loading(client, offset + 1, false);
         pump([&] { return received >= before + 2; });
     };
     join.Update_Round(expired + 9s);
@@ -1049,13 +1081,41 @@ void Check_Round_Restart(const HeadlessCollision &collision)
         SecondJoinClient.Players == players, "Round restart did not preserve the players and replace their soldiers");
 
     const int new_soldier = FirstJoinClient.Soldiers.at(1);
+    Check(std::abs(FirstJoinClient.Y.at(new_soldier) - 1.2f) < 0.1f,
+        "The restarted player did not use the next map's spawn position and coordinate precision");
     const int before = received;
     cPacket movement;
-    Write_Movement(movement, FirstControlObject, 0, new_soldier, 8);
+    Write_Movement(movement, FirstControlObject, 0, new_soldier, 8, 61.0f, 10);
     first.Send_Packet_To_Individual(movement, SERVER_RHOST_ID, SEND_UNRELIABLE);
     pump([&] { return received > before; });
     session.Advance(100ms);
-    pump([&] { return FirstJoinClient.Y[new_soldier] > 2.25f && SecondJoinClient.Y[new_soldier] > 2.25f; });
+    pump([&] { return FirstJoinClient.Y[new_soldier] > 1.5f && SecondJoinClient.Y[new_soldier] > 1.5f; });
+
+    Send_Bio(late, u"Late", PLAYERTYPE_NOD, 1, "C&C_Test.mix");
+    pump([&] { return LateJoinClient.Round == 2; });
+    Check(LateJoinClient.MapCRC == NextMapCRC && LateJoinClient.Players.count(3) == 1 &&
+        LateJoinClient.Soldiers.empty(), "A join finishing on the previous map must be redirected before spawning");
+    finish_loading(late);
+    pump([&] { return LateJoinClient.GameDataTime && FirstJoinClient.Soldiers.count(3); });
+
+    const auto cycle_end = expired + 10s + 23min;
+    Check(join.Update_Round(cycle_end), "The last map must send a result before finishing the cycle");
+    pump([&] { return FirstJoinClient.Round == 3 && SecondJoinClient.Round == 3 && LateJoinClient.Round == 3; });
+    Check(FirstJoinClient.CycleEnded == !loop && FirstJoinClient.MapCRC == (loop ? TestMapCRC : NextMapCRC),
+        "The last map did not honor DoMapsLoop");
+    cPacket final_announcement;
+    join.Write_Lan_Announcement(final_announcement, options.Address, 2, true);
+    Check(Field<BYTE>(final_announcement) == 0, "Unexpected LAN announcement type after the last map");
+    final_announcement.Get_Wide_Terminated_String(owner, 64);
+    Check(Field<uint32>(final_announcement) == 2 && Field<bool>(final_announcement) == loop,
+        "A finished map cycle must withdraw its LAN entry");
+    Check(join.Update_Round(cycle_end + 10s) == loop, "Final intermission must honor DoMapsLoop");
+    if (loop) {
+        finish_loading(first, 4);
+        pump([&] { return FirstJoinClient.GameDataTime && FirstJoinClient.Soldiers.count(1); });
+        Check(std::abs(FirstJoinClient.Y.at(FirstJoinClient.Soldiers.at(1)) - 2.0f) < 0.1f,
+            "Wrapping the map cycle did not restore the first map's spawn and coordinate precision");
+    }
 }
 
 void Check_Original_Join(unsigned short port, const std::string &definitions, const std::string &armor,
@@ -1205,7 +1265,15 @@ int main(int argc, char **argv)
         Check_Box_Sweeps(collision);
         Check_Soldier_Simulation(collision);
         Check_Player_Transport(collision);
-        Check_Round_Restart(collision);
+        Write_Archive(data / "C&C_Next.mix", {{"C&C_NEXT.LDD", Dynamic_Data(1.2f)},
+            {"C&C_NEXT.LSD", Static_Data(2, 60)}, {"C&C_NEXT.DEP", dependencies}, {"COLLIDERS.W3D", collision_data}});
+        const MixArchive next_archive(data / "C&C_Next.mix");
+        auto next_level = HeadlessLevel::Load(next_archive.Find("c&c_next.lsd").value(),
+            next_archive.Find("c&c_next.ldd").value(), core.Find("objects.ddb").value(), std::nullopt);
+        const auto next_collision = HeadlessCollision::Load(std::move(next_level),
+            [&](const std::string &name) { return next_archive.Find(name); }, next_archive.Find("c&c_next.dep"));
+        Check_Map_Rotation(collision, next_collision, true);
+        Check_Map_Rotation(collision, next_collision, false);
 
         FdsProcess check(argv[1], fixture.Path, master, "--check");
         const auto check_status = check.Wait();
@@ -1229,7 +1297,8 @@ int main(int argc, char **argv)
         server.Stop();
 
         std::ofstream(settings, std::ios::app) << "ClientBuildNumber=1234\nbGameTitle=Join fixture\nbMotd=Ready\n"
-            "TimeLimitMinutes=23\nIsPassworded=yes\nbPassword=testpass\n";
+            "TimeLimitMinutes=23\nIsPassworded=yes\nbPassword=testpass\n"
+            "MapName00=C&C_Test.mix\nMapName01=C&C_Next.mix\nDoMapsLoop=yes\n";
         LanReceiver lan;
         FdsProcess joining(argv[1], fixture.Path, master, "--lan-destination", "127.0.0.1");
         try {
@@ -1250,10 +1319,13 @@ int main(int argc, char **argv)
         Check(bad_mix.Wait() == 1 && bad_mix.Output().find("Invalid MIX1 index entry") != std::string::npos,
             "FDS accepted an invalid map archive");
 
-        Write_Archive(data / "C&C_Test.mix", {{"C&C_TEST.LDD", dynamic_data}, {"C&C_TEST.LSD", Static_Data(300)}});
+        Write_Archive(data / "C&C_Test.mix", {{"C&C_TEST.LDD", dynamic_data}, {"C&C_TEST.LSD", static_data},
+            {"C&C_TEST.DEP", dependencies}, {"COLLIDERS.W3D", collision_data}});
+        Write_Archive(data / "C&C_Next.mix", {{"C&C_NEXT.LDD", Dynamic_Data(1.2f)}, {"C&C_NEXT.LSD", Static_Data(300, 60)}});
         FdsProcess bad_level(argv[1], fixture.Path, master, "--check");
-        Check(bad_level.Wait() == 1 && bad_level.Output().find("invalid AAB tree node") != std::string::npos,
-            "FDS accepted an out-of-range static object link in an otherwise valid archive");
+        Check(bad_level.Wait() == 1 && bad_level.Output().find("C&C_Next.mix: ") != std::string::npos &&
+            bad_level.Output().find("invalid AAB tree node") != std::string::npos,
+            "FDS accepted an invalid static object link on a later map in the cycle");
 
         Write_Archive(data / "C&C_Test.mix", {{"C&C_TEST.LDD", dynamic_data}, {"C&C_TEST.LSD", static_data},
             {"C&C_TEST.DEP", dependencies}, {"COLLIDERS.W3D", Collision_Data(999)}});

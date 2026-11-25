@@ -8,13 +8,19 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <vector>
 
 #include "connect.h"
 #include "headless_join_data.h"
 #include "headless_player_session.h"
 
+struct HeadlessMap {
+    std::string Name;
+    HeadlessCollision Collision;
+    HeadlessJoinData Join;
+};
+
 struct HeadlessJoinOptions {
-    std::string Map;
     std::u16string Owner = u"FDS";
     std::u16string Title = u"Dedicated Renegade Server";
     std::u16string Motd;
@@ -22,16 +28,17 @@ struct HeadlessJoinOptions {
     uint32 Address = 0;
     int TimeLimit = 30;
     int RadarMode = 1;
+    bool LoopMaps = true;
 };
 
 class HeadlessJoin {
 public:
     using Clock = std::chrono::steady_clock;
 
-    HeadlessJoin(cConnection &connection, HeadlessPlayerSession &session, const HeadlessJoinData &data,
+    HeadlessJoin(cConnection &connection, HeadlessPlayerSession &session, const std::vector<HeadlessMap> &maps,
         const HeadlessJoinOptions &options);
 
-    void Update_Round(Clock::time_point now);
+    bool Update_Round(Clock::time_point now);
     REFUSAL_CODE Accept(cPacket &packet);
     void Connected(int peer_id);
     void Receive(cPacket &packet, int peer_id);
@@ -48,12 +55,15 @@ private:
         int Team = -1;
         int PlayerObject = 0;
         int SoldierObject = 0;
+        std::size_t MapIndex = 0; // Map last sent to this player.
         LoadState State = LoadState::Loading;
     };
 
     void Receive_Bio(cPacket &packet, int peer_id, Peer &peer);
     void Set_Loading(int peer_id, Peer &peer, bool loading);
+    void Create_Player(int peer_id, Peer &peer);
     void Spawn_Player(int peer_id, Peer &peer);
+    void Request_Reload(int peer_id, Peer &peer);
     void Begin_Intermission();
     void Restart_Round();
     Clock::duration Time_Remaining() const;
@@ -68,9 +78,11 @@ private:
 
     cConnection &Connection;
     HeadlessPlayerSession &Session;
-    const HeadlessJoinData &Data;
+    const std::vector<HeadlessMap> &Maps;
     const HeadlessJoinOptions &Options;
-    const uint32 MapCrc;
+    std::size_t MapIndex = 0;
+    uint32 MapCrc;
+    bool CycleEnding = false;
     Clock::time_point FrameTime;
     Clock::time_point RoundEnd;
     std::optional<Clock::time_point> IntermissionEnd;

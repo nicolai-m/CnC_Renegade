@@ -297,9 +297,10 @@ Settings Load_Settings(const Options &options, const fs::path &data_dir)
         if (!nickname.empty()) {
             result.Join.Owner = Legacy_Ini_String(nickname, 64, "Nickname");
         }
-        result.Join.Map = result.Maps.front();
-        if (result.Join.Map.size() > 27 || Fold_Ascii(fs::path(result.Join.Map).extension().string()) != ".mix") {
-            throw std::runtime_error("Client joins require a .mix map name of at most 27 bytes");
+        for (const auto &map : result.Maps) {
+            if (map.size() > 27 || Fold_Ascii(fs::path(map).extension().string()) != ".mix") {
+                throw std::runtime_error("Client joins require a .mix map name of at most 27 bytes: " + map);
+            }
         }
         if (const auto title = Setting(rules->second, "bgametitle"); !title.empty()) {
             result.Join.Title = Legacy_Ini_String(title, 63, "bGameTitle");
@@ -310,6 +311,10 @@ Settings Load_Settings(const Options &options, const fs::path &data_dir)
         }
         if (const auto radar = Setting(rules->second, "radarmode"); !radar.empty()) {
             result.Join.RadarMode = Read_Integer(radar, 0, 2, "RadarMode");
+        }
+        const auto loop = Fold_Ascii(Setting(rules->second, "domapsloop"));
+        if (!loop.empty() && std::string_view("nf0").find(loop.front()) != std::string_view::npos) {
+            result.Join.LoopMaps = false;
         }
         const auto passworded = Fold_Ascii(Setting(rules->second, "ispassworded"));
         if (passworded == "yes" || passworded == "true" || passworded == "1") {
@@ -382,12 +387,7 @@ unsigned Count_Armor_Types(const GameDataFile &armor)
     return types == ini.end() ? 0 : static_cast<unsigned>(types->second.size());
 }
 
-struct LoadedGame {
-    HeadlessCollision Collision;
-    std::optional<HeadlessJoinData> Join;
-};
-
-LoadedGame Load_Game_Data(const fs::path &directory, const Settings &settings)
+std::vector<HeadlessMap> Load_Game_Data(const fs::path &directory, const Settings &settings)
 {
     std::vector<MixArchive> core;
     for (const char *name : {"Always2.dat", "Always.dbs", "Always.dat"}) {
@@ -405,8 +405,10 @@ LoadedGame Load_Game_Data(const fs::path &directory, const Settings &settings)
         throw std::runtime_error("Cannot read armor.ini");
     }
 
-    std::optional<HeadlessCollision> collision;
-    std::optional<HeadlessJoinData> join;
+    const auto armor_types = settings.ClientBuild ? Count_Armor_Types(armor_data) : 0;
+    const auto find_core = [&](const std::string &name) { return Find_Optional_Asset(directory, core, name); };
+    std::vector<HeadlessMap> maps;
+    maps.reserve(settings.Maps.size());
     for (const auto &map : settings.Maps) {
         const auto map_path = Find_Child(directory, map);
         if (!map_path) {
@@ -422,25 +424,25 @@ LoadedGame Load_Game_Data(const fs::path &directory, const Settings &settings)
         }
         const auto static_data = Find_Asset(directory, map_archives, stem + ".lsd");
         const auto dynamic_data = Find_Asset(directory, map_archives, stem + ".ldd");
-        if (!collision) {
+        try {
             const auto map_definitions = Find_Optional_Asset(directory, map_archives, stem + ".ddb");
             auto level = HeadlessLevel::Load(static_data, dynamic_data, definitions, map_definitions);
-            collision = HeadlessCollision::Load(std::move(level), [&](const std::string &name) {
-                auto asset = Find_Optional_Asset(directory, core, name);
+            auto collision = HeadlessCollision::Load(std::move(level), [&](const std::string &name) {
+                auto asset = find_core(name);
                 return asset ? asset : Find_Optional_Asset(directory, map_archives, name);
             }, Find_Optional_Asset(directory, map_archives, stem + ".dep"));
+            HeadlessPlayerSession::Validate_Map(collision);
+            HeadlessJoinData join;
             if (settings.ClientBuild) {
-                join = Load_Headless_Join_Data(*settings.ClientBuild, Count_Armor_Types(armor_data), strings,
-                    definitions, map_definitions, [&](const std::string &name) {
-                        return Find_Optional_Asset(directory, core, name);
-                    });
+                join = Load_Headless_Join_Data(*settings.ClientBuild, armor_types, strings, definitions,
+                    map_definitions, find_core);
             }
-        } else {
-            Check_Chunks(static_data, stem + ".lsd");
-            Check_Chunks(dynamic_data, stem + ".ldd");
+            maps.push_back({map, std::move(collision), std::move(join)});
+        } catch (const std::runtime_error &error) {
+            throw std::runtime_error(map + ": " + error.what());
         }
     }
-    return LoadedGame{std::move(*collision), std::move(join)};
+    return maps;
 }
 
 void Report_Static_Collision(const HeadlessCollision &collision)
@@ -628,7 +630,7 @@ private:
 };
 
 int Run_Headless(const Settings &settings, const Options &options, const in_addr &bind_address,
-    const LoadedGame &game)
+    const std::vector<HeadlessMap> &maps)
 {
     if (std::signal(SIGINT, Request_Stop) == SIG_ERR || std::signal(SIGTERM, Request_Stop) == SIG_ERR) {
         throw std::runtime_error("Cannot install shutdown handlers");
@@ -642,14 +644,14 @@ int Run_Headless(const Settings &settings, const Options &options, const in_addr
         throw std::runtime_error("Cannot bind UDP to " + options.BindAddress + ":" + std::to_string(settings.Port));
     }
 
-    HeadlessPlayerSession session(game.Collision, server);
+    HeadlessPlayerSession session(maps.front().Collision, server);
     auto join_options = settings.Join;
     join_options.Address = bind_address.s_addr;
     std::optional<HeadlessJoin> join;
     std::optional<LanDiscovery> discovery;
-    if (game.Join) {
+    if (settings.ClientBuild) {
         server.Set_Bandwidth_Budget_Out(2000000); // Original BANDWIDTH_LANT1.
-        join.emplace(server, session, *game.Join, join_options);
+        join.emplace(server, session, maps, join_options);
         discovery.emplace(*join, bind_address, options.LanDestination);
         server.Install_Application_Acceptance_Handler([&](cPacket &packet) { return join->Accept(packet); });
         server.Install_Conn_Handler([&](int peer_id) { join->Connected(peer_id); });
@@ -680,8 +682,8 @@ int Run_Headless(const Settings &settings, const Options &options, const in_addr
     auto previous = HeadlessSimulation::Clock::now();
     while (!stop_requested) {
         const auto frame_start = HeadlessSimulation::Clock::now();
-        if (join) {
-            join->Update_Round(frame_start);
+        if (join && !join->Update_Round(frame_start)) {
+            break;
         }
         server.Service_Read();
         if (join) {
@@ -722,8 +724,8 @@ int main(int argc, char **argv)
         }
         const auto directory = Resolve_Data_Directory(options.DataDir);
         const Settings settings = Load_Settings(options, directory);
-        const auto game = Load_Game_Data(directory, settings);
-        const auto &collision = game.Collision;
+        const auto maps = Load_Game_Data(directory, settings);
+        const auto &collision = maps.front().Collision;
         const auto &level = collision.Level();
         std::cout << "Validated game data for " << settings.Maps.size() << " map(s); first map: "
                   << settings.Maps.front() << '\n'
@@ -733,13 +735,18 @@ int main(int argc, char **argv)
                   << " Nod and " << level.Count_Player_Spawns(PLAYERTYPE_GDI) << " GDI soldier starts)\n";
         Report_Static_Collision(collision);
         if (options.CheckOnly) {
-            Report_Soldier_Spawns(collision);
-            if (game.Join) {
-                std::cout << "Client version key: " << game.Join->VersionKey << '\n';
+            for (const auto &map : maps) {
+                if (maps.size() > 1) {
+                    std::cout << map.Name << '\n';
+                }
+                Report_Soldier_Spawns(map.Collision);
+            }
+            if (settings.ClientBuild) {
+                std::cout << "Client version key: " << maps.front().Join.VersionKey << '\n';
             }
             return 0;
         }
-        return Run_Headless(settings, options, bind_address, game);
+        return Run_Headless(settings, options, bind_address, maps);
     } catch (const std::exception &error) {
         std::cerr << "FDS: " << error.what() << '\n';
         return 1;

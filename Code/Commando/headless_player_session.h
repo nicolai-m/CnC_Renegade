@@ -16,13 +16,14 @@ struct HeadlessSoldierPreset;
 class HeadlessPlayerSession {
 public:
     HeadlessPlayerSession(const HeadlessCollision &collision, cConnection &connection);
+    static void Validate_Map(const HeadlessCollision &collision);
 
     // The joining client must know the soldier's network object before the first update.
     bool Attach_Player(int peer_id, int player_type, int soldier_object_id);
     void Introduce_Soldier(int owner_id, int recipient, const HeadlessSoldierPreset &preset, unsigned armor_types);
     void Set_Player_Loading(int peer_id, bool loading);
     void Remove_Player(int peer_id);
-    void Reset_Soldiers();
+    void Reset_Map(const HeadlessCollision &collision);
     void Receive_Control(cPacket &packet, int peer_id);
     void Advance(HeadlessSimulation::Clock::duration elapsed);
     static bool Client_Owns_Object_Id(int peer_id, int object_id);
@@ -40,6 +41,7 @@ private:
     };
 
     bool Read_Control(cPacket &packet, int peer_id, Peer &peer);
+    static void Init_Position_Encoders(const HeadlessCollision &collision, std::array<cEncoderTypeEntry, 3> &encoders);
     void Write_Position(cPacket &packet, const Vector3 &position);
     void Write_Frequent(cPacket &packet, int peer_id, const Peer &peer);
     void Publish_Player(int peer_id, const Peer &peer);
