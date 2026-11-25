@@ -95,13 +95,14 @@ peers receive position and movement updates for the soldiers known to them.
 The two-client UDP fixture covers login, map readiness, movement replication,
 and object removal when a player leaves.
 
-On Linux arm64, graphical EA 1.038 Windows clients loaded `C&C_Field.mix`,
-spawned and displayed another player's movement. The test used a separate copy of
-the client with `C&C_Field.mix` as the only `.mix` map in `Data`. Adding
+On Linux arm64 and with the Linux amd64 build running under QEMU, graphical EA
+1.038 Windows clients loaded `C&C_Field.mix`, spawned and displayed another
+player's movement. The test used a separate copy of the client with
+`C&C_Field.mix` as the only `.mix` map in `Data`. Adding
 `C&C_Under.mix` to that copy reproduced the client's "Missing map" error on
 the next join to `C&C_Field.mix`. Removing the extra map restored the join.
-Graphical testing against Linux amd64, weapons, match rules, map rotation, and
-server discovery are still pending.
+Graphical testing on native Linux amd64, weapons, match rules, map rotation,
+and server discovery are still pending.
 
 
 ### Level Edit (Public Release)
