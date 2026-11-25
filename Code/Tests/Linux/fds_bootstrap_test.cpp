@@ -15,6 +15,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -676,8 +677,8 @@ struct Join_Client_State {
     std::map<int, int> Soldiers;
     std::map<int, float> Y;
     std::set<int> Deleted;
-    bool HasOptions = false;
-    bool HasGameData = false;
+    std::optional<float> OptionsTime;
+    std::optional<int> GameDataTime;
 };
 
 Join_Client_State FirstJoinClient;
@@ -798,10 +799,11 @@ void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
         Check(std::u16string(motd) == u"Ready", "Wrong message of the day in game options");
         Check(!Field<bool>(packet) && !Field<bool>(packet) && Field<int>(packet) == 0,
             "Incorrect C&C victory options or starting credits");
-        Check(Field<float>(packet) == 1380.0f &&
+        const float remaining = Field<float>(packet);
+        Check(remaining > 0 && remaining <= 1380.0f &&
             Field<int>(packet) == 1 && Field<uint32>(packet) == 0 && Field<uint32>(packet) == TestMapCRC,
             "The original game options packet had an incorrect footer");
-        client.HasOptions = true;
+        client.OptionsTime = remaining;
         break;
     }
     case 1011: { // cPlayer.
@@ -853,11 +855,14 @@ void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
         packet.Flush();
         break;
     }
-    case 1012: // cGameDataUpdateEvent.
-        Check(Field<int>(packet) == 1380 && Field<int>(packet) == 1 && !client.Soldiers.empty(),
+    case 1012: { // cGameDataUpdateEvent.
+        const int remaining = Field<int>(packet);
+        Check(client.OptionsTime && remaining > 0 && remaining <= *client.OptionsTime &&
+            Field<int>(packet) == 1 && !client.Soldiers.empty(),
             "Incorrect game clock after map load");
-        client.HasGameData = true;
+        client.GameDataTime = remaining;
         break;
+    }
     default:
         throw std::runtime_error("Unexpected class in original join sequence");
     }
@@ -939,7 +944,7 @@ void Check_Original_Join(unsigned short port, const std::string &definitions, co
 
     cConnection first;
     Connect_Join_Client(first, u"First", u"testpass", JoinKey, Receive_First_Join);
-    Pump_Clients({&first}, [&] { return FirstJoinClient.HasOptions; });
+    Pump_Clients({&first}, [&] { return FirstJoinClient.OptionsTime.has_value(); });
     Check(first.Is_Established() && FirstJoinClient.Players.empty(), "Player objects arrived before map load");
     refuse(u"first", u"testpass", JoinKey, REFUSAL_PLAYER_EXISTS);
 
@@ -951,16 +956,21 @@ void Check_Original_Join(unsigned short port, const std::string &definitions, co
     Pump_Clients({&first}, [&] { return std::chrono::steady_clock::now() >= deadline; });
     Check(FirstJoinClient.Players.empty(), "A bio from a different map spawned a soldier");
     Send_Bio(first, u"First", PLAYERTYPE_GDI, 2, "C&C_Test.mix");
-    Pump_Clients({&first}, [&] { return FirstJoinClient.HasGameData; });
+    Pump_Clients({&first}, [&] { return FirstJoinClient.GameDataTime.has_value(); });
     const int first_soldier = FirstJoinClient.Soldiers.at(1);
 
+    const auto late_join = std::chrono::steady_clock::now() + 1100ms;
+    Pump_Clients({&first}, [&] { return std::chrono::steady_clock::now() >= late_join; });
     cConnection second;
     Connect_Join_Client(second, u"Second", u"testpass", JoinKey, Receive_Second_Join);
-    Pump_Clients({&first, &second}, [&] { return SecondJoinClient.HasOptions; });
+    Pump_Clients({&first, &second}, [&] { return SecondJoinClient.OptionsTime.has_value(); });
     Send_Bio(second, u"Second", PLAYERTYPE_NOD, 1, "C&C_Test.mix");
     Pump_Clients({&first, &second}, [&] {
-        return SecondJoinClient.HasGameData && FirstJoinClient.Soldiers.size() == 2 && SecondJoinClient.Soldiers.size() == 2;
+        return SecondJoinClient.GameDataTime && FirstJoinClient.Soldiers.size() == 2 && SecondJoinClient.Soldiers.size() == 2;
     });
+    Check(*FirstJoinClient.OptionsTime - *SecondJoinClient.OptionsTime >= 1.0f &&
+        *FirstJoinClient.GameDataTime > *SecondJoinClient.GameDataTime,
+        "A later player must receive the time remaining in the same round");
     lan.Expect(true, 2);
 
     cPacket movement;

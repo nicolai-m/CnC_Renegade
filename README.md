@@ -100,8 +100,15 @@ running multiple servers on the same LAN.
 The join sends the original teams and game options and waits for the client's
 post-load biography before creating its player and soldier objects. Connected
 peers receive position and movement updates for the soldiers known to them.
+
+`TimeLimitMinutes` starts counting down when the server starts the loaded map.
+Clients receive the remaining round time when joining and after loading the
+map. A value of `0` disables the time limit. Round-ending rules and map
+rotation are still being ported.
+
 The two-client UDP fixture covers login, map readiness, movement replication,
-object removal when a player leaves, and LAN announcements and withdrawal.
+the remaining time for a late join, object removal when a player leaves, and
+LAN announcements and withdrawal.
 
 On Linux arm64 and with the Linux amd64 build running under QEMU, graphical EA
 1.038 Windows clients loaded `C&C_Field.mix`, spawned and displayed another

@@ -73,6 +73,7 @@ uint32 Map_CRC(std::string map)
 HeadlessJoin::HeadlessJoin(cConnection &connection, HeadlessPlayerSession &session,
     const HeadlessJoinData &data, const HeadlessJoinOptions &options)
     : Connection(connection), Session(session), Data(data), Options(options), MapCrc(Map_CRC(options.Map)),
+      RoundEnd(Clock::now() + std::chrono::minutes(options.TimeLimit)),
       Teams{NextObject--, NextObject--}
 {
 }
@@ -322,6 +323,11 @@ void HeadlessJoin::Write_Game_Info(cPacket &packet, uint32 address) const
     packet.Add(0); // Mod CRC.
 }
 
+HeadlessJoin::Clock::duration HeadlessJoin::Time_Remaining() const
+{
+    return std::max(Clock::duration::zero(), RoundEnd - Clock::now());
+}
+
 void HeadlessJoin::Send_Game_Options(int recipient)
 {
     cPacket packet;
@@ -339,7 +345,7 @@ void HeadlessJoin::Send_Game_Options(int recipient)
     packet.Add(false); // Base destruction ends the game.
     packet.Add(false); // Beacon placement ends the game.
     packet.Add(0); // Starting credits.
-    packet.Add(static_cast<float>(Options.TimeLimit * 60));
+    packet.Add(std::chrono::duration<float>(Time_Remaining()).count());
     packet.Add(HostedGameNumber);
     packet.Add(0); // Mod CRC.
     packet.Add(MapCrc);
@@ -350,7 +356,7 @@ void HeadlessJoin::Send_Game_Data(int recipient)
 {
     cPacket packet;
     Write_Creation(packet, NextObject--, NETCLASSID_GAMEDATAUPDATEEVENT, true);
-    packet.Add(Options.TimeLimit * 60);
+    packet.Add(static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(Time_Remaining()).count()));
     packet.Add(HostedGameNumber);
     Connection.Send_Packet_To_Individual(packet, recipient, SEND_RELIABLE);
 }

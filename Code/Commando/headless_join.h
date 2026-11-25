@@ -2,6 +2,7 @@
 #ifndef HEADLESS_JOIN_H
 #define HEADLESS_JOIN_H
 
+#include <chrono>
 #include <map>
 #include <memory>
 #include <set>
@@ -35,6 +36,8 @@ public:
     void Write_Lan_Announcement(cPacket &packet, uint32 address, uint32 sequence, bool hosting) const;
 
 private:
+    using Clock = std::chrono::steady_clock;
+
     struct Peer {
         std::u16string Name;
         std::unique_ptr<cPacket> InitialControl;
@@ -46,6 +49,7 @@ private:
 
     void Receive_Bio(cPacket &packet, int peer_id, Peer &peer);
     void Set_Loading(int peer_id, Peer &peer, bool loading);
+    Clock::duration Time_Remaining() const;
     void Write_Game_Info(cPacket &packet, uint32 address) const;
     void Send_Game_Options(int recipient);
     void Send_Game_Data(int recipient);
@@ -58,6 +62,7 @@ private:
     const HeadlessJoinData &Data;
     const HeadlessJoinOptions &Options;
     const uint32 MapCrc;
+    const Clock::time_point RoundEnd;
     std::u16string PendingName;
     std::map<int, Peer> Peers;
     std::set<int> Closing;
