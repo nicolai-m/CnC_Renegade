@@ -185,6 +185,8 @@ std::string Collision_Data(uint32 last_vertex = 2)
             {0, 0, 0}, {2, 2, 1}) +
         box("testmesh.wall", W3D_BOX_ATTRIBUTE_ALIGNED | W3D_MESH_FLAG_COLLISION_TYPE_PHYSICAL,
             {0, 2.8f, 1}, {0.5f, 0.05f, 1}) +
+        box("testmesh.bulletwall", W3D_BOX_ATTRIBUTE_ALIGNED | W3D_MESH_FLAG_COLLISION_TYPE_PROJECTILE,
+            {-2.8f, 2.35f, 1.62f}, {0.08f, 0.17f, 0.8f}) +
         Chunk(W3D_CHUNK_EMITTER, Chunk(W3D_CHUNK_EMITTER_HEADER, Bytes(emitter), false)) +
         Chunk(W3D_CHUNK_HIERARCHY, Chunk(W3D_CHUNK_HIERARCHY_HEADER, Bytes(hierarchy), false) +
             Chunk(W3D_CHUNK_PIVOTS, Bytes(pivots), false)) +
@@ -193,8 +195,8 @@ std::string Collision_Data(uint32 last_vertex = 2)
         Chunk(W3D_CHUNK_HLOD, Chunk(W3D_CHUNK_HLOD_HEADER, Bytes(hlod), false) +
             parts(W3D_CHUNK_HLOD_LOD_ARRAY, 1, part("testmesh.low", 0)) +
             parts(W3D_CHUNK_HLOD_LOD_ARRAY, 2, part("testmesh.terrain", 0) + part("legacy", 1)) +
-            parts(W3D_CHUNK_HLOD_AGGREGATE_ARRAY, 3, part("testmesh.camera", 1) + part("testmesh.smoke", 1) +
-                part("testmesh.wall", 0)));
+            parts(W3D_CHUNK_HLOD_AGGREGATE_ARRAY, 4, part("testmesh.camera", 1) + part("testmesh.smoke", 1) +
+                part("testmesh.wall", 0) + part("testmesh.bulletwall", 0)));
 }
 
 std::string Dynamic_Data(float spawn_y = 2)
@@ -320,7 +322,8 @@ std::string Definitions()
     };
     auto soldier = [](sint32 id, const char (&name)[21], sint32 physics) {
         const auto identity = Chunk(0x100, Micro(1, id) + Micro(3, name), false);
-        const auto defense = Chunk(7311607, Micro(0, 100.0f) + Micro(3, 50.0f) + Micro(5, uint32{1}), false);
+        const auto defense = Chunk(7311607, Micro(0, 100.0f) + Micro(2, sint32{17}) +
+            Micro(3, 50.0f) + Micro(5, sint32{23}), false);
         const auto physical = Chunk(418001829, Chunk(909991657, Micro(18, physics), false));
         const auto weapons = Chunk(418001830, Micro(11, sint32{600 + id - 400}) + Micro(12, sint32{500}) +
             Micro(14, sint32{620}), false);
@@ -338,10 +341,11 @@ std::string Definitions()
             Chunk(1205091654, Micro(1, style) + Micro(9, 0.35f) + Micro(27, sint32{640}) +
                 Micro(28, sint32{641}) + Micro(29, clip) + Micro(35, reserve) + Micro(37, key), false)));
     };
-    auto ammo = [](sint32 id, sint32 cost) {
+    auto ammo = [](sint32 id, sint32 cost, float speed) {
         return Chunk(CHUNKID_AMMO_DEF, Chunk(0x00100101,
             Chunk(1206091430, Chunk(0x100, Micro(1, id), false)) +
-            Chunk(1206091429, Micro(31, cost) + Micro(48, 2.0f), false)));
+            Chunk(1206091429, Micro(3, sint32{1}) + Micro(4, 30.0f) + Micro(5, 40.0f) +
+                Micro(6, speed) + Micro(31, cost) + Micro(48, 2.0f), false)));
     };
     const auto powerup = Chunk(CHUNKID_GAME_OBJECT_DEF_POWERUP, Chunk(0x00100101,
         Chunk(909991656, Chunk(0x100, Micro(1, sint32{630}) + Micro(3, "pow_pistol"), false)) +
@@ -351,7 +355,7 @@ std::string Definitions()
         soldier(400, "CnC_Nod_Minigunner_0", 500) + soldier(401, "CnC_GDI_MiniGunner_0", 501) +
         physics(500, "test\\soldier0.w3d") + physics(501, "test\\soldier1.w3d") +
         weapon(600, 40, 200, 2, 2) + weapon(601, 40, 200, 2, 2) + weapon(610, 12, 100, 1, 5) +
-        weapon(620, 1, 0, 7, 0) + ammo(640, 20) + ammo(641, 7) + powerup));
+        weapon(620, 1, 0, 7, 0) + ammo(640, 20, 40.0f) + ammo(641, 7, 400.0f) + powerup));
 }
 
 struct ArchiveEntry {
@@ -537,7 +541,7 @@ void Receive_Movement_Snapshot(cPacket &packet)
     MovementSnapshots.push_back(snapshot);
 }
 
-void Write_Movement(cPacket &packet, int control_object, int owner, int soldier, float target_y,
+void Write_Movement(cPacket &packet, int control_object, int owner, int soldier, const Vector3 &target,
     float position_extent = 21.0f, unsigned position_bits = 8, ULONG buttons = 0,
     ULONG continuous = 0, bool moving = true)
 {
@@ -562,7 +566,7 @@ void Write_Movement(cPacket &packet, int control_object, int owner, int soldier,
     packet.Add(true); // Optional checksum follows.
     packet.Add(12345);
     const float max_code = static_cast<float>((1u << position_bits) - 1);
-    for (const float coordinate : {0.0f, target_y, 0.0f}) {
+    for (const float coordinate : {target.X, target.Y, target.Z}) {
         const auto code = static_cast<ULONG>(std::round((coordinate + position_extent) * max_code /
             (position_extent * 2)));
         packet.Add_Bits(code, position_bits);
@@ -635,34 +639,34 @@ void Check_Player_Transport(const HeadlessCollision &collision)
     const auto spawn = snapshot(50ms).Position;
 
     cPacket wrong_owner;
-    Write_Movement(wrong_owner, FirstControlObject, 2, SoldierObject, 8);
+    Write_Movement(wrong_owner, FirstControlObject, 2, SoldierObject, {0, 8, 0});
     send(wrong_owner, SEND_RELIABLE);
     cPacket unregistered;
-    Write_Movement(unregistered, FirstControlObject, 0, SoldierObject, 8);
+    Write_Movement(unregistered, FirstControlObject, 0, SoldierObject, {0, 8, 0});
     send(unregistered, SEND_UNRELIABLE);
     Check(snapshot(100ms).Position == spawn, "An invalid control owner moved the soldier");
 
     cPacket creation;
-    Write_Movement(creation, FirstControlObject, 1, -1, 0);
+    Write_Movement(creation, FirstControlObject, 1, -1, {0, 0, 0});
     send(creation, SEND_RELIABLE);
     cPacket wrong_soldier;
-    Write_Movement(wrong_soldier, FirstControlObject, 0, SoldierObject + 1, 8);
+    Write_Movement(wrong_soldier, FirstControlObject, 0, SoldierObject + 1, {0, 8, 0});
     send(wrong_soldier, SEND_UNRELIABLE);
     cPacket truncated;
-    Write_Movement(truncated, FirstControlObject, 0, SoldierObject, 8);
+    Write_Movement(truncated, FirstControlObject, 0, SoldierObject, {0, 8, 0});
     truncated.Set_Bit_Length(truncated.Get_Bit_Length() - 1);
     send(truncated, SEND_UNRELIABLE);
     Check(snapshot(100ms).Position == spawn, "Wrong-target or truncated input moved the soldier");
 
     cPacket drive;
-    Write_Movement(drive, FirstControlObject, 0, SoldierObject, 8);
+    Write_Movement(drive, FirstControlObject, 0, SoldierObject, {0, 8, 0});
     send(drive, SEND_UNRELIABLE);
     Check(snapshot(100ms).Position.Y > spawn.Y + 0.2f, "Valid client movement did not reach the simulation");
     const auto wall = snapshot(100ms).Position;
     Check(std::abs(wall.Y - 2.448f) < 0.1f, "Networked soldier did not stop at the wall");
 
     cPacket retreat;
-    Write_Movement(retreat, FirstControlObject, 0, SoldierObject, -8);
+    Write_Movement(retreat, FirstControlObject, 0, SoldierObject, {0, -8, 0});
     send(retreat, SEND_UNRELIABLE);
     Check(snapshot(100ms).Position.Y < wall.Y - 0.2f, "Turning the aim did not change the movement direction");
     const auto before_timeout = snapshot(120ms).Position;
@@ -672,13 +676,13 @@ void Check_Player_Transport(const HeadlessCollision &collision)
         "Reattaching a peer retained the previous soldier's position or input");
 
     cPacket recreate;
-    Write_Movement(recreate, FirstControlObject + 1, 1, SoldierObject, -8);
+    Write_Movement(recreate, FirstControlObject + 1, 1, SoldierObject, {0, -8, 0});
     send(recreate, SEND_RELIABLE);
     snapshot(100ms);
     MovementSnapshot edge;
     for (int i = 0; i < 7; ++i) {
         cPacket walk;
-        Write_Movement(walk, FirstControlObject + 1, 0, SoldierObject, -8);
+        Write_Movement(walk, FirstControlObject + 1, 0, SoldierObject, {0, -8, 0});
         send(walk, SEND_UNRELIABLE);
         edge = snapshot(100ms);
     }
@@ -693,6 +697,12 @@ template<class T> T Field(cPacket &packet)
 }
 
 struct Join_Client_State {
+    struct Defense {
+        bool Dead;
+        ULONG Health;
+        ULONG Shield;
+    };
+
     std::set<int> Teams;
     std::map<int, int> Players; // Peer ID to network object ID.
     std::map<int, int> Soldiers;
@@ -700,6 +710,7 @@ struct Join_Client_State {
     std::map<int, int> SelectedWeapon;
     std::map<int, int> Rounds;
     std::map<int, ULONG> FireControls;
+    std::map<int, Defense> Vitals;
     std::set<int> Deleted;
     std::optional<float> OptionsTime;
     std::optional<int> GameDataTime;
@@ -854,7 +865,7 @@ void Read_Soldier_Frequent(cPacket &packet, Join_Client_State &client, int objec
     ULONG state, bits;
     packet.Get_Bits(state, 5);
     packet.Get_Bits(bits, 9); // Human substate.
-    Check(state == 0 || state == 5, "Unexpected soldier state");
+    Check(state == 0 || state == 5 || state == 7, "Unexpected soldier state");
     if (state == 5) {
         for (int axis = 0; axis < 3; ++axis) {
             Field<float>(packet);
@@ -865,6 +876,27 @@ void Read_Soldier_Frequent(cPacket &packet, Join_Client_State &client, int objec
     packet.Get_Bits(bits, ControlClass::NUM_BOOLEAN_CONTINUOUS);
     client.FireControls[object] = bits;
     packet.Get_Bits(bits, 32); // Analog controls.
+}
+
+void Read_Soldier_Occasional(cPacket &packet, Join_Client_State &client, int object, int team = -1)
+{
+    Join_Client_State::Defense state{Field<bool>(packet)};
+    packet.Get_Bits(state.Health, 11);
+    packet.Get_Bits(state.Shield, 11);
+    ULONG shield_type;
+    packet.Get_Bits(shield_type, 2);
+    Check(shield_type == 2, "The original shield save ID did not map to the network index");
+    const int count = Field<int>(packet);
+    Check(count == 3, "Wrong size of the soldier inventory");
+    for (const auto &weapon : Fixture_Weapons(team)) {
+        const int id = Field<int>(packet);
+        const int rounds = Field<int>(packet);
+        if (team >= 0) {
+            Check(id == weapon.DefinitionId && rounds == weapon.Total_Rounds(),
+                "Spawn inventory did not include the armed preset and the scripted weapon grant");
+        }
+    }
+    client.Vitals[object] = state;
 }
 
 void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
@@ -883,8 +915,11 @@ void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
         Check(packet.Is_Flushed(), "Unexpected data in object deletion");
         return;
     }
-    if (dirty == 1) {
+    if (dirty == NetworkObjectClass::BIT_FREQUENT || dirty == NetworkObjectClass::BIT_OCCASIONAL) {
         Check(!deleting, "Unexpected deletion flag on soldier update");
+        if (dirty == NetworkObjectClass::BIT_OCCASIONAL) {
+            Read_Soldier_Occasional(packet, client, object);
+        }
         Read_Soldier_Frequent(packet, client, object);
         Check(packet.Is_Flushed(), "Unexpected data in soldier update");
         return;
@@ -942,21 +977,11 @@ void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
             "The soldier did not use the current map's preset");
         Check(Field<int>(packet) == 0 && Field<int>(packet) == 0 && Field<int>(packet) == 3 &&
             Field<int>(packet) == 0 && Field<int>(packet) == 0 && Field<int>(packet) == preset - first_preset &&
-            !Field<bool>(packet) && Field<int>(packet) == preset && !Field<bool>(packet),
+            !Field<bool>(packet) && Field<int>(packet) == preset,
             "Incorrect soldier rare fields");
-        ULONG defense;
-        packet.Get_Bits(defense, 11);
-        Check(defense == 102, "Wrong initial health");
-        packet.Get_Bits(defense, 11);
-        Check(defense == 51, "Wrong initial shield");
-        packet.Get_Bits(defense, 2);
-        const auto inventory = Fixture_Weapons(preset - first_preset);
-        Check(defense == 2 && Field<int>(packet) == static_cast<int>(inventory.size()),
-            "Wrong shield type or size of the spawn inventory");
-        for (const auto &weapon : inventory) {
-            Check(Field<int>(packet) == weapon.DefinitionId && Field<int>(packet) == weapon.Total_Rounds(),
-                "Spawn inventory did not include the armed preset and the scripted weapon grant");
-        }
+        Read_Soldier_Occasional(packet, client, object, preset - first_preset);
+        const auto &defense = client.Vitals.at(object);
+        Check(!defense.Dead && defense.Health == 102 && defense.Shield == 51, "Incorrect spawn vitals");
         Read_Soldier_Frequent(packet, client, object);
         Check(client.SelectedWeapon.at(object) == 600 + preset - first_preset, "The primary weapon must start equipped");
         break;
@@ -1059,7 +1084,7 @@ void Check_Map_Rotation(const HeadlessCollision &collision, const HeadlessCollis
     FirstJoinClient = {};
     SecondJoinClient = {};
     LateJoinClient = {};
-    const HeadlessJoinData data{42, 1, 2, 2, {{{400, "soldier0", 100, 50, 1, Fixture_Weapons(0), 600},
+    const HeadlessJoinData data{42, 1, 2, {{17, {}}, {23, {}}}, {{{400, "soldier0", 100, 50, 1, Fixture_Weapons(0), 600},
         {401, "soldier1", 100, 50, 1, Fixture_Weapons(1), 601}}}};
     auto next_data = data;
     next_data.Soldiers[PLAYERTYPE_NOD].DefinitionId = 410;
@@ -1105,7 +1130,7 @@ void Check_Map_Rotation(const HeadlessCollision &collision, const HeadlessCollis
     pump([&] { return FirstJoinClient.OptionsTime && SecondJoinClient.OptionsTime && LateJoinClient.OptionsTime; });
     Check(first.Get_Local_Id() == 1 && second.Get_Local_Id() == 2, "Unexpected round test peer IDs");
     cPacket control;
-    Write_Movement(control, FirstControlObject, 1, -1, 0);
+    Write_Movement(control, FirstControlObject, 1, -1, {0, 0, 0});
     first.Send_Packet_To_Individual(control, SERVER_RHOST_ID, SEND_RELIABLE);
     Send_Bio(first, u"First", PLAYERTYPE_GDI, 1, "C&C_Test.mix");
     Send_Bio(second, u"Second", PLAYERTYPE_NOD, 1, "C&C_Test.mix");
@@ -1156,7 +1181,7 @@ void Check_Map_Rotation(const HeadlessCollision &collision, const HeadlessCollis
         "The restarted player did not use the next map's spawn position and coordinate precision");
     const int before = received;
     cPacket movement;
-    Write_Movement(movement, FirstControlObject, 0, new_soldier, 8, 61.0f, 10);
+    Write_Movement(movement, FirstControlObject, 0, new_soldier, {0, 8, 0}, 61.0f, 10);
     first.Send_Packet_To_Individual(movement, SERVER_RHOST_ID, SEND_UNRELIABLE);
     pump([&] { return received > before; });
     session.Advance(100ms);
@@ -1219,7 +1244,7 @@ void Check_Original_Join(unsigned short port, const std::string &definitions, co
     refuse(u"first", u"testpass", JoinKey, REFUSAL_PLAYER_EXISTS);
 
     cPacket control;
-    Write_Movement(control, FirstControlObject, 1, -1, 0);
+    Write_Movement(control, FirstControlObject, 1, -1, {0, 0, 0});
     first.Send_Packet_To_Individual(control, SERVER_RHOST_ID, SEND_RELIABLE);
     Send_Bio(first, u"First", PLAYERTYPE_GDI, 1, "Wrong.mix");
     const auto deadline = std::chrono::steady_clock::now() + 50ms;
@@ -1244,15 +1269,15 @@ void Check_Original_Join(unsigned short port, const std::string &definitions, co
     lan.Expect(true, 2);
 
     cPacket movement;
-    Write_Movement(movement, FirstControlObject, 0, first_soldier, 8);
+    Write_Movement(movement, FirstControlObject, 0, first_soldier, {0, 8, 0});
     first.Send_Packet_To_Individual(movement, SERVER_RHOST_ID, SEND_UNRELIABLE);
     Pump_Clients({&first, &second}, [&] {
         return FirstJoinClient.Y[first_soldier] > 2.25f && SecondJoinClient.Y[first_soldier] > 2.25f;
     });
 
-    const auto send_controls = [&](ULONG buttons, ULONG triggers) {
+    const auto send_controls = [&](ULONG buttons, ULONG triggers, const Vector3 &target = Vector3(0, 8, 0)) {
         cPacket input;
-        Write_Movement(input, FirstControlObject, 0, first_soldier, 8, 21.0f, 8, buttons, triggers, false);
+        Write_Movement(input, FirstControlObject, 0, first_soldier, target, 21.0f, 8, buttons, triggers, false);
         first.Send_Packet_To_Individual(input, SERVER_RHOST_ID, SEND_UNRELIABLE);
     };
     const auto wait = [&](auto elapsed) {
@@ -1265,8 +1290,8 @@ void Check_Original_Join(unsigned short port, const std::string &definitions, co
             FirstJoinClient.FireControls.at(first_soldier) == triggers &&
             SecondJoinClient.FireControls.at(first_soldier) == triggers;
     };
-    const auto fire = [&](ULONG trigger, int remaining) {
-        send_controls(0, trigger);
+    const auto fire = [&](ULONG trigger, int remaining, const Vector3 &target = Vector3(0, 8, 0)) {
+        send_controls(0, trigger, target);
         Pump_Clients({&first, &second}, [&] { return replicated(remaining, trigger); });
     };
     constexpr ULONG primary = 1;
@@ -1287,6 +1312,56 @@ void Check_Original_Join(unsigned short port, const std::string &definitions, co
     fire(primary, 160); // The server automatically refilled the clip from the remaining reserve.
     send_controls(0, 0);
     Pump_Clients({&first, &second}, [&] { return replicated(160, 0); });
+
+    const int second_soldier = SecondJoinClient.Soldiers.at(2);
+    const auto defense = [&](int hp, int shield) {
+        cEncoderTypeEntry encoder;
+        encoder.Init(0, 2000, 1);
+        ULONG health_code, shield_code;
+        encoder.Scale(hp, health_code);
+        encoder.Scale(shield, shield_code);
+        const auto matches = [&](const Join_Client_State &client) {
+            const auto &vital = client.Vitals.at(second_soldier);
+            return vital.Dead == (hp == 0) && vital.Health == health_code && vital.Shield == shield_code;
+        };
+        return matches(FirstJoinClient) && matches(SecondJoinClient);
+    };
+    const auto aim_at_second = [&] {
+        return Vector3(-12, SecondJoinClient.Y.at(second_soldier) - FirstJoinClient.Y.at(first_soldier), 1.62f);
+    };
+    wait(550ms);
+    fire(primary, 140, aim_at_second());
+    wait(900ms);
+    Check(defense(100, 50), "Static projectile cover did not block the rifle shot");
+
+    const int second_control_id = FirstControlObject + 100000;
+    cPacket sidestep;
+    Write_Movement(sidestep, second_control_id, 2, second_soldier, {0, -8, 0});
+    second.Send_Packet_To_Individual(sidestep, SERVER_RHOST_ID, SEND_RELIABLE);
+    wait(300ms);
+    Check(SecondJoinClient.Y.at(second_soldier) <= 1.25f, "The target could not leave cover");
+    fire(primary, 120, aim_at_second());
+    Check(defense(100, 50), "The rifle projectile arrived before its travel time");
+    Pump_Clients({&first, &second}, [&] { return defense(82, 14); });
+    wait(550ms);
+    fire(primary, 100, aim_at_second());
+    Pump_Clients({&first, &second}, [&] { return defense(48, 0); });
+    wait(550ms);
+    fire(secondary, 93, aim_at_second());
+    Pump_Clients({&first, &second}, [&] { return defense(3, 0); });
+    wait(550ms);
+    fire(secondary, 86, aim_at_second());
+    Pump_Clients({&first, &second}, [&] { return defense(0, 0); });
+
+    const float dead_position = SecondJoinClient.Y.at(second_soldier);
+    cPacket dead_input;
+    Write_Movement(dead_input, second_control_id, 0, second_soldier, {12, 0, 1.62f}, 21.0f, 8,
+        1u << ControlClass::BOOLEAN_SELECT_WEAPON_1, primary);
+    second.Send_Packet_To_Individual(dead_input, SERVER_RHOST_ID, SEND_UNRELIABLE);
+    wait(300ms);
+    Check(SecondJoinClient.Y.at(second_soldier) == dead_position &&
+        FirstJoinClient.FireControls.at(second_soldier) == 0 && SecondJoinClient.SelectedWeapon.at(second_soldier) == 600,
+        "A defeated soldier could still move, change weapons or fire");
 
     const auto select = [&](ControlClass::BooleanControl button, int expected) {
         send_controls(1u << button, 0);
@@ -1330,7 +1405,9 @@ int main(int argc, char **argv)
         const auto dynamic_data = Dynamic_Data();
         const auto definitions = Definitions();
         const auto translations = Chunk(0x90000, Chunk(0x07141200, Micro(1, uint32{145}), false));
-        const std::string armor = "[Armor_Types]\n0=None\n1=Soldier\n";
+        const std::string armor = "[Armor_Types]\n2=Flesh\n1=Kevlar\n[Warhead_Types]\n3=None\n2=Bullets\n"
+            "[Armor_Save_IDs]\nFlesh=17\nKevlar=23\n[Scale_Flesh]\nBullets=1.5\n"
+            "[Scale_Kevlar]\nBullets=2\n[Shield_Kevlar]\nBullets=0.6\n";
         Write_Archive(data / "always.dbs", {{"STRINGS.TDB", translations}, {"OBJECTS.DDB", definitions}});
         std::ofstream(data / "ARMOR.ini") << armor;
         const auto dependencies = Chunk(0x04020527, Micro(1, "D:\\levels\\COLLIDERS.W3D"), false);
@@ -1364,7 +1441,7 @@ int main(int argc, char **argv)
 
         const auto collision = HeadlessCollision::Load(level,
             [&](const std::string &name) { return archive.Find(name); }, archive.Find("c&c_test.dep"));
-        Check(collision.Collider_Count() == 12 && collision.Incomplete_Object_Count() == 0,
+        Check(collision.Collider_Count() == 15 && collision.Incomplete_Object_Count() == 0,
             "HLOD dependencies, top LOD or aggregate parts failed to load");
         const Vector3 start(6.5f, 0.125f, 3), end(6.5f, 0.125f, -1);
         const auto ground = collision.Cast_Ray(start, end, COLLISION_TYPE_PHYSICAL);
@@ -1404,7 +1481,7 @@ int main(int argc, char **argv)
             "FDS did not validate the configured map");
         Check(check.Output().find("3 static objects in 3 spatial nodes, 1 buildings, 2 spawners") != std::string::npos,
             "FDS did not load the headless scene before startup");
-        Check(check.Output().find("12 colliders, 0 static objects with incomplete geometry; "
+        Check(check.Output().find("15 colliders, 0 static objects with incomplete geometry; "
             "2/2 soldier-start ground rays hit; 2/2 ground box sweeps hit (0 initial overlaps)") != std::string::npos,
             "FDS did not load W3D collision from the selected map");
         Check(check.Output().find("Headless soldier spawns: Nod ready, GDI ready") != std::string::npos,

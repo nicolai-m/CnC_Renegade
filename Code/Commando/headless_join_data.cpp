@@ -56,6 +56,8 @@ struct Record {
     int PhysicsId = 0;
     std::array<int, 2> WeaponIds{};
     int WeaponRounds = -1;
+    int SkinSaveId = 0;
+    int ShieldSaveId = 0;
     std::vector<std::string> SpawnPowerups;
 };
 
@@ -76,6 +78,16 @@ struct AmmoDefinition {
     int RoundCost = 1;
     float RateOfFire = 1;
     float ChargeSeconds = 0;
+    int Warhead = 0;
+    float Damage = 1;
+    float Range = 10;
+    float Speed = 1;
+    float Gravity = 0;
+    float Spread = 0;
+    int SprayCount = 1;
+    int SoftPierceLimit = 0;
+    bool Tracking = false;
+    int Explosion = 0;
 };
 
 struct WeaponGrant {
@@ -101,11 +113,11 @@ void Read_Identity(BoundedChunkReader &reader, int &definition_id, std::string &
     });
 }
 
-int Read_Defense_Value(BoundedChunkReader &reader)
+float Read_Defense_Value(BoundedChunkReader &reader)
 {
     const float value = reader.Value<float>();
     reader.Require(std::isfinite(value) && value >= 0 && value <= MaxDefense, "Invalid soldier defense value");
-    return static_cast<int>(std::lround(value));
+    return value;
 }
 
 void Read_Record(BoundedChunkReader &reader, Record &record, uint32 parent, unsigned depth = 0)
@@ -143,10 +155,12 @@ void Read_Record(BoundedChunkReader &reader, Record &record, uint32 parent, unsi
             reader.Each_Micro([&](uint32 field) {
                 if (field == 0) {
                     record.Soldier.Health = Read_Defense_Value(reader);
+                } else if (field == 2) {
+                    record.SkinSaveId = reader.Value<sint32>();
                 } else if (field == 3) {
                     record.Soldier.Shield = Read_Defense_Value(reader);
                 } else if (field == 5) {
-                    record.Soldier.ShieldType = reader.Value<uint32>();
+                    record.ShieldSaveId = reader.Value<sint32>();
                 }
             });
         } else if (id == PhysicsModelVariables) {
@@ -211,7 +225,17 @@ void Read_Ammo(BoundedChunkReader &reader, EquipmentDefinitions &equipment)
         } else if (id == AmmoVariables) {
             reader.Each_Micro([&](uint32 field) {
                 switch (field) {
+                case 3: ammo.Warhead = reader.Value<sint32>(); break;
+                case 4: ammo.Damage = reader.Value<float>(); break;
+                case 5: ammo.Range = reader.Value<float>(); break;
+                case 6: ammo.Speed = reader.Value<float>(); break;
+                case 7: ammo.Gravity = reader.Value<float>(); break;
+                case 10: ammo.Spread = reader.Value<float>(); break;
+                case 11: ammo.SprayCount = reader.Value<sint32>(); break;
                 case 15: ammo.BurstMax = reader.Value<sint32>(); break;
+                case 17: ammo.SoftPierceLimit = reader.Value<sint32>(); break;
+                case 21: ammo.Tracking = reader.Value<uint8>() != 0; break;
+                case 24: ammo.Explosion = reader.Value<sint32>(); break;
                 case 27: ammo.ChargeSeconds = reader.Value<float>(); break;
                 case 31: ammo.RoundCost = reader.Value<sint32>(); break;
                 case 32: ammo.Type = reader.Value<sint32>(); break;
@@ -310,7 +334,17 @@ std::optional<HeadlessFireMode> Get_Fire_Mode(const EquipmentDefinitions &equipm
     if (!std::isfinite(interval)) {
         return std::nullopt;
     }
-    return HeadlessFireMode{interval, charge_seconds, ammo.RoundCost};
+    HeadlessFireMode mode{interval, charge_seconds, ammo.RoundCost, {}};
+    // The minigunner uses single, straight bullets. The other projectile behaviors need their own simulation.
+    if (ammo.Warhead >= 0 && std::isfinite(ammo.Damage) && ammo.Damage > 0 &&
+        std::isfinite(ammo.Range) && ammo.Range > 0 && ammo.Range <= 1000 &&
+        std::isfinite(ammo.Speed) && ammo.Speed > 0 &&
+        std::isfinite(ammo.Spread) && ammo.Spread >= 0 && ammo.Spread <= 1 &&
+        ammo.Gravity == 0 && ammo.SprayCount <= 1 && ammo.SoftPierceLimit <= 1 && !ammo.Tracking && !ammo.Explosion) {
+        mode.Bullet = HeadlessBulletDefinition{ammo.Damage, static_cast<unsigned>(ammo.Warhead),
+            ammo.Range, ammo.Speed, ammo.Spread};
+    }
+    return mode;
 }
 
 void Load_Starting_Weapons(const Record &record, const EquipmentDefinitions &equipment, HeadlessSoldierPreset &soldier)
@@ -443,7 +477,7 @@ int HeadlessSpawnWeapon::Total_Rounds() const
     return ReserveRounds < 0 ? -1 : static_cast<int>(std::min<std::int64_t>(total, std::numeric_limits<int>::max()));
 }
 
-HeadlessJoinData Load_Headless_Join_Data(uint32 client_build, unsigned armor_types,
+HeadlessJoinData Load_Headless_Join_Data(uint32 client_build, const HeadlessArmorTable &armor,
     const GameDataFile &strings, const GameDataFile &definitions, const std::optional<GameDataFile> &map_definitions,
     const HeadlessCollision::FindAsset &find_core_asset)
 {
@@ -453,7 +487,7 @@ HeadlessJoinData Load_Headless_Join_Data(uint32 client_build, unsigned armor_typ
     result.ExeCRC = Build_CRC(exe);
     result.StringsCRC = Build_CRC(tdb);
     result.VersionKey = Build_CRC(exe + " " + tdb + " ") ^ Data_CRC(find_core_asset);
-    result.ArmorTypes = armor_types;
+    result.Armor = armor;
 
     std::array<Record, 2> soldiers;
     std::map<int, std::string> physics;
@@ -462,16 +496,22 @@ HeadlessJoinData Load_Headless_Join_Data(uint32 client_build, unsigned armor_typ
     if (map_definitions) {
         Load_Presets(*map_definitions, physics, soldiers, equipment);
     }
+    const auto armor_index = [&](int save_id) -> unsigned {
+        const auto found = std::find_if(armor.begin(), armor.end(), [=](const auto &type) { return type.SaveId == save_id; });
+        return found == armor.end() ? 0 : static_cast<unsigned>(found - armor.begin());
+    };
     for (std::size_t team = 0; team < soldiers.size(); ++team) {
         const auto &record = soldiers[team];
         const auto model = physics.find(record.PhysicsId);
         if (record.Soldier.DefinitionId <= 0 || record.Soldier.Health <= 0 ||
-            armor_types == 0 || record.Soldier.ShieldType >= armor_types ||
+            armor.empty() ||
             model == physics.end() || model->second.empty()) {
             throw std::runtime_error("Missing or invalid Nod/GDI minigunner preset");
         }
         result.Soldiers[team] = record.Soldier;
         result.Soldiers[team].Model = model->second;
+        result.Soldiers[team].Skin = armor_index(record.SkinSaveId);
+        result.Soldiers[team].ShieldType = armor_index(record.ShieldSaveId);
         Load_Starting_Weapons(record, equipment, result.Soldiers[team]);
     }
     return result;

@@ -4,6 +4,7 @@
 #include <net/if.h>
 #include <charconv>
 #include <chrono>
+#include <cmath>
 #include <csignal>
 #include <filesystem>
 #include <fstream>
@@ -128,11 +129,13 @@ Options Parse_Options(int argc, char **argv)
 
 using IniSection = std::map<std::string, std::string>;
 using IniFile = std::map<std::string, IniSection>;
+using IniEntryOrder = std::map<std::string, std::vector<std::string>>;
 
-IniFile Read_Ini(std::istream &input, const std::string &name)
+IniFile Read_Ini(std::istream &input, const std::string &name, IniEntryOrder *order = nullptr)
 {
     IniFile result;
     IniSection *section = nullptr;
+    std::vector<std::string> *keys = nullptr;
     std::string line;
     bool first_line = true;
     while (std::getline(input, line)) {
@@ -146,14 +149,20 @@ IniFile Read_Ini(std::istream &input, const std::string &name)
             continue;
         }
         if (text.front() == '[' && text.back() == ']') {
-            section = &result[Fold_Ascii(Trim(text.substr(1, text.size() - 2)))];
+            const auto name = Fold_Ascii(Trim(text.substr(1, text.size() - 2)));
+            section = &result[name];
+            keys = order ? &(*order)[name] : nullptr;
             continue;
         }
         const auto equals = text.find('=');
         if (section != nullptr && equals != std::string_view::npos) {
             const auto key = Trim(text.substr(0, equals));
             if (!key.empty()) {
-                (*section)[Fold_Ascii(key)] = Trim(text.substr(equals + 1));
+                const auto folded = Fold_Ascii(key);
+                if (keys && section->find(folded) == section->end()) {
+                    keys->push_back(folded);
+                }
+                (*section)[folded] = Trim(text.substr(equals + 1));
             }
         }
     }
@@ -312,6 +321,8 @@ Settings Load_Settings(const Options &options, const fs::path &data_dir)
         if (const auto radar = Setting(rules->second, "radarmode"); !radar.empty()) {
             result.Join.RadarMode = Read_Integer(radar, 0, 2, "RadarMode");
         }
+        const auto friendly = Fold_Ascii(Setting(rules->second, "isfriendlyfirepermitted"));
+        result.Join.FriendlyFire = !friendly.empty() && std::string_view("yt1").find(friendly.front()) != std::string_view::npos;
         const auto loop = Fold_Ascii(Setting(rules->second, "domapsloop"));
         if (!loop.empty() && std::string_view("nf0").find(loop.front()) != std::string_view::npos) {
             result.Join.LoopMaps = false;
@@ -374,7 +385,7 @@ void Check_Chunks(const GameDataFile &data, const std::string &name)
     }
 }
 
-unsigned Count_Armor_Types(const GameDataFile &armor)
+HeadlessArmorTable Load_Armor(const GameDataFile &armor)
 {
     auto file = armor.Open();
     std::string text(armor.Length, '\0');
@@ -382,9 +393,37 @@ unsigned Count_Armor_Types(const GameDataFile &armor)
         throw std::runtime_error("Cannot read armor.ini");
     }
     std::istringstream input(text);
-    const auto ini = Read_Ini(input, "armor.ini");
-    const auto types = ini.find("armor_types");
-    return types == ini.end() ? 0 : static_cast<unsigned>(types->second.size());
+    IniEntryOrder order;
+    const auto ini = Read_Ini(input, "armor.ini", &order);
+    const auto get = [&](const std::string &section, const std::string &key) {
+        const auto found = ini.find(section);
+        return found == ini.end() ? std::string{} : Setting(found->second, key);
+    };
+    const auto coefficient = [&](const std::string &section, const std::string &warhead, float fallback) {
+        const auto text = get(section, warhead);
+        float value;
+        const auto result = std::from_chars(text.data(), text.data() + text.size(), value);
+        return result.ec == std::errc{} && result.ptr == text.data() + text.size() && std::isfinite(value) ? value : fallback;
+    };
+    std::vector<std::string> warheads;
+    for (const auto &key : order["warhead_types"]) {
+        warheads.push_back(Fold_Ascii(get("warhead_types", key)));
+    }
+    HeadlessArmorTable types;
+    // The original INI loader uses file order for network indices and separate saved IDs in objects.ddb.
+    for (const auto &key : order["armor_types"]) {
+        const auto name = Fold_Ascii(get("armor_types", key));
+        const auto saved = get("armor_save_ids", name);
+        int id = -100;
+        const auto result = std::from_chars(saved.data(), saved.data() + saved.size(), id);
+        HeadlessArmorType type{result.ec == std::errc{} && result.ptr == saved.data() + saved.size() ? id : -100, {}};
+        for (const auto &warhead : warheads) {
+            type.Warheads.push_back({coefficient("scale_" + name, warhead, 1.0f),
+                coefficient("shield_" + name, warhead, 0.0f)});
+        }
+        types.push_back(std::move(type));
+    }
+    return types;
 }
 
 std::vector<HeadlessMap> Load_Game_Data(const fs::path &directory, const Settings &settings)
@@ -405,7 +444,7 @@ std::vector<HeadlessMap> Load_Game_Data(const fs::path &directory, const Setting
         throw std::runtime_error("Cannot read armor.ini");
     }
 
-    const auto armor_types = settings.ClientBuild ? Count_Armor_Types(armor_data) : 0;
+    const auto armor_table = settings.ClientBuild ? Load_Armor(armor_data) : HeadlessArmorTable{};
     const auto find_core = [&](const std::string &name) { return Find_Optional_Asset(directory, core, name); };
     std::vector<HeadlessMap> maps;
     maps.reserve(settings.Maps.size());
@@ -434,7 +473,7 @@ std::vector<HeadlessMap> Load_Game_Data(const fs::path &directory, const Setting
             HeadlessPlayerSession::Validate_Map(collision);
             HeadlessJoinData join;
             if (settings.ClientBuild) {
-                join = Load_Headless_Join_Data(*settings.ClientBuild, armor_types, strings, definitions,
+                join = Load_Headless_Join_Data(*settings.ClientBuild, armor_table, strings, definitions,
                     map_definitions, find_core);
             }
             maps.push_back({map, std::move(collision), std::move(join)});

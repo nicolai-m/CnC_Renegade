@@ -78,6 +78,7 @@ HeadlessJoin::HeadlessJoin(cConnection &connection, HeadlessPlayerSession &sessi
       FrameTime(Clock::now()), RoundEnd(FrameTime + std::chrono::minutes(options.TimeLimit)),
       Teams{NextObject--, NextObject--}
 {
+    Session.Set_Combat_Rules(Maps[0].Join.Armor, Options.FriendlyFire);
 }
 
 bool HeadlessJoin::Update_Round(Clock::time_point now)
@@ -130,6 +131,7 @@ void HeadlessJoin::Restart_Round()
         }
     }
     Session.Reset_Map(Maps[MapIndex].Collision);
+    Session.Set_Combat_Rules(Maps[MapIndex].Join.Armor, Options.FriendlyFire);
     for (auto &[id, peer] : Peers) {
         if (peer.State == LoadState::Ready) {
             Spawn_Player(id, peer);
@@ -454,7 +456,8 @@ void HeadlessJoin::Send_Game_Options(int recipient)
     packet.Add(Options.RadarMode);
     packet.Add(static_cast<int>(IntermissionDuration.count()));
     packet.Add(0); // Minimum qualifying minutes.
-    for (int i = 0; i < 7; ++i) { // Tier 2 flags, including three C&C-specific flags.
+    packet.Add(Options.FriendlyFire);
+    for (int i = 0; i < 6; ++i) { // Remaining Tier 2 flags, including three C&C-specific flags.
         packet.Add(false);
     }
     packet.Add_Wide_Terminated_String(Options.Motd.c_str(), true);
@@ -534,5 +537,5 @@ void HeadlessJoin::Delete_Object(int recipient, int object)
 void HeadlessJoin::Introduce_Soldier(int recipient, int player_id, const Peer &peer)
 {
     const auto &data = Maps[MapIndex].Join;
-    Session.Introduce_Soldier(player_id, recipient, data.Soldiers[peer.Team], data.ArmorTypes);
+    Session.Introduce_Soldier(player_id, recipient, data.Soldiers[peer.Team]);
 }

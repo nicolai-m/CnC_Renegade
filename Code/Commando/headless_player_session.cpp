@@ -7,11 +7,15 @@
 #include <stdexcept>
 #include <utility>
 
+#include "aabox.h"
+#include "colmath.h"
+#include "coltype.h"
 #include "connect.h"
 #include "control.h"
 #include "headless_collision.h"
 #include "headless_join_data.h"
 #include "humanstate.h"
+#include "lineseg.h"
 #include "netclassids.h"
 #include "networkobject.h"
 
@@ -30,6 +34,8 @@ constexpr UINT HumanSubStateBits = 9;
 constexpr double PositionResolution = 0.2;
 constexpr ULONG FirePrimary = 1u << (ControlClass::BOOLEAN_WEAPON_FIRE_PRIMARY - ControlClass::BOOLEAN_CONTINUOUS_FIRST);
 constexpr ULONG FireSecondary = 1u << (ControlClass::BOOLEAN_WEAPON_FIRE_SECONDARY - ControlClass::BOOLEAN_CONTINUOUS_FIRST);
+constexpr float InstantBulletSpeed = 400.0f; // BulletManager::Create_Bullet.
+constexpr std::size_t MaxActiveBullets = 4096;
 
 Vector2 Left_Of(const Vector2 &forward)
 {
@@ -42,7 +48,16 @@ HeadlessPlayerSession::HeadlessPlayerSession(const HeadlessCollision &collision,
     : Simulation(collision), Connection(connection)
 {
     AnalogEncoder.Init(-1.0, 1.0, 0.01); // ControlClass::Set_Precision
+    VitalsEncoder.Init(0, 2000, 1); // DefenseObjectClass::Set_Precision
+    ArmorEncoder.Init(0, 1, 1);
     Init_Position_Encoders(collision, PositionEncoders);
+}
+
+void HeadlessPlayerSession::Set_Combat_Rules(const HeadlessArmorTable &armor, bool friendly_fire)
+{
+    Armor = &armor;
+    FriendlyFire = friendly_fire;
+    ArmorEncoder.Init(0, std::max<std::size_t>(1, armor.size()), 1);
 }
 
 void HeadlessPlayerSession::Validate_Map(const HeadlessCollision &collision)
@@ -86,6 +101,10 @@ bool HeadlessPlayerSession::Attach_Player(int peer_id, int player_type, int sold
     const auto previous = Peers.find(peer_id);
     const int control = previous == Peers.end() ? 0 : previous->second.ControlObject;
     auto &peer = Peers.insert_or_assign(peer_id, Peer{soldier_object_id, forward, target, control}).first->second;
+    peer.Health = preset.Health;
+    peer.Shield = preset.Shield;
+    peer.Skin = preset.Skin;
+    peer.ShieldType = preset.ShieldType;
     peer.Weapons = preset.Weapons;
     const auto starting_weapon = std::find_if(peer.Weapons.begin(), peer.Weapons.end(), [&](const auto &weapon) {
         return weapon.DefinitionId == preset.StartingWeapon;
@@ -97,8 +116,7 @@ bool HeadlessPlayerSession::Attach_Player(int peer_id, int player_type, int sold
     return true;
 }
 
-void HeadlessPlayerSession::Introduce_Soldier(int owner_id, int recipient, const HeadlessSoldierPreset &preset,
-    unsigned armor_types)
+void HeadlessPlayerSession::Introduce_Soldier(int owner_id, int recipient, const HeadlessSoldierPreset &preset)
 {
     const auto &soldier = *Simulation.Find_Soldier(owner_id);
     auto &peer = Peers.at(owner_id);
@@ -123,23 +141,7 @@ void HeadlessPlayerSession::Introduce_Soldier(int owner_id, int recipient, const
     packet.Add(false); // HUD poke indicator.
     packet.Add(preset.DefinitionId); // SoldierGameObj::Export_Rare.
 
-    packet.Add(false); // Health is nonzero.
-    cEncoderTypeEntry vitals;
-    vitals.Init(0, 2000, 1);
-    cEncoderTypeEntry armor;
-    armor.Init(0, armor_types, 1);
-    ULONG code;
-    vitals.Scale(preset.Health, code);
-    packet.Add_Bits(code, vitals.Get_Bit_Precision());
-    vitals.Scale(preset.Shield, code);
-    packet.Add_Bits(code, vitals.Get_Bit_Precision());
-    armor.Scale(preset.ShieldType, code);
-    packet.Add_Bits(code, armor.Get_Bit_Precision());
-    packet.Add(static_cast<int>(peer.Weapons.size()));
-    for (const auto &weapon : peer.Weapons) {
-        packet.Add(weapon.DefinitionId);
-        packet.Add(weapon.Total_Rounds());
-    }
+    Write_Occasional(packet, peer);
     Write_Frequent(packet, owner_id, peer);
     Connection.Send_Packet_To_Individual(packet, recipient, SEND_RELIABLE);
     peer.Viewers.insert(recipient);
@@ -173,6 +175,7 @@ void HeadlessPlayerSession::Reset_Map(const HeadlessCollision &collision)
 {
     Init_Position_Encoders(collision, PositionEncoders);
     Simulation = HeadlessSimulation(collision);
+    Bullets.clear();
     PublishElapsed = {};
     for (auto &[id, peer] : Peers) {
         peer.Ready = false;
@@ -190,7 +193,7 @@ void HeadlessPlayerSession::Reset_Map(const HeadlessCollision &collision)
 void HeadlessPlayerSession::Receive_Control(cPacket &packet, int peer_id)
 {
     const auto peer = Peers.find(peer_id);
-    if (peer != Peers.end() && peer->second.Ready) {
+    if (peer != Peers.end() && peer->second.Ready && peer->second.Health > 0) {
         Read_Control(packet, peer_id, peer->second);
     }
     packet.Flush();
@@ -300,7 +303,7 @@ bool HeadlessPlayerSession::Read_Control(cPacket &packet, int peer_id, Peer &pee
     return true;
 }
 
-void HeadlessPlayerSession::Advance_Weapon(Peer &peer, float seconds, ULONG fire_controls, bool reload)
+void HeadlessPlayerSession::Advance_Weapon(int player_id, Peer &peer, float seconds, ULONG fire_controls, bool reload)
 {
     if (peer.WeaponSlot == 0) {
         return;
@@ -344,6 +347,9 @@ void HeadlessPlayerSession::Advance_Weapon(Peer &peer, float seconds, ULONG fire
             peer.WeaponTimeRemaining = mode ? mode->ShotInterval : weapon.PrimaryFire->ShotInterval;
             if (mode) {
                 weapon.ClipRounds = std::max(0, weapon.ClipRounds - mode->RoundCost);
+                if (mode->Bullet) {
+                    Fire_Bullet(player_id, peer, *mode->Bullet);
+                }
             }
             continue;
         case WeaponState::Reloading: {
@@ -361,6 +367,112 @@ void HeadlessPlayerSession::Advance_Weapon(Peer &peer, float seconds, ULONG fire
         peer.WeaponAction = WeaponState::Ready;
         peer.WeaponTimeRemaining = 0;
     }
+}
+
+void HeadlessPlayerSession::Fire_Bullet(int player_id, const Peer &peer, const HeadlessBulletDefinition &definition)
+{
+    const auto &soldier = *Simulation.Find_Soldier(player_id);
+    const auto start = soldier.Position + Vector3(0, 0, SoldierEyeHeight);
+    Vector3 direction = peer.Target - start;
+    if (direction.Length2() < 0.0001f) {
+        return;
+    }
+    direction.Normalize();
+    if (definition.Spread > 0) {
+        auto random = std::uniform_real_distribution<float>(0, 1);
+        const float theta = random(SpreadRandom) * 6.283185307f;
+        const float angle = random(SpreadRandom) * definition.Spread;
+        const Vector3 axis = std::abs(direction.Z) > 0.99f ? Vector3(0, 1, 0) : Vector3(0, 0, 1);
+        auto right = Vector3::Cross_Product(direction, axis);
+        right.Normalize();
+        const auto up = Vector3::Cross_Product(right, direction);
+        direction = direction * std::cos(angle) + (right * std::cos(theta) + up * std::sin(theta)) * std::sin(angle);
+    }
+    Bullet bullet{peer.SoldierObject, soldier.PlayerType, definition, start, direction, definition.Range * 1.2f};
+    if (definition.Speed >= InstantBulletSpeed) {
+        Trace_Bullet(bullet, start + direction * definition.Range);
+    } else if (Bullets.size() < MaxActiveBullets) {
+        Bullets.push_back(bullet);
+    }
+}
+
+bool HeadlessPlayerSession::Trace_Bullet(const Bullet &bullet, const Vector3 &end)
+{
+    const auto terrain = Simulation.Map_Collision().Cast_Ray(bullet.Position, end, COLLISION_TYPE_PROJECTILE);
+    if (terrain && terrain->StartsInside) {
+        return true;
+    }
+    const LineSegClass ray(bullet.Position, end);
+    CastResultStruct hit;
+    hit.Fraction = terrain ? terrain->Fraction : 1.0f;
+    auto target = Peers.end();
+    for (auto it = Peers.begin(); it != Peers.end(); ++it) {
+        auto &peer = it->second;
+        if (!peer.Ready || peer.Health <= 0 || peer.SoldierObject == bullet.ShooterObject) {
+            continue;
+        }
+        const auto &soldier = *Simulation.Find_Soldier(it->first);
+        if (CollisionMath::Collide(ray, HeadlessSimulation::Soldier_Bounds(soldier.Position), &hit)) {
+            target = it;
+            if (hit.StartBad) {
+                break;
+            }
+        }
+    }
+    if (target != Peers.end()) {
+        const auto &soldier = *Simulation.Find_Soldier(target->first);
+        if (FriendlyFire || soldier.PlayerType != bullet.Team) {
+            Apply_Bullet_Damage(target->first, target->second, bullet.Definition);
+        }
+        return true;
+    }
+    return terrain.has_value();
+}
+
+void HeadlessPlayerSession::Apply_Bullet_Damage(int player_id, Peer &peer, const HeadlessBulletDefinition &bullet)
+{
+    if (!Armor || peer.Skin >= Armor->size() || peer.ShieldType >= Armor->size()) {
+        return;
+    }
+    const auto &skin = (*Armor)[peer.Skin].Warheads;
+    const auto &shield = (*Armor)[peer.ShieldType].Warheads;
+    if (bullet.Warhead >= skin.size() || bullet.Warhead >= shield.size()) {
+        return;
+    }
+    double damage = bullet.Damage;
+    const float previous_shield = peer.Shield;
+    if (peer.Shield > 0) {
+        const auto &rule = shield[bullet.Warhead];
+        const double absorbed = damage * std::clamp(rule.ShieldAbsorption, 0.0f, 1.0f);
+        const double shield_loss = std::min<double>(peer.Shield, absorbed * std::max(0.0f, rule.Scale));
+        peer.Shield -= static_cast<float>(shield_loss);
+        // DefenseObjectClass sends the unabsorbed fraction and spillover through the skin multiplier.
+        damage = std::max(0.0, damage - (rule.Scale > 0 ? shield_loss / rule.Scale : absorbed));
+    }
+    const float previous_health = peer.Health;
+    peer.Health -= static_cast<float>(std::min<double>(peer.Health, damage * std::max(0.0f, skin[bullet.Warhead].Scale)));
+    peer.DefenseChanged |= peer.Health != previous_health || peer.Shield != previous_shield;
+    if (peer.Health == 0) {
+        peer.MoveAxes.Set(0, 0);
+        peer.FireControls = 0;
+        peer.InputRemaining = {};
+        peer.ReloadRequested = false;
+        Simulation.Set_Move_Input(player_id, peer.MoveAxes);
+    }
+}
+
+void HeadlessPlayerSession::Advance_Bullets(float seconds)
+{
+    Bullets.erase(std::remove_if(Bullets.begin(), Bullets.end(), [&](Bullet &bullet) {
+        const float travel = std::min(bullet.RemainingTravel, seconds * bullet.Definition.Speed);
+        const auto end = bullet.Position + bullet.Direction * travel;
+        if (Trace_Bullet(bullet, end)) {
+            return true;
+        }
+        bullet.Position = end;
+        bullet.RemainingTravel -= travel;
+        return bullet.RemainingTravel <= 0;
+    }), Bullets.end());
 }
 
 void HeadlessPlayerSession::Select_Weapon(Peer &peer, ULONG controls)
@@ -411,12 +523,13 @@ void HeadlessPlayerSession::Advance(HeadlessSimulation::Clock::duration elapsed)
         return;
     }
     const auto weapon_elapsed = std::min(elapsed, std::chrono::duration_cast<Duration>(100ms));
+    Advance_Bullets(std::chrono::duration<float>(weapon_elapsed).count());
     for (auto &[id, peer] : Peers) {
-        if (peer.Ready) {
+        if (peer.Ready && peer.Health > 0) {
             const auto held = std::min(weapon_elapsed, peer.InputRemaining);
             const bool reload = std::exchange(peer.ReloadRequested, false);
-            Advance_Weapon(peer, std::chrono::duration<float>(held).count(), peer.FireControls, reload);
-            Advance_Weapon(peer, std::chrono::duration<float>(weapon_elapsed - held).count(), 0, false);
+            Advance_Weapon(id, peer, std::chrono::duration<float>(held).count(), peer.FireControls, reload);
+            Advance_Weapon(id, peer, std::chrono::duration<float>(weapon_elapsed - held).count(), 0, false);
         }
         if (peer.InputRemaining > Duration::zero()) {
             peer.InputRemaining -= std::min(elapsed, peer.InputRemaining);
@@ -431,9 +544,26 @@ void HeadlessPlayerSession::Advance(HeadlessSimulation::Clock::duration elapsed)
     PublishElapsed += std::min(elapsed, std::chrono::duration_cast<Duration>(PublishInterval));
     if (PublishElapsed >= PublishInterval) {
         PublishElapsed -= PublishInterval;
-        for (const auto &[id, peer] : Peers) {
+        for (auto &[id, peer] : Peers) {
             Publish_Player(id, peer);
         }
+    }
+}
+
+void HeadlessPlayerSession::Write_Occasional(cPacket &packet, const Peer &peer)
+{
+    packet.Add(peer.Health == 0);
+    ULONG code;
+    VitalsEncoder.Scale(std::lround(peer.Health), code);
+    packet.Add_Bits(code, VitalsEncoder.Get_Bit_Precision());
+    VitalsEncoder.Scale(std::lround(peer.Shield), code);
+    packet.Add_Bits(code, VitalsEncoder.Get_Bit_Precision());
+    ArmorEncoder.Scale(peer.ShieldType, code);
+    packet.Add_Bits(code, ArmorEncoder.Get_Bit_Precision());
+    packet.Add(static_cast<int>(peer.Weapons.size()));
+    for (const auto &weapon : peer.Weapons) {
+        packet.Add(weapon.DefinitionId);
+        packet.Add(weapon.Total_Rounds());
     }
 }
 
@@ -461,7 +591,10 @@ void HeadlessPlayerSession::Write_Frequent(cPacket &packet, int peer_id, const P
         if (weapon.SecondaryFire) { fire_controls |= peer.FireControls & FireSecondary; }
     }
     Write_Position(packet, soldier.Position);
-    packet.Add_Bits(soldier.Grounded ? HumanStateClass::UPRIGHT : HumanStateClass::AIRBORNE, HumanStateBits);
+    const bool dead = peer.Health == 0;
+    const auto state = dead ? HumanStateClass::DEATH :
+        (soldier.Grounded ? HumanStateClass::UPRIGHT : HumanStateClass::AIRBORNE);
+    packet.Add_Bits(state, HumanStateBits);
     const auto left = Left_Of(peer.Forward);
     const float forward_speed = soldier.Velocity.X * peer.Forward.X + soldier.Velocity.Y * peer.Forward.Y;
     const float left_speed = soldier.Velocity.X * left.X + soldier.Velocity.Y * left.Y;
@@ -470,8 +603,8 @@ void HeadlessPlayerSession::Write_Frequent(cPacket &packet, int peer_id, const P
     if (forward_speed < -0.01f) { stance |= HumanStateClass::SUB_STATE_BACKWARD; }
     if (left_speed > 0.01f) { stance |= HumanStateClass::SUB_STATE_LEFT; }
     if (left_speed < -0.01f) { stance |= HumanStateClass::SUB_STATE_RIGHT; }
-    packet.Add_Bits(stance, HumanSubStateBits);
-    if (!soldier.Grounded) {
+    packet.Add_Bits(dead ? HumanStateClass::TORSO_FROM_FRONT : stance, HumanSubStateBits);
+    if (state == HumanStateClass::AIRBORNE) {
         packet.Add(soldier.Velocity.X);
         packet.Add(soldier.Velocity.Y);
         packet.Add(soldier.Velocity.Z);
@@ -488,20 +621,24 @@ void HeadlessPlayerSession::Write_Frequent(cPacket &packet, int peer_id, const P
     }
 }
 
-void HeadlessPlayerSession::Publish_Player(int peer_id, const Peer &peer)
+void HeadlessPlayerSession::Publish_Player(int peer_id, Peer &peer)
 {
     if (!peer.Ready) {
         return;
     }
     cPacket packet;
     packet.Add(peer.SoldierObject);
-    packet.Add(static_cast<BYTE>(NetworkObjectClass::BIT_FREQUENT));
+    packet.Add(static_cast<BYTE>(peer.DefenseChanged ? NetworkObjectClass::BIT_OCCASIONAL : NetworkObjectClass::BIT_FREQUENT));
     packet.Add(false);
+    if (peer.DefenseChanged) {
+        Write_Occasional(packet, peer);
+    }
     Write_Frequent(packet, peer_id, peer);
     for (const int recipient : peer.Viewers) {
         const auto viewer = Peers.find(recipient);
         if (viewer != Peers.end() && viewer->second.Ready && Connection.Get_Remote_Host(recipient)) {
-            Connection.Send_Packet_To_Individual(packet, recipient, SEND_UNRELIABLE);
+            Connection.Send_Packet_To_Individual(packet, recipient, peer.DefenseChanged ? SEND_RELIABLE : SEND_UNRELIABLE);
         }
     }
+    peer.DefenseChanged = false;
 }

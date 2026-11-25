@@ -29,6 +29,7 @@ struct HeadlessJoinOptions {
     int TimeLimit = 30;
     int RadarMode = 1;
     bool LoopMaps = true;
+    bool FriendlyFire = false;
 };
 
 class HeadlessJoin {

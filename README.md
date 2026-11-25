@@ -107,8 +107,16 @@ inventory on spawn and synchronizes weapon selection, including number keys,
 cycling, and holstering. For the stock rifles and pistol, the server tracks
 magazine and reserve rounds, uses the original firing rates and reload times,
 and synchronizes trigger state and remaining ammunition. Both manual and
-automatic reloads use the weapon's reserve. Projectile hits, damage, and C4
-placement and detonation are still being ported.
+automatic reloads use the weapon's reserve.
+
+The server traces the stock minigunner's rifle and pistol shots against static
+map geometry and soldier collision boxes. Rifles use projectile travel time.
+The pistol resolves the hit immediately, as in the original game. Shield
+absorption and skin multipliers come from `armor.ini`. The server publishes
+health and shield updates and stops movement and firing at zero health.
+Set `IsFriendlyFirePermitted=yes` in `[Settings]` to enable damage between
+teammates. It defaults to off. Skeletal hit zones, damage to vehicles and
+buildings, combat respawns, and C4 placement and detonation remain open.
 
 `TimeLimitMinutes` starts counting down when the server starts the loaded map.
 Clients receive the remaining round time when joining and after loading the
@@ -125,10 +133,11 @@ tiebreaker. Scoring and combat-based victory rules are still being ported.
 
 The two-client UDP fixture covers login, map readiness, movement replication,
 the remaining time for a late join, spawn inventory, weapon selection visible
-to both peers, firing and reloads, object removal, and LAN announcements and
-withdrawal. The round fixture advances the server clock through a timeout and
-checks the announced map, its spawn and position encoding, movement after a
-map reload, and the end of the map cycle.
+to both peers, firing and reloads, cover, projectile travel, shield and health
+damage, blocked input at zero health, object removal, and LAN announcements
+and withdrawal. The round fixture advances the server clock through a timeout
+and checks the announced map, its spawn and position encoding, movement after
+a map reload, and the end of the map cycle.
 
 On Linux arm64 and with the Linux amd64 build running under QEMU, graphical EA
 1.038 Windows clients loaded `C&C_Field.mix`, spawned and displayed another

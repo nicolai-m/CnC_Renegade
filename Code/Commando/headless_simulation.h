@@ -11,6 +11,7 @@
 #include "vector3.h"
 
 class HeadlessCollision;
+class AABoxClass;
 
 class HeadlessSimulation {
 public:
@@ -31,6 +32,8 @@ public:
     bool Spawn_Soldier(int player_id, int player_type);
     void Remove_Soldier(int player_id);
     const Soldier *Find_Soldier(int player_id) const;
+    static AABoxClass Soldier_Bounds(const Vector3 &feet);
+    const HeadlessCollision &Map_Collision() const { return Collision.get(); }
 
     // World-space movement axes in [-1, 1], held until the next input.
     bool Set_Move_Input(int player_id, const Vector2 &direction);
