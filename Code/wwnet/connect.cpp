@@ -31,12 +31,11 @@
 
 #include "connect.h" // I WANNA BE FIRST!
 
-//#include <stdlib.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "systimer.h"
-
-#include "systimer.h"
-#include "miscutil.h"
 #include "netutil.h"
 #include "singlepl.h"
 #include "mathutil.h"
@@ -45,11 +44,13 @@
 #include "fromaddress.h"
 #include "crc.h"
 #include "msgstatlist.h"
+#if !defined(__linux__)
 #include "wwprofile.h"
 #include "commando\nat.h"
 #include "commando\natter.h"
+#endif
 #include "packetmgr.h"
-#include "bwbalance.h"
+#include "BWBalance.h"
 
 #ifdef WWDEBUG
 #include "combat\crandom.h"
@@ -89,11 +90,10 @@ static const int		INVALID_RHOST_ID			= -1;
 char * Addr_As_String(sockaddr_in *addr)
 {
 	static char _string[128];
-	sprintf(_string, "%d.%d.%d.%d ; %d", 	(int)(addr->sin_addr.S_un.S_un_b.s_b1),
-														(int)(addr->sin_addr.S_un.S_un_b.s_b2),
-														(int)(addr->sin_addr.S_un.S_un_b.s_b3),
-														(int)(addr->sin_addr.S_un.S_un_b.s_b4),
-														htonl((int)(addr->sin_port)));
+	USHORT port;
+	char ip[16];
+	cNetUtil::Address_To_String(addr, ip, sizeof(ip), port);
+	sprintf(_string, "%s ; %u", ip, static_cast<unsigned int>(port));
 	return(_string);
 }
 //#endif //WWDEBUG
@@ -107,7 +107,10 @@ cConnection::cConnection() :
    MinRHost(-1),							// should be altered if IsServer
    //MaxRHost(0),							// should be altered if IsServer
    MaxRHost(-2),							// should be altered if IsServer
+	LocalId(ID_UNKNOWN),
+	LocalPort(0),
 	InitDone(false),
+	Sock(INVALID_SOCKET),
 	IsServer(false),
 	IsDedicatedServer(false),
    SimulatedPacketLossPerRANDMAX(0),
@@ -145,15 +148,11 @@ cConnection::cConnection() :
       cNetUtil::Create_Unbound_Socket(Sock);
 
       //
-      // Make socket non-blocking
-      //
-      u_long arg = 1L;
-      WSA_CHECK(ioctlsocket(Sock, FIONBIO, (u_long *) &arg));
-
-      //
       // Increase the send and rcv buffer sizes a bit
       //
-		cNetUtil::Set_Socket_Buffer_Sizes(Sock);
+		if (Sock != INVALID_SOCKET) {
+			cNetUtil::Set_Socket_Buffer_Sizes(Sock);
+		}
 	}
 
    /*
@@ -182,13 +181,7 @@ cConnection::~cConnection()
 
 	//Remove_All();
 
-   if (!cSinglePlayerData::Is_Single_Player()) {
-		//
-		// Abortively shut down the socket
-		//
-      WSA_CHECK(shutdown(Sock, 2)); // SD_BOTH
-      WSA_CHECK(::closesocket(Sock));
-   }
+	cNetUtil::Close_Socket(Sock);
 
    //for (int rhost_id = 0; rhost_id < MAX_RHOSTS; rhost_id++) {
    //for (int rhost_id = 0; rhost_id < MaxRHost; rhost_id++) {
@@ -244,11 +237,9 @@ void cConnection::Init_As_Client(LPSOCKADDR_IN p_server_address, unsigned short 
 	//
 	// The server address and port are supplied by the firewall code too.
 	//
-   if (!cSinglePlayerData::Is_Single_Player()) {
-      bool is_bound;
-		is_bound = Bind(my_port);
-      WWASSERT(is_bound);
-   }
+	if (!cSinglePlayerData::Is_Single_Player() && !Bind(my_port)) {
+		return;
+	}
 
 	//
 	// Create rhost for server
@@ -286,7 +277,7 @@ void cConnection::Init_As_Client(ULONG server_ip, USHORT server_port, unsigned s
 	WWASSERT(server_port >= MIN_SERVER_PORT && server_port <= MAX_SERVER_PORT);
 
    SOCKADDR_IN server_address;
-	ZeroMemory(&server_address, sizeof(server_address));
+	memset(&server_address, 0, sizeof(server_address));
 
    if (!cSinglePlayerData::Is_Single_Player()) {
 		server_address.sin_family			= AF_INET;
@@ -298,91 +289,72 @@ void cConnection::Init_As_Client(ULONG server_ip, USHORT server_port, unsigned s
 }
 
 //------------------------------------------------------------------------------------
-void cConnection::Init_As_Server(USHORT server_port, int max_players,
-	bool is_dedicated_server, ULONG addr)
+bool cConnection::Init_As_Server(USHORT server_port, int max_players,
+	bool is_dedicated_server, ULONG addr, bool allow_port_fallback)
 {
-   WWDEBUG_SAY(("cConnection::Init_As_Server\n"));
+	WWDEBUG_SAY(("cConnection::Init_As_Server\n"));
+	if (InitDone || max_players < 1 || max_players > MAX_PEER_ID ||
+		(server_port != 0 && server_port < MIN_SERVER_PORT)) {
+		return false;
+	}
 
-   WWASSERT(!InitDone);
-   WWASSERT(server_port >= MIN_SERVER_PORT && server_port <= MAX_SERVER_PORT);
-	WWASSERT(max_players >= 1);
-	//WWASSERT(max_players < MAX_RHOSTS); // because MAX_RHOSTS is an array bound
+	const bool single_player = cSinglePlayerData::Is_Single_Player();
+	if (!single_player) {
+		bool bound = false;
+		const int last_port = server_port != 0 && allow_port_fallback
+			? MIN(server_port + 49, MAX_SERVER_PORT) : server_port;
+		for (int port = server_port; port <= last_port && !bound; ++port) {
+			bound = Bind(static_cast<USHORT>(port), addr);
+		}
+		if (!bound) {
+			return false;
+		}
+	}
 
-   MinRHost = 1;
-   MaxRHost = max_players;
-
-	typedef cRemoteHost * PcRemoteHost;
-	PRHost = new PcRemoteHost[max_players + 1];
-	WWASSERT(PRHost != NULL);
-	//ZeroMemory(PRHost, sizeof(PRHost));
-	for (int rhost_id = MinRHost; rhost_id <= MaxRHost; rhost_id++) {
-      PRHost[rhost_id] = NULL;
-   }
-
- 	Init_Stats();
+	MinRHost = 1;
+	MaxRHost = max_players;
+	PRHost = new cRemoteHost *[max_players + 1];
+	for (int id = 0; id <= max_players; ++id) {
+		PRHost[id] = NULL;
+	}
+	Init_Stats();
 
 	IsServer = true;
 	IsDedicatedServer = is_dedicated_server;
-   LocalId = 0;
-
-	if (cSinglePlayerData::Is_Single_Player()) {
-      IsFlowControlEnabled = false;
-   } else {
-      //
-      // The server has to ::bind to his well-known port... or the nearest he can get
-      // to it...
-      //
-      bool is_bound;
-      int num_tries = 0;
-      do {
-         is_bound = Bind(server_port, addr);
-
-         if (!is_bound) {
-            WWDEBUG_SAY(("Failed to Bind to local port %d.\n", server_port));
-            server_port++;
-            num_tries++;
-         }
-      } while (!is_bound && num_tries < 50 && server_port <= MAX_SERVER_PORT);
-
-      WWASSERT(num_tries < 50 && server_port <= MAX_SERVER_PORT);
-
-		// Tell the firewall code that we started a new local server.
+	LocalId = 0;
+	if (single_player) {
+		IsFlowControlEnabled = false;
+#if !defined(__linux__)
+	} else {
 		WOLNATInterface.Set_Server(true);
-   }
-
+#endif
+	}
 	InitDone = true;
+	return true;
 }
 
 //------------------------------------------------------------------------------------
 bool cConnection::Bind(USHORT port, ULONG addr)
 {
-   WWASSERT(!cSinglePlayerData::Is_Single_Player());
+	WWASSERT(!cSinglePlayerData::Is_Single_Player());
+	WWASSERT(!InitDone);
+	if (Sock == INVALID_SOCKET) {
+		return false;
+	}
 
-   WWASSERT(!InitDone);
-	//WWASSERT((!IsServer && port == 0) ||
-	WWASSERT((!IsServer) ||
-		    (IsServer && port >= MIN_SERVER_PORT && port <= MAX_SERVER_PORT));
-
-   SOCKADDR_IN address;
-   cNetUtil::Create_Local_Address(&address, port);
-
-   if (addr) address.sin_addr.s_addr = htonl(addr);
-
-   if (::bind(Sock, (LPSOCKADDR) &address, sizeof(SOCKADDR_IN)) != SOCKET_ERROR) {
-      LocalPort = port;
-      WWDEBUG_SAY(("Bound to local port %d.\n", LocalPort));
-      return true;
-   } else {
-      //
-      // Any excuse other than address/port already used, is fatal.
-      //
-      if (::WSAGetLastError() != WSAEADDRINUSE) {
-			WSA_ERROR;
-      }
-      return false;
-   }
-
-   //DIE; // won't get here
+	SOCKADDR_IN address;
+	cNetUtil::Create_Local_Address(&address, port);
+	if (addr) {
+		address.sin_addr.s_addr = htonl(addr);
+	}
+	SocketLength length = sizeof(address);
+	if (::bind(Sock, (LPSOCKADDR)&address, length) == SOCKET_ERROR ||
+		(port == 0 && getsockname(Sock, (LPSOCKADDR)&address, &length) == SOCKET_ERROR)) {
+		return false;
+	}
+	LocalPort = ntohs(address.sin_port);
+	WWDEBUG_SAY(("Bound to local port %d.\n", LocalPort));
+	return true;
 }
 
 //------------------------------------------------------------------------------------
@@ -570,7 +542,11 @@ int cConnection::Single_Player_recvfrom(char * data)
 
    SLNode<cPacket> * objnode = p_packet_list->Head();
    if (objnode == NULL) {
+#if defined(__linux__)
+		errno = EAGAIN;
+#else
       WSASetLastError(WSAEWOULDBLOCK);
+#endif
       ret_code = SOCKET_ERROR; // no data received
    } else {
 
@@ -678,9 +654,10 @@ bool cConnection::Receive_Packet()
 	// Intercept packets intended for the firewall negotiation code.
 	//
    if (packet.Get_Type() == PACKETTYPE_FIREWALL_PROBE) {
+#if !defined(__linux__)
 		WOLNATInterface.Intercept_Game_Packet(packet);
+#endif
 		packet.Flush();
-      WWDEBUG_SAY(("cConnection:: Packet transferred to WOLNAT interface\n"));
 		return(true);
 	};
 
@@ -719,6 +696,9 @@ bool cConnection::Receive_Packet()
 	WWASSERT(p_from_address != NULL);
 	cRemoteHost * p_sender_rhost = NULL;
 	if (sender_id != cPacket::UNDEFINED_ID) {
+		if (sender_id < MinRHost || sender_id > MaxRHost) {
+			return true;
+		}
 		p_sender_rhost = PRHost[sender_id];
 
 		//WWASSERT(p_sender_rhost != NULL);
@@ -777,8 +757,9 @@ bool cConnection::Receive_Packet()
       case PACKETTYPE_CONNECT_CS: {
 				WWDEBUG_SAY(("CONNECT: PACKETTYPE_CONNECT_CS received\n"));
 
-            WWASSERT(IsServer);
-            WWASSERT(sender_id == ID_UNKNOWN);
+				if (!IsServer || sender_id != ID_UNKNOWN || !ApplicationAcceptanceHandler || !ConnHandler) {
+					return true;
+				}
 
             //
             // Reliable message, ack it.
@@ -794,7 +775,9 @@ bool cConnection::Receive_Packet()
 				//WWDEBUG_SAY(("cConnection::Receive_Packet : PACKETTYPE_ACCEPT_SC received\n"));
 				WWDEBUG_SAY(("CONNECT: PACKETTYPE_ACCEPT_SC received\n"));
 
-            WWASSERT(!IsServer);
+            if (IsServer || sender_id != SERVER_RHOST_ID || !Sender_Id_Tests(packet) || !AcceptHandler) {
+               return true;
+            }
 
             if (LocalId != ID_UNKNOWN) {
                //
@@ -806,9 +789,12 @@ bool cConnection::Receive_Packet()
                packet.Flush();
             } else {
 
-               WWASSERT(sender_id == SERVER_RHOST_ID);
-
-					packet.Get(LocalId); // This is where we learn our id
+               int assigned_id = ID_UNKNOWN;
+               packet.Get(assigned_id);
+               if (assigned_id <= SERVER_RHOST_ID || assigned_id > MAX_PEER_ID) {
+                  return true;
+               }
+               LocalId = assigned_id;
                WWDEBUG_SAY(("  Received LocalId:%d\n", LocalId));
                Send_Ack(p_from_address, packet_id);
 
@@ -836,7 +822,9 @@ bool cConnection::Receive_Packet()
       case PACKETTYPE_REFUSAL_SC: {
 				WWDEBUG_SAY(("cConnection::Receive_Packet : PACKETTYPE_REFUSAL_SC received\n"));
 
-            WWASSERT(!IsServer);
+            if (IsServer || sender_id != SERVER_RHOST_ID || !Sender_Id_Tests(packet) || !RefusalHandler) {
+               return true;
+            }
 
             if (LocalId == ID_UNKNOWN) {
 
@@ -1135,7 +1123,7 @@ if (last_packet_len == (int)packet.Get_Compressed_Size_Bytes()) {
 }
 last_packet_len = (int)packet.Get_Compressed_Size_Bytes();
 memcpy(last_packet, packet.Get_Data(), last_packet_len);
-#endif (0)
+#endif
 
    if (cSinglePlayerData::Is_Single_Player()) {
 	   ret_code = Single_Player_sendto(packet);
@@ -1178,7 +1166,9 @@ int cConnection::Send_Wrapper(cPacket & packet, LPSOCKADDR_IN p_address)
    WWASSERT(p_address != NULL);
 
 	cPacket full_packet;
-	cPacket::Construct_Full_Packet(full_packet, packet);
+	if (!cPacket::Construct_Full_Packet(full_packet, packet)) {
+		return 0;
+	}
 
 	//
 	// Update stats
@@ -1286,6 +1276,7 @@ int cConnection::Low_Level_Receive_Wrapper(cPacket & packet)
 
 		if (bytes) {
 			sockaddr_in *addr_ptr = (LPSOCKADDR_IN) &packet.Get_From_Address_Wrapper()->FromAddress;
+			addr_ptr->sin_family = AF_INET;
 			memcpy(&addr_ptr->sin_addr.s_addr, ip_address, 4);
 			addr_ptr->sin_port = port;
 		}
@@ -1331,7 +1322,9 @@ int cConnection::Receive_Wrapper(cPacket & packet)
 		//
 		full_packet.Set_Bit_Length(ret_code * 8);
 
-		cPacket::Construct_App_Packet(packet, full_packet);
+		if (!cPacket::Construct_App_Packet(packet, full_packet)) {
+			return 0;
+		}
 
 #ifndef WRAPPER_CRC
 		if (packet.Is_Crc_Correct()) {
@@ -1860,7 +1853,9 @@ void cConnection::Service_Read()
 	*/
 
 	{
+#if !defined(__linux__)
 	WWPROFILE("Receive Packets");
+#endif
    while (Receive_Packet());
 	}
 
@@ -1884,7 +1879,9 @@ void cConnection::Service_Read()
 	//start_time = (int) TIMEGETTIME();
 
 	{
+#if !defined(__linux__)
 	WWPROFILE("Process R Packets");
+#endif
 
 	for (rhost_id = MinRHost; rhost_id <= MaxRHost; rhost_id++) {
 		if (PRHost[rhost_id] != NULL) {
@@ -1992,7 +1989,9 @@ void cConnection::Service_Read()
 	//start_time = (int) TIMEGETTIME();
 
 	{
+#if !defined(__linux__)
 	WWPROFILE("Process U Packets");
+#endif
 
 	for (rhost_id = MinRHost; rhost_id <= MaxRHost; rhost_id++) {
 		if (PRHost[rhost_id] != NULL) {
@@ -2318,7 +2317,9 @@ void cConnection::Service_Send(bool is_urgent)
 			}
 
 			// Keep track of how many packets in the queue are waiting on late acks.
-			p_rhost->Set_Total_Resent_Packets_In_Queue(resent_packets);
+			if (PRHost[rhost_id] != NULL) {
+				p_rhost->Set_Total_Resent_Packets_In_Queue(resent_packets);
+			}
 		}
 	}
 
@@ -2368,7 +2369,7 @@ void cConnection::Service_Send(bool is_urgent)
          }
 
 	      // destroy all
-			for (objnode = p_rhost->Get_Packet_List(UNRELIABLE_SEND_LIST).Head();
+			for (SLNode<cPacket> *objnode = p_rhost->Get_Packet_List(UNRELIABLE_SEND_LIST).Head();
             objnode != NULL; objnode = objnode->Next()) {
 
             cPacket * p_packet = objnode->Data();

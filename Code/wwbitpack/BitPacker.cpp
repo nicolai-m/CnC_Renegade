@@ -24,7 +24,7 @@
 // Description:  Minimal bit encoding
 //
 
-#include "bitpacker.h"
+#include "BitPacker.h"
 
 #include <string.h>	// for memset
 
@@ -65,14 +65,7 @@ cBitPacker& cBitPacker::operator=(const cBitPacker& rhs)
 }
 
 //-----------------------------------------------------------------------------
-//
-// This method needs optimization
-//
-// 02-14-2002 Jani: Optimized the code somewhat. Note that the old code reverted
-// the bit order and the new one doesn't, so the versions are not compatible.
-// If you use optimized Add_Bits() you need to also use optimize Get_Bits().
-//
-
+// Renegade writes the selected bits most-significant bit first.
 void cBitPacker::Add_Bits(ULONG value, UINT num_bits)
 {
 	//
@@ -80,108 +73,51 @@ void cBitPacker::Add_Bits(ULONG value, UINT num_bits)
 	// than 4 bytes, such as a double. Hopefully you would be using a float 
 	// instead anyway.
 	//
-#if 0	// Old version
 	WWASSERT(num_bits > 0 && num_bits <= MAX_BITS);
-
-	ULONG mask = 1 << (num_bits - 1);
-	while (mask > 0) {
-
-		//WWASSERT(BitWritePosition < BufferSize * 8);
-		WWASSERT(BitWritePosition < MAX_BUFFER_SIZE * 8);
-
-		UINT byte_num = BitWritePosition / 8;
-		UINT bit_offset = BitWritePosition % 8;
-		bool bit_value = (value & mask) != 0;
-		Buffer[byte_num] |= bit_value << bit_offset;
-
-		BitWritePosition++;
-
-		mask >>= 1;
+	WWASSERT(num_bits <= MAX_BUFFER_SIZE * 8 - BitWritePosition);
+	if (num_bits == 0 || num_bits > MAX_BITS ||
+		num_bits > MAX_BUFFER_SIZE * 8 - BitWritePosition) {
+		return;
 	}
 
-#else	// New faster version
+	while (num_bits != 0) {
+		const UINT byte_index = BitWritePosition / 8;
+		const UINT bit_offset = BitWritePosition % 8;
+		const UINT count = MIN(num_bits, 8 - bit_offset);
+		const UINT shift = 8 - bit_offset - count;
+		const UINT mask = (1u << count) - 1u;
+		const UINT prefix_mask = 0xffu << (8 - bit_offset);
 
-	// Verify that we're not writing over buffer
-	WWASSERT(num_bits > 0 && num_bits <= MAX_BITS);
-	WWASSERT(BitWritePosition+num_bits <= MAX_BUFFER_SIZE * 8);
-
-	// Fill the remaining bits of the write byte first
-	UINT byte_num = BitWritePosition >> 3;
-	UINT bit_offset = BitWritePosition & 0x7;
-	BitWritePosition+=num_bits;		// Advance the write position
-
-	// If write buffer is not byte aligned, write the remaining bits first
-	value <<= 32-num_bits;
-	if (bit_offset) {
-		UINT bit_count = 8 - bit_offset;
-		if (bit_count>num_bits) bit_count=num_bits;
-
-		ULONG bit_value = value;
-		value <<= bit_count;					// Remove the copied bits
-		num_bits -= bit_count;
-		bit_value >>= (24+bit_offset);
-		Buffer[byte_num++] |= bit_value;
+		num_bits -= count;
+		const UINT bits = (value >> num_bits) & mask;
+		Buffer[byte_index] = static_cast<BYTE>(
+			(Buffer[byte_index] & prefix_mask) | (bits << shift));
+		BitWritePosition += count;
 	}
-
-	// Write the rest of the data as bytes
-	if (num_bits>8) {
-		for (unsigned a=0;a<num_bits;a+=8) {
-			Buffer[byte_num++]=unsigned char(value>>24);
-			value<<=8;
-		}
-	}
-	else {
-		Buffer[byte_num]=unsigned char(value>>24);
-	}
-#endif
 }
 
 //-----------------------------------------------------------------------------
-//
-// This method needs optimization
-// 02-14-2002 Jani: Optimized. See Add_Bits() for notes.
-//
 void cBitPacker::Get_Bits(ULONG & value, UINT num_bits)
 {
-#if 0	// Old version
 	WWASSERT(num_bits > 0 && num_bits <= MAX_BITS);
-
+	WWASSERT(num_bits <= BitWritePosition - BitReadPosition);
 	value = 0;
-	for (int bit = num_bits - 1; bit >= 0; bit--) {
-
-		//WWASSERT(BitReadPosition < BufferSize * 8);
-		WWASSERT(BitReadPosition < MAX_BUFFER_SIZE * 8);
-		WWASSERT(BitReadPosition < BitWritePosition);
-		UINT byte_num = BitReadPosition / 8;
-		UINT bit_offset = BitReadPosition % 8;
-		bool b = (Buffer[byte_num] & (1 << bit_offset)) != 0;
-
-		value += (b << bit);	
-
-		BitReadPosition++;
+	if (num_bits == 0 || num_bits > MAX_BITS ||
+		num_bits > BitWritePosition - BitReadPosition) {
+		return;
 	}
-#else // New faster version
 
-	// Verify that we're not reading over buffer or write pointer
-	WWASSERT(num_bits > 0 && num_bits <= MAX_BITS);
-	WWASSERT(BitReadPosition+num_bits <= MAX_BUFFER_SIZE * 8);
-	WWASSERT(BitReadPosition+num_bits <= BitWritePosition);
+	while (num_bits != 0) {
+		const UINT byte_index = BitReadPosition / 8;
+		const UINT bit_offset = BitReadPosition % 8;
+		const UINT count = MIN(num_bits, 8 - bit_offset);
+		const UINT shift = 8 - bit_offset - count;
+		const UINT mask = (1u << count) - 1u;
 
-	UINT read_len=num_bits;
-	UINT byte_num = BitReadPosition / 8;
-	UINT bit_offset = BitReadPosition % 8;
-	BitReadPosition += num_bits;
-
-	UINT bit_count = 8 - bit_offset;
-	if (bit_count>num_bits) bit_count=num_bits;
-	value = (ULONG(Buffer[byte_num++]) << (bit_offset+24));
-	num_bits-=bit_count;
-
-	for (int shift=24-bit_count;shift>0;shift-=8,num_bits-=8) value|=unsigned(Buffer[byte_num++]) << shift;
-	if (num_bits>0) value|=Buffer[byte_num++]>>(-shift);
-
-	value >>= 32-read_len;
-#endif
+		value = (value << count) | ((Buffer[byte_index] >> shift) & mask);
+		BitReadPosition += count;
+		num_bits -= count;
+	}
 }
 
 //-----------------------------------------------------------------------------
@@ -193,7 +129,8 @@ void cBitPacker::Set_Bit_Write_Position(UINT position)
 {
 	//WWASSERT(position <= BufferSize * 8);
 	WWASSERT(position <= MAX_BUFFER_SIZE * 8);
-	BitWritePosition = position;
+	BitWritePosition = MIN(position, static_cast<UINT>(MAX_BUFFER_SIZE * 8));
+	BitReadPosition = MIN(BitReadPosition, BitWritePosition);
 }
 
 

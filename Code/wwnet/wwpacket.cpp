@@ -26,9 +26,10 @@
 //------------------------------------------------------------------------------------
 #include "wwpacket.h"
 
-#include "win.h"
 #include "systimer.h"
+#if !defined(__linux__) || !defined(WRAPPER_CRC)
 #include "crc.h"
+#endif
 #include "quat.h"
 #include "fromaddress.h"
 #include "packettype.h"
@@ -37,7 +38,9 @@
 #define	PACKET_ID_BITS		28		// Enough for about 100 packets per second for about a month.
 #define	PACKET_TYPE_BITS	4		// Enough for 16 packet types (we currently have 7 at 9/20/2001 11:33PM)
 
+#if !defined(__linux__)
 DEFINE_AUTO_POOL(cPacket, 256)
+#endif
 
 //
 // Class statics
@@ -210,12 +213,16 @@ void cPacket::Init_Encoder(void)
 
 
 //------------------------------------------------------------------------------------
-void cPacket::Construct_Full_Packet(cPacket & full_packet, cPacket & src_packet)
+bool cPacket::Construct_Full_Packet(cPacket & full_packet, cPacket & src_packet)
 {
    WWASSERT(
 		src_packet.Get_Type() >= PACKETTYPE_FIRST &&
 		src_packet.Get_Type() <= PACKETTYPE_LAST);
    WWASSERT(src_packet.Get_Id() != UNDEFINED_ID);
+	if (full_packet.Get_Bit_Length() != 0 ||
+		src_packet.Get_Compressed_Size_Bytes() > MAX_BUFFER_SIZE - PACKET_HEADER_SIZE) {
+		return false;
+	}
 
 #ifndef WRAPPER_CRC
 	full_packet.Add(CRC_PLACEHOLDER);
@@ -257,17 +264,22 @@ void cPacket::Construct_Full_Packet(cPacket & full_packet, cPacket & src_packet)
 		temp_packet.Get_Data(),
 		temp_packet.Get_Compressed_Size_Bytes());
 #endif //WRAPPER_CRC
+	return true;
 }
 
 //------------------------------------------------------------------------------------
-void cPacket::Construct_App_Packet(cPacket & packet, cPacket & full_packet)
+bool cPacket::Construct_App_Packet(cPacket & packet, cPacket & full_packet)
 {
+	const UINT header_bits = PACKET_HEADER_SIZE * 8;
+	if (full_packet.Get_Bit_Length() < header_bits) {
+		return false;
+	}
 #ifndef WRAPPER_CRC
    int remote_crc;
 #endif //WRAPPER_CRC
 	BYTE type;
 	int packet_id;
-	char sender_id;
+	BYTE sender_id;
 	USHORT bit_size;
 
 #ifndef WRAPPER_CRC
@@ -277,14 +289,19 @@ void cPacket::Construct_App_Packet(cPacket & packet, cPacket & full_packet)
 	full_packet.Get(packet_id, BITPACK_PACKET_ID);
 	full_packet.Get(sender_id);
 	full_packet.Get(bit_size);
+	if (type > PACKETTYPE_LAST || bit_size > full_packet.Get_Bit_Length() - header_bits) {
+		return false;
+	}
+	const int signed_sender_id = sender_id < 0x80 ? sender_id : sender_id - 0x100;
 
 #ifdef WRAPPER_CRC
 	packet.Set_Type(type);
 	packet.Set_Id(packet_id);
-	packet.Set_Sender_Id(sender_id);
+	packet.Set_Sender_Id(signed_sender_id);
 	packet.Set_Bit_Length(bit_size);
 	packet.PFromAddressWrapper = full_packet.PFromAddressWrapper;
 	memcpy(packet.Get_Data(), full_packet.Get_Data() + PACKET_HEADER_SIZE, packet.Get_Compressed_Size_Bytes());
+	return true;
 
 #else //WRAPPER_CRC
 
@@ -299,7 +316,7 @@ void cPacket::Construct_App_Packet(cPacket & packet, cPacket & full_packet)
 			packet.Set_Is_Crc_Correct(true);
 			packet.Set_Type(type);
 			packet.Set_Id(packet_id);
-			packet.Set_Sender_Id(sender_id);
+			packet.Set_Sender_Id(signed_sender_id);
 			packet.Set_Bit_Length(bit_size);
 			packet.PFromAddressWrapper = full_packet.PFromAddressWrapper;
 
@@ -310,6 +327,7 @@ void cPacket::Construct_App_Packet(cPacket & packet, cPacket & full_packet)
 	} else {
 		packet.Set_Is_Crc_Correct(false);
 	}
+	return packet.Is_Crc_Correct();
 
 #endif //WRAPPER_CRC
 }

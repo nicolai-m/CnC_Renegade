@@ -39,6 +39,9 @@
 #include "wwpacket.h"
 #include "packettype.h"
 
+#if defined(__linux__)
+#include <functional>
+#endif
 //
 // A server can have this many clients (a client has only 1 rhost: the server)
 // -1 is used as ID_UNKNOWN
@@ -80,12 +83,20 @@ class cMsgStatList;
 
 typedef void (*Accept_Handler)(void);
 typedef void (*Refusal_Handler)(REFUSAL_CODE refusal_code);
+#if defined(__linux__)
+using Server_Broken_Connection_Handler = std::function<void(int)>;
+using Eviction_Handler = std::function<void(int)>;
+using Conn_Handler = std::function<void(int)>;
+using Server_Packet_Handler = std::function<void(cPacket &, int)>;
+using Application_Acceptance_Handler = std::function<REFUSAL_CODE(cPacket &)>;
+#else
 typedef void (*Server_Broken_Connection_Handler)(int broken_rhost_id);
-typedef void (*Client_Broken_Connection_Handler)(void);
 typedef void (*Eviction_Handler)(int evicted_rhost_id);
 typedef void (*Conn_Handler)(int new_rhost_id);
-typedef REFUSAL_CODE (*Application_Acceptance_Handler)(cPacket & packet);
 typedef void (*Server_Packet_Handler)(cPacket & packet, int rhost_id);
+typedef REFUSAL_CODE (*Application_Acceptance_Handler)(cPacket & packet);
+#endif
+typedef void (*Client_Broken_Connection_Handler)(void);
 typedef void (*Client_Packet_Handler)(cPacket & packet);
 
 extern char * Addr_As_String(sockaddr_in *addr);
@@ -101,9 +112,10 @@ class cConnection
 		cConnection();
 		~cConnection();
 
+		enum { MAX_PEER_ID = 127 };
       void Init_As_Client(ULONG server_ip, USHORT server_port, unsigned short my_port = 0);
-      void Init_As_Server(USHORT server_port, int max_players,
-			bool is_dedicated_server, ULONG addr = 0);
+      bool Init_As_Server(USHORT server_port, int max_players,
+			bool is_dedicated_server, ULONG addr = 0, bool allow_port_fallback = true);
       void Connect_Cs(cPacket & app_data);
       void Send_Packet_To_Individual(cPacket & packet, int addressee, BYTE send_flags);
       bool Have_Id() const {return LocalId != ID_UNKNOWN;}
@@ -128,6 +140,7 @@ class cConnection
 		cRemoteHost * Get_Remote_Host(int rhost);
 		bool Is_Destroy() {return IsDestroy;}
       int Get_Local_Id() const {return LocalId;}
+		USHORT Get_Local_Port() const {return LocalPort;}
 		double Get_Max_Acceptable_Packetloss_Pc() const {return MaxAcceptablePacketlossPc;}
 		cNetStats & Get_Combined_Stats() {return CombinedStats;}
 		cNetStats & Get_Averaged_Stats() {return AveragedStats;}

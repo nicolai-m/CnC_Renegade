@@ -37,16 +37,82 @@
 #include "packetmgr.h"
 
 #include <always.h>
-#include <memory.h>
-//#include <winsock.h>
+#include <assert.h>
+#include <string.h>
 #include "systimer.h"
-#include <malloc.h>
-
-#include "netutil.h"
-#include "wwmemlog.h"
 #include "crc.h"
+
+#if defined(__linux__)
+#include <sched.h>
+#else
+#include "wwmemlog.h"
 #include "wwprofile.h"
-#include "connect.h"
+#endif
+
+namespace {
+
+// Wrapper headers are little-endian. Keep the layout independent of compiler bitfields.
+const int PacketPackHeaderSize = 2;
+const int PacketDeltaHeaderSize = 1;
+const unsigned char DeltaChunkMap = 1;
+const unsigned char DeltaByteMap = 2;
+
+void Write_Pack_Header(unsigned char *header, int count, int size)
+{
+	const unsigned int packed = count | (size << 5);
+	header[0] = static_cast<unsigned char>(packed);
+	header[1] = static_cast<unsigned char>(packed >> 8);
+}
+
+bool Socket_Connection_Reset(int error)
+{
+#if defined(__linux__)
+	return error == ECONNRESET || error == ECONNREFUSED;
+#else
+	return error == WSAECONNRESET;
+#endif
+}
+
+int Receive_Datagram(SOCKET socket, unsigned char *buffer, int capacity, SOCKADDR_IN &address)
+{
+#if defined(__linux__)
+	SocketLength address_size = sizeof(address);
+	int bytes;
+	do {
+		// MSG_TRUNC reports the original datagram length if the buffer is too small.
+		bytes = recvfrom(socket, buffer, capacity, MSG_DONTWAIT | MSG_TRUNC,
+			reinterpret_cast<LPSOCKADDR>(&address), &address_size);
+	} while (bytes == SOCKET_ERROR && errno == EINTR);
+	return bytes;
+#else
+	u_long pending = 0;
+	if (ioctlsocket(socket, FIONREAD, &pending) == SOCKET_ERROR) {
+		return SOCKET_ERROR;
+	}
+	if (pending == 0) {
+		return 0;
+	}
+	SocketLength address_size = sizeof(address);
+	return recvfrom(socket, reinterpret_cast<char *>(buffer), capacity, 0,
+		reinterpret_cast<LPSOCKADDR>(&address), &address_size);
+#endif
+}
+
+int Send_Datagram(SOCKET socket, const char *buffer, int size, SOCKADDR_IN &address)
+{
+#if defined(__linux__)
+	int bytes;
+	do {
+		bytes = sendto(socket, buffer, size, MSG_DONTWAIT,
+			reinterpret_cast<LPSOCKADDR>(&address), sizeof(address));
+	} while (bytes == SOCKET_ERROR && errno == EINTR);
+	return bytes;
+#else
+	return sendto(socket, buffer, size, 0, reinterpret_cast<LPSOCKADDR>(&address), sizeof(address));
+#endif
+}
+
+} // namespace
 
 /*
 ** Single instance of PacketManagerClass.
@@ -141,7 +207,7 @@ inline unsigned char PacketManagerClass::Get_Bit(unsigned char * &bitstream, int
  *=============================================================================================*/
 PacketManagerClass::PacketManagerClass(void)
 {
-	BandwidthList.Set_Growth_Step(128);
+	BandwidthList.reserve(128);
 
 	//memset(PacketLengths, 0, sizeof(PacketLengths));
 	NextPacket = 0;
@@ -155,8 +221,10 @@ PacketManagerClass::PacketManagerClass(void)
 	StatsFrequency = 10 * 1000;
 	LastStatsUpdate = TIMEGETTIME();
 	ErrorState = STATE_OK;
-	ResetStatsIn = true;
-	ResetStatsOut = true;
+	TotalCompressedBandwidthIn = 0;
+	TotalCompressedBandwidthOut = 0;
+	TotalUncompressedBandwidthIn = 0;
+	TotalUncompressedBandwidthOut = 0;
 
 	NumSendBuffers = PACKET_MANAGER_BUFFERS;
 	SendBuffers = new SendBufferClass[NumSendBuffers];
@@ -208,8 +276,10 @@ PacketManagerClass::~PacketManagerClass(void)
  *=============================================================================================*/
 void PacketManagerClass::Set_Is_Server(bool is_server)
 {
-	CriticalSectionClass::LockClass lock(CriticalSection);
+	PacketLock lock(CriticalSection);
+#if !defined(__linux__)
 	WWMEMLOG(MEM_NETWORK);
+#endif
 	bool reset = false;
 
 	if (is_server && NumSendBuffers != PACKET_MANAGER_BUFFERS_WHEN_SERVER) {
@@ -297,13 +367,10 @@ int PacketManagerClass::Build_Delta_Packet_Patch(unsigned char *base_packet, uns
 	/*
 	** dereference pointers to the packet header and the packet build pointer.
 	*/
-	PacketDeltaHeaderStruct *header = (PacketDeltaHeaderStruct*) delta_packet;
-	unsigned char *build_delta_ptr = delta_packet + sizeof(PacketDeltaHeaderStruct);
+	*delta_packet = 0;
+	unsigned char *build_delta_ptr = delta_packet + PacketDeltaHeaderSize;
 	unsigned char *chunk_ptr = build_delta_ptr;
-	pm_assert(sizeof(PacketDeltaHeaderStruct) == 1);
 	*build_delta_ptr = 0;
-
-	header->BytePack = 0;
 
 	if (base_packet_size == add_packet_size) {
 
@@ -317,11 +384,9 @@ int PacketManagerClass::Build_Delta_Packet_Patch(unsigned char *base_packet, uns
 
 			this_match = false;
 
-			if (*((long*)&base_packet[i]) == *((long*)&add_packet[i])) {
-				if (*((long*)&base_packet[i+4]) == *((long*)&add_packet[i+4])) {
-					chunks = true;
-					this_match = true;
-				}
+			if (memcmp(base_packet + i, add_packet + i, 8) == 0) {
+				chunks = true;
+				this_match = true;
 			}
 
 			write_bit_pos = Add_Bit(this_match, build_delta_ptr, write_bit_pos);
@@ -340,7 +405,7 @@ int PacketManagerClass::Build_Delta_Packet_Patch(unsigned char *base_packet, uns
 		** If none of the chunks were the same then this is a pointless endevour. Mark in the header that we don't have
 		** chunk info and move on to trying byte for byte.
 		*/
-		header->ChunkPack = chunks ? 1 : 0;
+		*delta_packet = chunks ? DeltaChunkMap : 0;
 
 		/*
 		** Lost the useless chunk info if none of the chunks matched anyway.
@@ -358,7 +423,7 @@ int PacketManagerClass::Build_Delta_Packet_Patch(unsigned char *base_packet, uns
 		*/
 		read_bit_pos = 0;
 		num_diff_bytes = 0;
-		for (i=0 ; i<base_packet_size ; i+= 8) {
+		for (int i=0 ; i<base_packet_size ; i+= 8) {
 
 			/*
 			** If we have chunk info, then use it to skip matching chunks.
@@ -373,7 +438,7 @@ int PacketManagerClass::Build_Delta_Packet_Patch(unsigned char *base_packet, uns
 			** If this chunk didn't match then go through byte by byte and note differences.
 			*/
 			for (int j=i ; j<i+8 && j<base_packet_size ; j++) {
-				header->BytePack = 1;
+				*delta_packet |= DeltaByteMap;
 				this_match = (base_packet[j] == add_packet[j]) ? true : false;
 				write_bit_pos = Add_Bit(this_match, build_delta_ptr, write_bit_pos);
 				if (!this_match) {
@@ -425,122 +490,63 @@ int PacketManagerClass::Build_Delta_Packet_Patch(unsigned char *base_packet, uns
  * HISTORY:                                                                                    *
  *   9/26/2001 2:14PM ST : Created                                                             *
  *=============================================================================================*/
-int PacketManagerClass::Reconstruct_From_Delta(unsigned char *base_packet, unsigned char *reconstructed_packet, unsigned char *delta_packet, int base_packet_size, int &delta_size)
+int PacketManagerClass::Reconstruct_From_Delta(unsigned char *base_packet, unsigned char *reconstructed_packet,
+	unsigned char *delta_packet, int base_packet_size, int available, int &delta_size)
 {
-	if (base_packet == NULL) {
-		WWDEBUG_SAY(("*** WARNING: MALFORMED PACKET - PacketManagerClass::Reconstruct_From_Delta -- Bad base packet\n"));
-		return(0);
+	if (available < 1 || base_packet_size < 1 || base_packet_size > PACKET_MANAGER_MTU) {
+		return 0;
 	}
 
-	if (reconstructed_packet == NULL) {
-		WWDEBUG_SAY(("*** WARNING: MALFORMED PACKET - PacketManagerClass::Reconstruct_From_Delta -- Bad reconstructed packet\n"));
-		return(0);
-	}
-
-	if (delta_packet == NULL) {
-		WWDEBUG_SAY(("*** WARNING: MALFORMED PACKET - PacketManagerClass::Reconstruct_From_Delta -- Bad delta packet\n"));
-		return(0);
-	}
-
-	if (base_packet_size > 500) {
-		WWDEBUG_SAY(("*** WARNING: MALFORMED PACKET - PacketManagerClass::Reconstruct_From_Delta -- Bad base packet size\n"));
-		return(0);
-	}
-
-
-	pm_assert(base_packet != NULL);
-	pm_assert(reconstructed_packet != NULL);
-	pm_assert(delta_packet != NULL);
-	int patch_list[1024];
-	int num_patches = 0;
+	const bool has_chunks = (delta_packet[0] & DeltaChunkMap) != 0;
+	unsigned char *chunk_ptr = delta_packet + PacketDeltaHeaderSize;
+	unsigned char *read_ptr = chunk_ptr;
+	unsigned char *end = delta_packet + available;
 	int read_bit_pos = 0;
-	int read_chunk_pos = 0;
-	int restored_bytes = 0;
-
-	PacketDeltaHeaderStruct *header = (PacketDeltaHeaderStruct*) delta_packet;
-	unsigned char *read_delta_ptr = delta_packet + sizeof(PacketDeltaHeaderStruct);
-	pm_assert(sizeof(PacketDeltaHeaderStruct) == 1);
-	unsigned char *chunk_ptr = read_delta_ptr;
-
-	/*
-	** If there is chunk info then extract that first. Use it to copy the approprate parts of the base packet into the add packet.
-	*/
-	if (header->ChunkPack) {
-		for (int i=0 ; i<base_packet_size - 7 ; i+=8) {
-			if (Get_Bit(read_delta_ptr, read_bit_pos)) {
-				memcpy(&reconstructed_packet[i], &base_packet[i], 8);
-				restored_bytes += 8;
-			}
+	if (has_chunks) {
+		const int chunk_count = (base_packet_size + 7) / 8;
+		if (end - read_ptr < (chunk_count + 7) / 8) {
+			return 0;
 		}
-
-		/*
-		** If the packet isn't an even number of chunks long then pull out an extra bit and throw it away. It should always be 0.
-		*/
-		if ((base_packet_size & 7) != 0) {
-//#ifdef WWDEBUG
-			unsigned char bitty =
-//#endif //WWDEBUG
-			Get_Bit(read_delta_ptr, read_bit_pos);
-			if (bitty != 0) {
-				WWDEBUG_SAY(("*** WARNING: MALFORMED PACKET - PacketManagerClass::Reconstruct_From_Delta -- Bad bitty\n"));
-				return(0);
-			}
-			pm_assert(bitty == 0);
+		// Move past the chunk map while keeping its original cursor.
+		for (int i = 0; i < chunk_count - 1; ++i) {
+			Get_Bit(read_ptr, read_bit_pos);
+		}
+		if (Get_Bit(read_ptr, read_bit_pos) && base_packet_size % 8 != 0) {
+			return 0; // The partial final chunk must be described byte by byte.
 		}
 	}
 
-
-	/*
-	** Now use the per byte bitmask to restore the rest of the data.
-	*/
-	for (int i=0 ; i<base_packet_size ; i+= 8) {
-
-		/*
-		** If we have chunk info, then use it to skip matching chunks.
-		*/
-		if (header->ChunkPack) {
-			if (Get_Bit(chunk_ptr, read_chunk_pos)) {
-				continue;
-			}
+	int patches[PACKET_MANAGER_MTU];
+	int num_patches = 0;
+	int chunk_bit_pos = 0;
+	for (int i = 0; i < base_packet_size; i += 8) {
+		if (has_chunks && Get_Bit(chunk_ptr, chunk_bit_pos)) {
+			memcpy(reconstructed_packet + i, base_packet + i, 8);
+			continue;
 		}
 
-		/*
-		** If this chunk didn't match then go through byte by byte and note differences.
-		*/
-		for (int j=i ; j<i+8 && j<base_packet_size ; j++) {
-			if (Get_Bit(read_delta_ptr, read_bit_pos)) {
+		const int chunk_end = MIN(i + 8, base_packet_size);
+		for (int j = i; j < chunk_end; ++j) {
+			if (read_ptr == end) {
+				return 0;
+			}
+			if (Get_Bit(read_ptr, read_bit_pos)) {
 				reconstructed_packet[j] = base_packet[j];
-				restored_bytes++;
 			} else {
-				patch_list[num_patches++] = j;
+				patches[num_patches++] = j;
 			}
 		}
 	}
 
-	/*
-	** Well, the patch bytes must be here somewhere.
-	*/
-	unsigned char *patch_bytes = read_delta_ptr;
-	if (read_bit_pos != 0) {
-		patch_bytes++;
+	unsigned char *patch_ptr = read_ptr + (read_bit_pos != 0 ? 1 : 0);
+	if (end - patch_ptr < num_patches) {
+		return 0;
 	}
-
-	/*
-	** Work out how many delta bytes we processed - it's needed for meta packet decoding.
-	*/
-	delta_size = (patch_bytes - delta_packet) + num_patches;
-
-	/*
-	** Copy the patch bytes into the correct positions.
-	*/
-	for (int p=0 ; p<num_patches ; p++) {
-		reconstructed_packet[patch_list[p]] = *patch_bytes++;
+	for (int i = 0; i < num_patches; ++i) {
+		reconstructed_packet[patches[i]] = *patch_ptr++;
 	}
-
-	restored_bytes += num_patches;
-	//pm_assert(restored_bytes == base_packet_size);
-
-	return(restored_bytes);
+	delta_size = static_cast<int>(patch_ptr - delta_packet);
+	return base_packet_size;
 }
 
 
@@ -595,10 +601,10 @@ int PacketManagerClass::Get_Next_Free_Buffer_Index(void)
  *=============================================================================================*/
 bool PacketManagerClass::Take_Packet(unsigned char *packet, int packet_len, unsigned char *dest_ip, unsigned short dest_port, SOCKET source_socket)
 {
-	CriticalSectionClass::LockClass lock(CriticalSection);
+	PacketLock lock(CriticalSection);
 
 	if (NumPackets < NumSendBuffers) {
-		if (packet_len > 0 && packet_len < (PACKET_MANAGER_MTU - sizeof(PacketPackHeaderStruct))) {
+		if (packet_len > 0 && packet_len < (PACKET_MANAGER_MTU - PacketPackHeaderSize)) {
 			int index = Get_Next_Free_Buffer_Index();
 			if (index != -1) {
 				memcpy(SendBuffers[index].PacketBuffer, packet, packet_len);
@@ -643,15 +649,17 @@ bool PacketManagerClass::Take_Packet(unsigned char *packet, int packet_len, unsi
 void PacketManagerClass::Flush(bool forced)
 {
 {
+#if !defined(__linux__)
 WWPROFILE("PMgr Flush");
+#endif
 
-	CriticalSectionClass::LockClass lock(CriticalSection);
+	PacketLock lock(CriticalSection);
 
 	int base_index = -1;
 	int length = 0;
 	unsigned char *base_packet = NULL;
 	int new_length = 0;
-	PacketPackHeaderStruct *header = (PacketPackHeaderStruct*) BuildPacket;
+	int packet_count = 0;
 	unsigned char *next_packet_pos = NULL;
 	int index = 0;
 	int i;
@@ -660,7 +668,7 @@ WWPROFILE("PMgr Flush");
 	/*
 	** If it's not time to send packets yet then just return.
 	*/
-	unsigned long time = TIMEGETTIME();
+	uint32 time = TIMEGETTIME();
 	if (!forced && FlushFrequency != 0) {
 		if (time - LastSendTime < FlushFrequency) {
 			return;
@@ -698,14 +706,11 @@ WWPROFILE("PMgr Flush");
 				//WWDEBUG_SAY(("Found base packet %d\n", base_index));
 
 				socket = SendBuffers[index].PacketSendSocket;
-				header->NumPackets = 1;
-				header->PacketSize = length;
-				header->MorePackets = 0;
-				pm_assert(header->NumPackets > 0 && header->NumPackets <= PACKET_MANAGER_MAX_PACKETS);
-				next_packet_pos = BuildPacket + sizeof(*header);
+				packet_count = 1;
+				next_packet_pos = BuildPacket + PacketPackHeaderSize;
 				memcpy(next_packet_pos, base_packet, length);
 				next_packet_pos += length;
-				new_length = length + sizeof(*header);
+				new_length = length + PacketPackHeaderSize;
 				//WWDEBUG_SAY(("Added base packet %d to metapacket - %d (+2) bytes\n", index, length));
 				index++;
 				if (index >= NumSendBuffers) {
@@ -724,14 +729,14 @@ WWPROFILE("PMgr Flush");
 		** If we found a packet, see if there are more packets of the same size that we can package up with it.
 		*/
 		if (base_index != -1 && NumPackets > 1) {
-			if ((new_length + length + sizeof(PacketDeltaHeaderStruct)) < PACKET_MANAGER_MTU) {
+			if ((new_length + length + PacketDeltaHeaderSize) < PACKET_MANAGER_MTU) {
 
 				for (int j=i ; j<NumSendBuffers ; j++) {
 
 					/*
 					** If we can't fit any more packets in this packet then break out of the loop and send it as is.
 					*/
-					if (header->NumPackets == PACKET_MANAGER_MAX_PACKETS) {
+if (packet_count == PACKET_MANAGER_MAX_PACKETS) {
 						break;
 					}
 
@@ -744,7 +749,8 @@ WWPROFILE("PMgr Flush");
 						/*
 						** Is this packet for the same recipient?
 						*/
-						if (SendBuffers[base_index].Port == SendBuffers[index].Port && (*(unsigned long*)(&SendBuffers[index].IPAddress[0])) == (*(unsigned long*)(&SendBuffers[base_index].IPAddress[0]))) {
+						if (SendBuffers[base_index].Port == SendBuffers[index].Port &&
+							memcmp(SendBuffers[base_index].IPAddress, SendBuffers[index].IPAddress, 4) == 0) {
 
 							//WWDEBUG_SAY(("Found secondary packet %d\n", index));
 
@@ -760,25 +766,23 @@ WWPROFILE("PMgr Flush");
 								next_packet_pos += bytes;
 								new_length += bytes;
 								//WWDEBUG_SAY(("Added delta packet %d to metapacket - %d bytes\n", index, bytes));
-								header->NumPackets++;
-								pm_assert(header->NumPackets > 0 && header->NumPackets <= PACKET_MANAGER_MAX_PACKETS);
+								++packet_count;
+								pm_assert(packet_count > 0 && packet_count <= PACKET_MANAGER_MAX_PACKETS);
 							} else {
 								/*
 								** The delta was no better than the original. Stick a 0 byte in to say it's not a delta and then
 								** Copy the whole thing.
 								*/
-								PacketDeltaHeaderStruct *delta_header = (PacketDeltaHeaderStruct*) next_packet_pos;
-								delta_header->ChunkPack = 0;
-								delta_header->BytePack = 0;
-								next_packet_pos += sizeof(PacketDeltaHeaderStruct);
-								new_length += sizeof(PacketDeltaHeaderStruct);
+								*next_packet_pos = 0;
+								next_packet_pos += PacketDeltaHeaderSize;
+								new_length += PacketDeltaHeaderSize;
 
 								memcpy(next_packet_pos, SendBuffers[index].PacketBuffer, length);
 								next_packet_pos += length;
 								new_length += length;
 								//WWDEBUG_SAY(("Added secondary packet %d to metapacket - %d (+1) bytes\n", index, length));
-								header->NumPackets++;
-								pm_assert(header->NumPackets > 0 && header->NumPackets <= PACKET_MANAGER_MAX_PACKETS);
+								++packet_count;
+								pm_assert(packet_count > 0 && packet_count <= PACKET_MANAGER_MAX_PACKETS);
 							}
 
 							/*
@@ -788,12 +792,12 @@ WWPROFILE("PMgr Flush");
 							NumPackets--;
 							//WWDEBUG_SAY(("NumPackets = %d (discarding secondary packet index %d)\n", NumPackets, index));
 
-							pm_assert(header->NumPackets > 0 && header->NumPackets <= PACKET_MANAGER_MAX_PACKETS);
+							pm_assert(packet_count > 0 && packet_count <= PACKET_MANAGER_MAX_PACKETS);
 
 							/*
 							** If there's no room for any more of these packets then bail out.
 							*/
-							if ((new_length + length + sizeof(PacketDeltaHeaderStruct)) >= PACKET_MANAGER_MTU) {
+							if ((new_length + length + PacketDeltaHeaderSize) >= PACKET_MANAGER_MTU) {
 								break;
 							}
 						}
@@ -806,7 +810,7 @@ WWPROFILE("PMgr Flush");
 			}
 		}
 
-		pm_assert(header->NumPackets > 0 && header->NumPackets <= PACKET_MANAGER_MAX_PACKETS);
+		pm_assert(packet_count > 0 && packet_count <= PACKET_MANAGER_MAX_PACKETS);
 
 		/*
 		** Allright, it's time to send this sucker.
@@ -816,6 +820,7 @@ WWPROFILE("PMgr Flush");
 			/*
 			** Just copy it back into the base index for now and mark it as ready to go.
 			*/
+			Write_Pack_Header(BuildPacket, packet_count, length);
 			memcpy(SendBuffers[base_index].PacketBuffer, BuildPacket, new_length);
 			SendBuffers[base_index].PacketReady = true;
 			SendBuffers[base_index].PacketSendLength = new_length;
@@ -824,7 +829,7 @@ WWPROFILE("PMgr Flush");
 			//WWDEBUG_SAY(("NumPackets = %d (discarding base packet %d)\n", NumPackets, base_index));
 			pm_assert(NumPackets >= 0);
 		}
-		pm_assert(header->NumPackets > 0 && header->NumPackets <= PACKET_MANAGER_MAX_PACKETS);
+		pm_assert(packet_count > 0 && packet_count <= PACKET_MANAGER_MAX_PACKETS);
 	}
 
 
@@ -835,7 +840,7 @@ WWPROFILE("PMgr Flush");
 		for (i=0 ; i<NumSendBuffers ; i++) {
 			if (SendBuffers[i].PacketReady) {
 
-				PacketPackHeaderStruct *current_header = (PacketPackHeaderStruct*) SendBuffers[i].PacketBuffer;
+				unsigned char *current_header = SendBuffers[i].PacketBuffer->Buffer;
 				int current_len = SendBuffers[i].PacketSendLength;
 				socket = SendBuffers[i].PacketSendSocket;
 
@@ -849,11 +854,12 @@ WWPROFILE("PMgr Flush");
 				for (int j=i+1 ; j<NumSendBuffers ; j++) {
 					if (SendBuffers[j].PacketReady && SendBuffers[j].PacketSendSocket == socket) {
 						if (SendBuffers[i].PacketSendLength + SendBuffers[j].PacketSendLength < PACKET_MANAGER_MTU) {
-							if (SendBuffers[i].Port == SendBuffers[j].Port && (*(unsigned long*)(&SendBuffers[i].IPAddress[0])) == (*(unsigned long*)(&SendBuffers[j].IPAddress[0]))) {
+							if (SendBuffers[i].Port == SendBuffers[j].Port &&
+								memcmp(SendBuffers[i].IPAddress, SendBuffers[j].IPAddress, 4) == 0) {
 								unsigned char *dest_ptr = &SendBuffers[i].PacketBuffer->Buffer[current_len];
 								memcpy(dest_ptr, SendBuffers[j].PacketBuffer, SendBuffers[j].PacketSendLength);
-								current_header->MorePackets = 1;
-								current_header = (PacketPackHeaderStruct*) dest_ptr;
+								current_header[1] |= 0x80;
+								current_header = dest_ptr;
 								current_len += SendBuffers[j].PacketSendLength;
 								SendBuffers[i].PacketSendLength = current_len;
 								SendBuffers[j].PacketReady = false;
@@ -877,13 +883,15 @@ WWPROFILE("PMgr Flush");
 	for (i=0 ; i<NumSendBuffers ; i++) {
 		if (SendBuffers[i].PacketReady) {
 			sockaddr_in addr;
+			memset(&addr, 0, sizeof(addr));
 			addr.sin_family = AF_INET;
 			addr.sin_port = SendBuffers[i].Port;
 			memcpy (&addr.sin_addr.s_addr, &SendBuffers[i].IPAddress[0], 4);
 			socket = SendBuffers[i].PacketSendSocket;
 #ifdef WWDEBUG
-			int debug_num_packets = (int)(((PacketPackHeaderStruct*)SendBuffers[i].PacketBuffer)->NumPackets);
-			int debug_packet_size = (int)(((PacketPackHeaderStruct*)SendBuffers[i].PacketBuffer)->PacketSize);
+			const unsigned char *header = SendBuffers[i].PacketBuffer->Buffer;
+			int debug_num_packets = header[0] & 0x1f;
+			int debug_packet_size = (header[0] >> 5) | ((header[1] & 0x7f) << 3);
 			pm_assert(debug_num_packets > 0);
 			pm_assert(debug_packet_size < PACKET_MANAGER_MTU);
 			pm_assert(SendBuffers[i].PacketSendLength < PACKET_MANAGER_MTU);
@@ -893,47 +901,39 @@ WWPROFILE("PMgr Flush");
 
 #ifdef WRAPPER_CRC
 
-			unsigned long crc = CRC::Memory((unsigned char*)SendBuffers[i].PacketBuffer, SendBuffers[i].PacketSendLength);
-#if (1)
-			/*
-			** Reverse byte order to prevent the demo from having the same CRC as the game.
-			*/
-			_asm {
-				push	eax;
-				mov	eax,crc;
-				bswap	eax;
-				mov	crc,eax;
-				pop	eax;
-			};
-#endif //(0)
-			char *crc_and_buffer = (char*)_alloca(SendBuffers[i].PacketSendLength + sizeof(crc));
-			*((unsigned long*) crc_and_buffer) = crc;
-			memcpy(crc_and_buffer + sizeof(crc), (const char*)SendBuffers[i].PacketBuffer, SendBuffers[i].PacketSendLength);
+			// The Renegade wire format prefixes the wrapper with a big-endian CRC32.
+			const uint32 crc = htonl(CRC::Memory(SendBuffers[i].PacketBuffer->Buffer, SendBuffers[i].PacketSendLength));
+			char crc_and_buffer[PACKET_MANAGER_MTU + sizeof(crc)];
+			memcpy(crc_and_buffer, &crc, sizeof(crc));
+			memcpy(crc_and_buffer + sizeof(crc), SendBuffers[i].PacketBuffer->Buffer, SendBuffers[i].PacketSendLength);
 
 			Register_Packet_Out(&SendBuffers[i].IPAddress[0], SendBuffers[i].Port, SendBuffers[i].PacketSendLength + UDP_HEADER_SIZE + sizeof(crc), 0);
-			int result = sendto(socket, crc_and_buffer, SendBuffers[i].PacketSendLength + sizeof(crc), 0, (LPSOCKADDR) &addr, sizeof(SOCKADDR_IN));
+			int result = Send_Datagram(socket, crc_and_buffer, SendBuffers[i].PacketSendLength + sizeof(crc), addr);
 
 #else //WRAPPER_CRC
 
 			Register_Packet_Out(&SendBuffers[i].IPAddress[0], SendBuffers[i].Port, SendBuffers[i].PacketSendLength + UDP_HEADER_SIZE, 0);
-			int result = sendto(socket, (const char*)SendBuffers[i].PacketBuffer, SendBuffers[i].PacketSendLength, 0, (LPSOCKADDR) &addr, sizeof(SOCKADDR_IN));
+			int result = Send_Datagram(socket, (const char*)SendBuffers[i].PacketBuffer, SendBuffers[i].PacketSendLength, addr);
 
 #endif //WRAPPER_CRC
 
 
 			if (result == SOCKET_ERROR){
-				if (WSAGetLastError() != WSAEWOULDBLOCK) {
-					int error_code = 0;
-					error_code = WSAGetLastError();// avoid release build compiler warning
-					WWDEBUG_SAY(("PacketManagerClass - sendto returned error code %d - %s\n", error_code, cNetUtil::Winsock_Error_Text(error_code)));
+				const int error_code = Last_Socket_Error();
+				if (!Socket_Would_Block(error_code)) {
+					WWDEBUG_SAY(("PacketManagerClass - sendto returned error %d\n", error_code));
 					Clear_Socket_Error(socket);
 				} else {
 
 					/*
 					** No more room for outgoing packets. Unfortunately, this means we lose the lot.
 					*/
-					WWDEBUG_SAY(("PacketManagerClass - sendto returned WSAEWOULDBLOCK\n"));
+					WWDEBUG_SAY(("PacketManagerClass - sendto would block\n"));
+#if defined(__linux__)
+					sched_yield();
+#else
 					Sleep(0);
+#endif
 					ErrorState = STATE_WS_BUFFERS_FULL;
 				}
 			}
@@ -992,105 +992,54 @@ void PacketManagerClass::Disable_Optimizations(void)
  * HISTORY:                                                                                    *
  *   9/26/2001 2:25PM ST : Created                                                             *
  *=============================================================================================*/
-bool PacketManagerClass::Break_Packet(unsigned char *packet, int original_packet_size, unsigned char *ip_address, unsigned short port)
+bool PacketManagerClass::Break_Packet(unsigned char *packet, int packet_size)
 {
-	/*
-	** Dereference a pointer to the packet header.
-	*/
-	PacketPackHeaderStruct *header = (PacketPackHeaderStruct*) packet;
+	unsigned char *cursor = packet;
+	unsigned char *end = packet + packet_size;
+	bool more_packets;
+	do {
+		if (end - cursor < PacketPackHeaderSize) {
+			return false;
+		}
+		const int count = cursor[0] & 0x1f;
+		const int size = (cursor[0] >> 5) | ((cursor[1] & 0x7f) << 3);
+		more_packets = (cursor[1] & 0x80) != 0;
+		cursor += PacketPackHeaderSize;
+		if (count == 0 || count > NumReceiveBuffers - NumReceivePackets ||
+			size == 0 || size > PACKET_MANAGER_MTU || end - cursor < size) {
+			return false;
+		}
 
-	/*
-	** Pull out the number of packets and the size of each.
-	*/
-	int num_packets = header->NumPackets;
-	int packet_size = header->PacketSize;
-	bool more_packets = header->MorePackets;
+		ReceiveBufferClass &base = ReceiveBuffers[NumReceivePackets++];
+		memcpy(base.ReceiveHoldingBuffer, cursor, size);
+		base.ReceivePacketLength = size;
+		cursor += size;
 
-	if (num_packets < 1 || packet_size > PACKET_MANAGER_MTU) {
-		WWDEBUG_SAY(("PacketManager - Packet decode error. num_packets = %d\n, packet_size = %d\n", num_packets, packet_size));
-		return(false);
-	}
-	pm_assert(num_packets >= 1);
-	pm_assert(packet_size <= PACKET_MANAGER_MTU);
-
-	/*
-	** Get the first packet. This is needed as a reference for other delta packets.
-	*/
-	unsigned char *packet_ptr = packet + sizeof(*header);
-	memcpy(&ReceiveBuffers[NumReceivePackets].ReceiveHoldingBuffer[0], packet_ptr, packet_size);
-	ReceiveBuffers[NumReceivePackets].ReceivePacketLength = packet_size;
-	Register_Packet_In(ip_address, port, 0, packet_size + UDP_HEADER_SIZE);
-	int delta_base_index = NumReceivePackets;
-	memcpy(ReceiveIPAddress, ip_address, 4);
-	ReceivePort = port;
-	NumReceivePackets++;
-	//WWDEBUG_SAY(("Extracted base packet from metapacket - %d bytes\n", packet_size));
-
-	packet_ptr += packet_size;
-
-	/*
-	** Get the rest of the packets.
-	*/
-	for (int i=0 ; i<num_packets-1 ; i++) {
-		PacketDeltaHeaderStruct * delta_header = (PacketDeltaHeaderStruct*) packet_ptr;
-
-		/*
-		** If this is a delta packet then we need to reconstruct it before copying it into the buffer.
-		*/
-		if (delta_header->ChunkPack || delta_header->BytePack) {
-			int delta_size = 0;
-//#ifdef WWDEBUG
-			int bytes =
-//#endif //WWDEBUG
-				Reconstruct_From_Delta(&ReceiveBuffers[delta_base_index].ReceiveHoldingBuffer[0], &ReceiveBuffers[NumReceivePackets].ReceiveHoldingBuffer[0], (unsigned char *)delta_header, packet_size, delta_size);
-			if (bytes != packet_size) {
-				WWDEBUG_SAY(("*** WARNING: MALFORMED PACKET - PacketManagerClass::Break_Packet -- bytes !=  packet_size\n"));
-				return(false);
+		for (int i = 1; i < count; ++i) {
+			if (cursor == end) {
+				return false;
 			}
-			if (delta_size <= 0) {
-				WWDEBUG_SAY(("*** WARNING: MALFORMED PACKET - PacketManagerClass::Break_Packet -- delta_size <= 0\n"));
-				return(false);
+			ReceiveBufferClass &next = ReceiveBuffers[NumReceivePackets++];
+			if ((*cursor & (DeltaChunkMap | DeltaByteMap)) != 0) {
+				int delta_size = 0;
+				if (Reconstruct_From_Delta(base.ReceiveHoldingBuffer, next.ReceiveHoldingBuffer,
+					cursor, size, static_cast<int>(end - cursor), delta_size) != size) {
+					return false;
+				}
+				cursor += delta_size;
+			} else {
+				++cursor;
+				if (end - cursor < size) {
+					return false;
+				}
+				memcpy(next.ReceiveHoldingBuffer, cursor, size);
+				cursor += size;
 			}
-			pm_assert(bytes == packet_size);
-			pm_assert(delta_size > 0);
-			ReceiveBuffers[NumReceivePackets].ReceivePacketLength = packet_size;
-			NumReceivePackets++;
-			packet_ptr += delta_size;
-			Register_Packet_In(ip_address, port, 0, packet_size + UDP_HEADER_SIZE);
-			//WWDEBUG_SAY(("Extracted delta packet from metapacket - %d bytes (delta size = %d)\n", bytes, delta_size));
-		} else {
-			/*
-			** Not a delta, just copy the whole thing.
-			*/
-			packet_ptr += sizeof(*delta_header);
-			memcpy(&ReceiveBuffers[NumReceivePackets].ReceiveHoldingBuffer[0], packet_ptr, packet_size);
-			ReceiveBuffers[NumReceivePackets].ReceivePacketLength = packet_size;
-			packet_ptr += packet_size;
-			NumReceivePackets++;
-			Register_Packet_In(ip_address, port, 0, packet_size + UDP_HEADER_SIZE);
-			//WWDEBUG_SAY(("Extracted secondary packet from metapacket - %d (+1) bytes\n", PacketLength));
+			next.ReceivePacketLength = size;
 		}
-		if (NumReceivePackets >= PACKET_MANAGER_RECEIVE_BUFFERS) {
-			break;
-		}
-	}
+	} while (more_packets);
 
-	int bytes_pulled_from_packet = packet_ptr - packet;
-
-	/*
-	** More packets in this buffer?
-	*/
-	if (more_packets && NumReceivePackets < PACKET_MANAGER_RECEIVE_BUFFERS) {
-		if (!Break_Packet(packet_ptr, original_packet_size - bytes_pulled_from_packet, ip_address, port)) {
-			return(false);
-		}
-	}
-
-	//if (NumReceivePackets > 20) {
-	//	WWDEBUG_SAY(("Sub packet broken into %d packets\n", NumReceivePackets));
-	//}
-
-	return(true);
+	return cursor == end;
 }
 
 
@@ -1110,13 +1059,11 @@ bool PacketManagerClass::Break_Packet(unsigned char *packet, int original_packet
  *=============================================================================================*/
 void PacketManagerClass::Clear_Socket_Error(SOCKET socket)
 {
-	unsigned long error_code;
-	int length = 4;
-	assert(socket != INVALID_SOCKET);
-
-	if (socket != INVALID_SOCKET) {
-		getsockopt (socket, SOL_SOCKET, SO_ERROR, (char*)&error_code, &length);
-		WWDEBUG_SAY(("Per socket error is %d - %s\n", error_code, cNetUtil::Winsock_Error_Text(error_code)));
+	int error_code = 0;
+	SocketLength length = sizeof(error_code);
+	if (socket != INVALID_SOCKET &&
+		getsockopt(socket, SOL_SOCKET, SO_ERROR, reinterpret_cast<char *>(&error_code), &length) == 0) {
+		WWDEBUG_SAY(("Per socket error is %d\n", error_code));
 	}
 }
 
@@ -1142,107 +1089,85 @@ void PacketManagerClass::Clear_Socket_Error(SOCKET socket)
  *=============================================================================================*/
 int PacketManagerClass::Get_Packet(SOCKET socket, unsigned char *packet_buffer, int packet_buffer_size, unsigned char *ip_address, unsigned short &port)
 {
-{
-WWPROFILE("Pmgr Get");
-	CriticalSectionClass::LockClass lock(CriticalSection);
+#if !defined(__linux__)
+	WWPROFILE("Pmgr Get");
+#endif
+	PacketLock lock(CriticalSection);
+
+	if (packet_buffer_size <= 0 || socket == INVALID_SOCKET) {
+		return 0;
+	}
 
 	if (NumReceivePackets == 0) {
-   	int address_size = sizeof(sockaddr_in);
-		sockaddr_in addr;
+#ifdef WRAPPER_CRC
+		const int crc_size = sizeof(uint32);
+#else
+		const int crc_size = 0;
+#endif
+		unsigned char datagram[PACKET_MANAGER_MTU + crc_size];
+		SOCKADDR_IN addr;
 		memset(&addr, 0, sizeof(addr));
-		pm_assert(packet_buffer_size >= PACKET_MANAGER_MTU);
-		int bytes;
-		int result = ioctlsocket(socket, FIONREAD, (unsigned long *)&bytes);
-		if (result == 0 && bytes != 0) {
+		const int bytes = Receive_Datagram(socket, datagram, sizeof(datagram), addr);
 
-			bytes = recvfrom(socket, (char*)packet_buffer, packet_buffer_size, 0, (LPSOCKADDR) &addr, &address_size);
-			if (bytes > 0) {
-#ifndef WRAPPER_CRC
-				Register_Packet_In((unsigned char*) &addr.sin_addr.s_addr, addr.sin_port, bytes + UDP_HEADER_SIZE, 0);
-#endif //WRAPPER_CRC
-
-#ifdef WRAPPER_CRC
-				unsigned long crc = CRC::Memory((unsigned char*)packet_buffer + 4, bytes - sizeof(crc));
-#if (1)
-				/*
-				** Reverse byte order to prevent the demo from having the same CRC as the game.
-				*/
-				_asm {
-					push	eax;
-					mov	eax,crc;
-					bswap	eax;
-					mov	crc,eax;
-					pop	eax;
-				};
-#endif //(0)
-				if (crc != *((unsigned long*)packet_buffer)) {
-					WWDEBUG_SAY(("PMC::Get_Packet: Socket %d, received packet %d bytes long from %s\n", socket, bytes, Addr_As_String(&addr)));
-					WWDEBUG_SAY(("PMC::Get_Packet: *** PACKET WRAPPER CRC ERROR ***"));
-					NumReceivePackets = 0;
-				} else {
-					Register_Packet_In((unsigned char*) &addr.sin_addr.s_addr, addr.sin_port, bytes + UDP_HEADER_SIZE, 0);
-					bytes -= sizeof(crc);
-					memmove(packet_buffer, packet_buffer + sizeof(crc), bytes);
-#endif //WRAPPER_CRC
-
-					//WWDEBUG_SAY(("PMC::Get_Packet: Socket %d, received packet %d bytes long from %s\n", socket, bytes, Addr_As_String(&addr)));
-					ReceiveSocket = socket;
-					//WWDEBUG_SAY(("Breaking packet %d bytes long from %s\n", bytes, Addr_As_String(&addr)));
-					bool broken = Break_Packet(packet_buffer, bytes, (unsigned char*) &addr.sin_addr.s_addr, addr.sin_port);
-					if (!broken) {
-						WWDEBUG_SAY(("Failed to break packet %d bytes long from %s\n", bytes, Addr_As_String(&addr)));
-						WWDEBUG_SAY(("Discarding %d suspect packets due to decode failure\n", NumReceivePackets));
-						NumReceivePackets = 0;
-					} else {
-						//WWDEBUG_SAY(("PMC::Get_Packet: Packet broken into %d packets\n", NumReceivePackets));
-					}
-					CurrentPacket = 0;
-#ifdef WRAPPER_CRC
-				}
-#endif //WRAPPER_CRC
-			} else {
-				if (bytes == SOCKET_ERROR && WSAGetLastError() != WSAEWOULDBLOCK) {
-					int error_code = 0;
-					error_code = WSAGetLastError();// avoid release build compiler warning
-					WWDEBUG_SAY(("PacketManagerClass - recvfrom failed with error %d - %s\n", error_code, cNetUtil::Winsock_Error_Text(error_code)));
-					Clear_Socket_Error(socket);
-					if (error_code == WSAECONNRESET) {
-						WWDEBUG_SAY(("PacketManagerClass - WSAECONNRESET from address %s\n", Addr_As_String(&addr)));
-						memcpy(ip_address, &addr.sin_addr.s_addr, 4);
-						port = addr.sin_port;
-						return(-1);
-					}
-				} else {
-					WWDEBUG_SAY(("PacketManagerClass - recvfrom failed with error WSAEWOULDBLOCK\n", WSAGetLastError()));
+		if (bytes == SOCKET_ERROR) {
+			const int error = Last_Socket_Error();
+			if (!Socket_Would_Block(error)) {
+				WWDEBUG_SAY(("PacketManagerClass - recvfrom returned error %d\n", error));
+				Clear_Socket_Error(socket);
+				if (Socket_Connection_Reset(error)) {
+					memcpy(ip_address, &addr.sin_addr.s_addr, 4);
+					port = addr.sin_port;
+					return -1;
 				}
 			}
+			return 0;
 		}
-	}
 
-	if (CurrentPacket < NumReceivePackets && socket == ReceiveSocket) {
-		/*
-		** Copy the current packet into the return buffer. We have to zero out the rest of the buffer or the CRC won't come out
-		** right. Lordy. FIxed in CRC code now ST - 9/24/2001 3:36PM
-		*/
-		int size = (int)ReceiveBuffers[CurrentPacket].ReceivePacketLength;
-		memcpy(packet_buffer, &ReceiveBuffers[CurrentPacket].ReceiveHoldingBuffer[0], min(size, packet_buffer_size));
-		//if (size < packet_buffer_size) {
-		//	memset(packet_buffer + size, 0, packet_buffer_size - size);
-		//}
-		memcpy(ip_address, ReceiveIPAddress, 4);
-		port = ReceivePort;
-		CurrentPacket++;
-
-		if (CurrentPacket >= NumReceivePackets) {
-			CurrentPacket = 0;
+		if (bytes < crc_size + PacketPackHeaderSize || bytes > static_cast<int>(sizeof(datagram))) {
+			return 0;
+		}
+		unsigned char *payload = datagram + crc_size;
+		const int payload_size = bytes - crc_size;
+#ifdef WRAPPER_CRC
+		uint32 received_crc;
+		memcpy(&received_crc, datagram, crc_size);
+		if (ntohl(received_crc) != CRC::Memory(payload, payload_size)) {
+			return 0;
+		}
+#endif
+		if (!Break_Packet(payload, payload_size)) {
 			NumReceivePackets = 0;
+			return 0;
 		}
 
-		return(size);
+		ReceiveSocket = socket;
+		CurrentPacket = 0;
+		memcpy(ReceiveIPAddress, &addr.sin_addr.s_addr, 4);
+		ReceivePort = addr.sin_port;
+		Register_Packet_In(ReceiveIPAddress, ReceivePort, bytes + UDP_HEADER_SIZE, 0);
+		for (int i = 0; i < NumReceivePackets; ++i) {
+			Register_Packet_In(ReceiveIPAddress, ReceivePort, 0,
+				ReceiveBuffers[i].ReceivePacketLength + UDP_HEADER_SIZE);
+		}
 	}
 
-	return(0);
-}
+	if (CurrentPacket >= NumReceivePackets || socket != ReceiveSocket) {
+		return 0;
+	}
+
+	const ReceiveBufferClass &next = ReceiveBuffers[CurrentPacket++];
+	if (CurrentPacket == NumReceivePackets) {
+		CurrentPacket = 0;
+		NumReceivePackets = 0;
+	}
+	const int size = static_cast<int>(next.ReceivePacketLength);
+	if (size > packet_buffer_size) {
+		return 0;
+	}
+	memcpy(packet_buffer, next.ReceiveHoldingBuffer, size);
+	memcpy(ip_address, ReceiveIPAddress, 4);
+	port = ReceivePort;
+	return size;
 }
 
 
@@ -1264,12 +1189,12 @@ WWPROFILE("Pmgr Get");
  *=============================================================================================*/
 void PacketManagerClass::Reset_Stats(void)
 {
-	CriticalSectionClass::LockClass lock(CriticalSection);
+	PacketLock lock(CriticalSection);
 	WWDEBUG_SAY(("PacketManagerClass Resetting stats\n"));
-	BandwidthList.Delete_All();
+	BandwidthList.clear();
 	LastStatsUpdate = TIMEGETTIME();
-	ResetStatsIn = true;
-	ResetStatsOut = true;
+	StatsIn = StatsCache();
+	StatsOut = StatsCache();
 }
 
 
@@ -1291,12 +1216,12 @@ void PacketManagerClass::Reset_Stats(void)
  * HISTORY:                                                                                    *
  *   10/9/2001 8:54AM ST : Created                                                             *
  *=============================================================================================*/
-int PacketManagerClass::Get_Stats_Index(unsigned long ip_address, unsigned short port, bool can_create)
+int PacketManagerClass::Get_Stats_Index(uint32 ip_address, unsigned short port, bool can_create)
 {
 	/*
 	** Find the stats struct entry for this ip/port.
 	*/
-	for (int i=0 ; i<BandwidthList.Count() ; i++) {
+	for (int i=0 ; i<static_cast<int>(BandwidthList.size()) ; i++) {
 		if (ip_address == BandwidthList[i].IPAddress && port == BandwidthList[i].Port) {
 			return(i);
 		}
@@ -1317,8 +1242,8 @@ int PacketManagerClass::Get_Stats_Index(unsigned long ip_address, unsigned short
 		stats.UncompressedBandwidthOut = 0;
 		stats.CompressedBandwidthIn = 0;
 		stats.CompressedBandwidthOut = 0;
-		BandwidthList.Add(stats);
-		return(BandwidthList.Count()-1);
+		BandwidthList.push_back(stats);
+		return(static_cast<int>(BandwidthList.size())-1);
 	}
 	return(-1);
 }
@@ -1344,34 +1269,9 @@ int PacketManagerClass::Get_Stats_Index(unsigned long ip_address, unsigned short
  *=============================================================================================*/
 void PacketManagerClass::Register_Packet_In(unsigned char *ip_address, unsigned short port, unsigned long compressed_size, unsigned long uncompressed_size)
 {
-	static unsigned long _last_ip = 0;
-	static unsigned short _last_port = 0;
-	static int _last_stats = -1;
-	unsigned long long_ip = *((unsigned long*)ip_address);
-
-	if (ResetStatsIn) {
-		_last_ip = 0;
-		_last_port = 0;
-		_last_stats = -1;
-		ResetStatsIn = false;
-	}
-
-	if (_last_stats != -1 && _last_ip == long_ip && _last_port == port && BandwidthList.Count()) {
-		BandwidthList[_last_stats].UncompressedBytesIn += uncompressed_size;
-		BandwidthList[_last_stats].CompressedBytesIn += compressed_size;
-	} else {
-
-		int stats_index = Get_Stats_Index(long_ip, port);
-		assert(stats_index != -1);
-
-		if (stats_index != -1) {
-			BandwidthList[stats_index].UncompressedBytesIn += uncompressed_size;
-			BandwidthList[stats_index].CompressedBytesIn += compressed_size;
-			_last_stats = stats_index;
-			_last_ip = long_ip;
-			_last_port = port;
-		}
-	}
+	BandwidthStatsStruct &stats = Get_Stats_For_Packet(ip_address, port, StatsIn);
+	stats.UncompressedBytesIn += uncompressed_size;
+	stats.CompressedBytesIn += compressed_size;
 }
 
 
@@ -1395,34 +1295,9 @@ void PacketManagerClass::Register_Packet_In(unsigned char *ip_address, unsigned 
  *=============================================================================================*/
 void PacketManagerClass::Register_Packet_Out(unsigned char *ip_address, unsigned short port, unsigned long compressed_size, unsigned long uncompressed_size)
 {
-	static unsigned long _last_ip = 0;
-	static unsigned short _last_port = 0;
-	static int _last_stats = -1;
-	unsigned long long_ip = *((unsigned long*)ip_address);
-
-	if (ResetStatsOut) {
-		_last_ip = 0;
-		_last_port = 0;
-		_last_stats = -1;
-		ResetStatsOut = false;
-	}
-
-	if (_last_stats != -1 && _last_ip == long_ip && _last_port == port && BandwidthList.Count()) {
-		BandwidthList[_last_stats].UncompressedBytesOut += uncompressed_size;
-		BandwidthList[_last_stats].CompressedBytesOut += compressed_size;
-	} else {
-
-		int stats_index = Get_Stats_Index(long_ip, port);
-		assert(stats_index != -1);
-
-		if (stats_index != -1) {
-			BandwidthList[stats_index].UncompressedBytesOut += uncompressed_size;
-			BandwidthList[stats_index].CompressedBytesOut += compressed_size;
-			_last_stats = stats_index;
-			_last_ip = long_ip;
-			_last_port = port;
-		}
-	}
+	BandwidthStatsStruct &stats = Get_Stats_For_Packet(ip_address, port, StatsOut);
+	stats.UncompressedBytesOut += uncompressed_size;
+	stats.CompressedBytesOut += compressed_size;
 }
 
 
@@ -1442,8 +1317,8 @@ void PacketManagerClass::Register_Packet_Out(unsigned char *ip_address, unsigned
  *=============================================================================================*/
 void PacketManagerClass::Update_Stats(bool forced)
 {
-	CriticalSectionClass::LockClass lock(CriticalSection);
-	unsigned long time = TIMEGETTIME();
+	PacketLock lock(CriticalSection);
+	uint32 time = TIMEGETTIME();
 
 	/*
 	** Handle timer resetting.
@@ -1470,7 +1345,7 @@ void PacketManagerClass::Update_Stats(bool forced)
 		/*
 		** Go through the entry for each ip/port and work out the averages.
 		*/
-		for (int i=0 ; i<BandwidthList.Count() ; i++) {
+		for (int i=0 ; i<static_cast<int>(BandwidthList.size()) ; i++) {
 			BandwidthStatsStruct *stats = &BandwidthList[i];
 
 			if (stats->CompressedBytesOut) {
@@ -1616,8 +1491,8 @@ unsigned long PacketManagerClass::Get_Total_Compressed_Bandwidth_Out(void)
  *=============================================================================================*/
 unsigned long PacketManagerClass::Get_Raw_Bandwidth_In(SOCKADDR_IN *address)
 {
-	CriticalSectionClass::LockClass lock(CriticalSection);
-	unsigned long ip = *((unsigned long*)&address->sin_addr.s_addr);
+	PacketLock lock(CriticalSection);
+	uint32 ip = address->sin_addr.s_addr;
 	unsigned short port = address->sin_port;
 	int stats = Get_Stats_Index(ip, port, false);
 
@@ -1645,8 +1520,8 @@ unsigned long PacketManagerClass::Get_Raw_Bandwidth_In(SOCKADDR_IN *address)
  *=============================================================================================*/
 unsigned long PacketManagerClass::Get_Raw_Bandwidth_Out(SOCKADDR_IN *address)
 {
-	CriticalSectionClass::LockClass lock(CriticalSection);
-	unsigned long ip = *((unsigned long*)&address->sin_addr.s_addr);
+	PacketLock lock(CriticalSection);
+	uint32 ip = address->sin_addr.s_addr;
 	unsigned short port = address->sin_port;
 	int stats = Get_Stats_Index(ip, port, false);
 
@@ -1675,8 +1550,8 @@ unsigned long PacketManagerClass::Get_Raw_Bandwidth_Out(SOCKADDR_IN *address)
  *=============================================================================================*/
 unsigned long PacketManagerClass::Get_Raw_Bytes_Out(SOCKADDR_IN *address)
 {
-	CriticalSectionClass::LockClass lock(CriticalSection);
-	unsigned long ip = *((unsigned long*)&address->sin_addr.s_addr);
+	PacketLock lock(CriticalSection);
+	uint32 ip = address->sin_addr.s_addr;
 	unsigned short port = address->sin_port;
 	int stats = Get_Stats_Index(ip, port, false);
 
@@ -1706,8 +1581,8 @@ unsigned long PacketManagerClass::Get_Raw_Bytes_Out(SOCKADDR_IN *address)
  *=============================================================================================*/
 unsigned long PacketManagerClass::Get_Compressed_Bandwidth_In(SOCKADDR_IN *address)
 {
-	CriticalSectionClass::LockClass lock(CriticalSection);
-	unsigned long ip = *((unsigned long*)&address->sin_addr.s_addr);
+	PacketLock lock(CriticalSection);
+	uint32 ip = address->sin_addr.s_addr;
 	unsigned short port = address->sin_port;
 	int stats = Get_Stats_Index(ip, port, false);
 
@@ -1735,8 +1610,8 @@ unsigned long PacketManagerClass::Get_Compressed_Bandwidth_In(SOCKADDR_IN *addre
  *=============================================================================================*/
 unsigned long PacketManagerClass::Get_Compressed_Bandwidth_Out(SOCKADDR_IN *address)
 {
-	CriticalSectionClass::LockClass lock(CriticalSection);
-	unsigned long ip = *((unsigned long*)&address->sin_addr.s_addr);
+	PacketLock lock(CriticalSection);
+	uint32 ip = address->sin_addr.s_addr;
 	unsigned short port = address->sin_port;
 	int stats = Get_Stats_Index(ip, port, false);
 
@@ -1802,13 +1677,15 @@ PacketManagerClass::ErrorStateEnum PacketManagerClass::Get_Error_State(void)
 
 
 
-/*
-** Operators required to allow us to add BandwidthStateStruct to a dynamic vector.
-*/
-bool PacketManagerClass::BandwidthStatsStruct::operator == (BandwidthStatsStruct const &stats) {
-	return((memcmp(this, &stats, sizeof(*this)) == 0) ? true : false);
-}
-
-bool PacketManagerClass::BandwidthStatsStruct::operator != (BandwidthStatsStruct const &stats) {
-	return((memcmp(this, &stats, sizeof(*this)) == 0) ? false : true);
+PacketManagerClass::BandwidthStatsStruct &PacketManagerClass::Get_Stats_For_Packet(
+	const unsigned char *ip_address, unsigned short port, StatsCache &cache)
+{
+	uint32 ip;
+	memcpy(&ip, ip_address, sizeof(ip));
+	if (cache.Index < 0 || cache.IPAddress != ip || cache.Port != port) {
+		cache.Index = Get_Stats_Index(ip, port);
+		cache.IPAddress = ip;
+		cache.Port = port;
+	}
+	return BandwidthList[cache.Index];
 }

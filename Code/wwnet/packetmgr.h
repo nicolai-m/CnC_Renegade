@@ -39,11 +39,17 @@
 #ifndef _PACKETMGR_H
 #define _PACKETMGR_H
 
-#include "mutex.h"
+#include <vector>
+#include "bittype.h"
 #include "wwdebug.h"
+#include "socketplatform.h"
+#include "packetformat.h"
+#if defined(__linux__)
+#include <mutex>
+#else
+#include "mutex.h"
 #include "vector.h"
-
-#include <winsock.h> // for SOCKET
+#endif
 
 #ifdef WWASSERT
 #ifndef pm_assert
@@ -53,50 +59,6 @@
 #define pm_assert assert
 #endif //WWASSERT
 
-#pragma pack(push)
-#pragma pack(1)
-
-#define WRAPPER_CRC
-
-
-/*
-** Header used at the beginning of a packet to identify the number of packets packed in this packet IYSWIM.
-*/
-struct PacketPackHeaderStruct {
-	/*
-	** Number of same length packets in this block.
-	*/
-	unsigned short NumPackets : 5;
-
-	/*
-	** Length of the packets.
-	*/
-	unsigned short PacketSize : 10;
-
-	/*
-	** More packets of a different length after these ones?
-	*/
-	unsigned short MorePackets : 1;
-};
-
-
-/*
-** Header used at the beginning of every delta packet.
-*/
-struct PacketDeltaHeaderStruct {
-	/*
-	** Chunk pack bits are present.
-	*/
-	unsigned char ChunkPack : 1;
-
-	/*
-	** Byte pack bits are present.
-	*/
-	unsigned char BytePack : 1;
-};
-
-
-#pragma pack(pop)
 
 /*
 ** Minimum MTU allowable on the internet is 576. IP Header is 20 bytes. UDP header is 8 bytes
@@ -198,8 +160,8 @@ class PacketManagerClass
 		** Delta compression.
 		*/
 		static int Build_Delta_Packet_Patch(unsigned char *base_packet, unsigned char *add_packet, unsigned char *delta_packet, int base_packet_size, int add_packet_size);
-		static int Reconstruct_From_Delta(unsigned char *base_packet, unsigned char *reconstructed_packet, unsigned char *delta_packet, int base_packet_size, int &delta_size);
-		bool Break_Packet(unsigned char *packet, int packet_len, unsigned char *ip_address, unsigned short port);
+		static int Reconstruct_From_Delta(unsigned char *base_packet, unsigned char *reconstructed_packet, unsigned char *delta_packet, int base_packet_size, int available, int &delta_size);
+		bool Break_Packet(unsigned char *packet, int packet_len);
 
 		/*
 		** Bit packing.
@@ -221,7 +183,7 @@ class PacketManagerClass
 		** Stats management.
 		*/
 		struct BandwidthStatsStruct {
-			unsigned long	IPAddress;
+			uint32			IPAddress;
 			unsigned short	Port;
 			unsigned long	UncompressedBytesIn;
 			unsigned long	UncompressedBytesOut;
@@ -231,11 +193,15 @@ class PacketManagerClass
 			unsigned long	UncompressedBandwidthOut;
 			unsigned long	CompressedBandwidthIn;
 			unsigned long	CompressedBandwidthOut;
-
-			bool operator == (BandwidthStatsStruct const &stats);
-			bool operator != (BandwidthStatsStruct const &stats);
 		};
-		int Get_Stats_Index(unsigned long ip_address, unsigned short port, bool can_create = true);
+		struct StatsCache {
+			uint32 IPAddress;
+			unsigned short Port;
+			int Index;
+			StatsCache() : IPAddress(0), Port(0), Index(-1) {}
+		};
+		int Get_Stats_Index(uint32 ip_address, unsigned short port, bool can_create = true);
+		BandwidthStatsStruct &Get_Stats_For_Packet(const unsigned char *ip_address, unsigned short port, StatsCache &cache);
 		void Register_Packet_In(unsigned char *ip_address, unsigned short port, unsigned long compressed_size, unsigned long uncompressed_size);
 		void Register_Packet_Out(unsigned char *ip_address, unsigned short port, unsigned long compressed_size, unsigned long uncompressed_size);
 
@@ -316,21 +282,21 @@ class PacketManagerClass
 		/*
 		** Send timing.
 		*/
-		unsigned long LastSendTime;
+		uint32 LastSendTime;
 		unsigned long FlushFrequency;
 
 		/*
 		** Bandwidth measurement.
 		*/
-		DynamicVectorClass<BandwidthStatsStruct> BandwidthList;
+		std::vector<BandwidthStatsStruct> BandwidthList;
 		unsigned long TotalCompressedBandwidthIn;
 		unsigned long TotalCompressedBandwidthOut;
 		unsigned long TotalUncompressedBandwidthIn;
 		unsigned long TotalUncompressedBandwidthOut;
 		unsigned long StatsFrequency;
-		unsigned long LastStatsUpdate;
-		bool ResetStatsIn;
-		bool ResetStatsOut;
+		uint32 LastStatsUpdate;
+		StatsCache StatsIn;
+		StatsCache StatsOut;
 
 		/*
 		** Debug
@@ -346,7 +312,14 @@ class PacketManagerClass
 		/*
 		** Thread safety
 		*/
+#if defined(__linux__)
+		// Flush and Reset_Stats can be called while the current thread holds the lock.
+		typedef std::lock_guard<std::recursive_mutex> PacketLock;
+		std::recursive_mutex CriticalSection;
+#else
+		typedef CriticalSectionClass::LockClass PacketLock;
 		CriticalSectionClass CriticalSection;
+#endif
 
 };
 

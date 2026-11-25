@@ -42,7 +42,9 @@
 #include "always.h"
 #endif
 
+#if !defined(__linux__)
 #include "mempool.h"
+#endif
 
 #ifndef NULL
 #define NULL 0
@@ -57,7 +59,10 @@ template	<class T> class SList;
 //	manage a	singularly linked	list of objects.	
 //
 
-class	GenericSLNode : public AutoPoolClass<GenericSLNode, 256>
+class	GenericSLNode
+#if !defined(__linux__)
+	: public AutoPoolClass<GenericSLNode, 256>
+#endif
 {
 	protected:
 		void* Internal_Get_Next(void) { return NodeNext; };

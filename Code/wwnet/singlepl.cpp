@@ -27,7 +27,6 @@
 #include "singlepl.h" // I WANNA BE FIRST!
 
 #include "netutil.h"
-#include "miscutil.h"
 #include "wwdebug.h"
 #include "wwpacket.h"
 

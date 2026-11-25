@@ -44,7 +44,6 @@
 
 #include "wwdebug.h"
 #include "mathutil.h"
-#include "widestring.h"
 
 
 //-----------------------------------------------------------------------------
@@ -174,14 +173,18 @@ void BitStreamClass::Add_Wide_Terminated_String(const WCHAR *string, bool permit
 	//
 	// The terminating null is not transmitted.
 	//
-	USHORT len = (USHORT)wcslen (string);
+	const WCHAR *end = string;
+	while (*end != 0) {
+		++end;
+	}
+	USHORT len = static_cast<USHORT>(end - string);
 	if (!permit_empty) {
 		WWASSERT(len > 0 && "Empty string not permitted");
 	}
 
 	Add(len);
 	for (int i = 0; i < len; i++) {
-		Add(string[i]);
+		Add(static_cast<USHORT>(string[i]));
 	}
 }
 
@@ -198,12 +201,12 @@ void BitStreamClass::Get_Wide_Terminated_String(WCHAR *buffer, USHORT buffer_len
 		WWASSERT(len > 0 && "Empty string not permitted");
 	}
 
-	WCHAR temp = L'?';
+	USHORT temp = 0;
 	int i = 0;
 	for (i = 0; i < len; i++) {
 		Get(temp);
 		if (i < buffer_len - 1) {
-			buffer[i] = temp;
+			buffer[i] = static_cast<WCHAR>(temp);
 		}
 	}
 

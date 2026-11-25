@@ -34,8 +34,11 @@
 #include "bittype.h"
 #include "bitstream.h"
 #include "fromaddress.h"
+#include "packetformat.h"
+#if !defined(__linux__)
 #include "packetmgr.h"
 #include "mempool.h"
+#endif
 
 #ifndef NULL
 #define NULL 0L
@@ -46,7 +49,10 @@ class Quaternion;
 class cFromAddress;
 
 //-----------------------------------------------------------------------------
-class cPacket : public BitStreamClass, public AutoPoolClass<cPacket, 256>
+class cPacket : public BitStreamClass
+#if !defined(__linux__)
+	, public AutoPoolClass<cPacket, 256>
+#endif
 {
 	public:
 		cPacket();
@@ -86,8 +92,8 @@ class cPacket : public BitStreamClass, public AutoPoolClass<cPacket, 256>
 		unsigned long	Get_First_Send_Time(void) const	{return FirstSendTime;}
 		static void		Init_Encoder(void);
 		static int		Get_Ref_Count()						{return RefCount;}
-		static void		Construct_Full_Packet(cPacket & full_packet, cPacket & src_packet);
-		static void		Construct_App_Packet(cPacket & packet, cPacket & full_packet);
+		static bool		Construct_Full_Packet(cPacket & full_packet, cPacket & src_packet);
+		static bool		Construct_App_Packet(cPacket & packet, cPacket & full_packet);
 		static USHORT	Get_Packet_Header_Size(void)		{return (PACKET_HEADER_SIZE);}
 		//BYTE				Peek_Message_Type() const;
 		static unsigned long Get_Default_Send_Time(void) {return(DefSendTime);}

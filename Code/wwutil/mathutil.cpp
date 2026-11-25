@@ -115,20 +115,6 @@ double cMathUtil::Simple_Distance(double x1, double y1, double x2, double y2)
 }
 
 //-----------------------------------------------------------------------------
-int cMathUtil::Round(double arg)
-{
-   //return (int)(arg + 0.5);
-
-	if (arg > MISCUTIL_EPSILON) {
-		return (int) (arg + 0.5f);
-	} else if (arg < -MISCUTIL_EPSILON) {
-		return (int) (arg - 0.5f);
-	} else {
-		return 0;
-	}
-}
-
-//-----------------------------------------------------------------------------
 void cMathUtil::Rotate_Vector(double & vx, double & vy, double angle)
 {
    double angle_radians = angle * PI / 180.0;

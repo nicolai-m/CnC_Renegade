@@ -43,24 +43,35 @@
 
 typedef unsigned char	uint8;
 typedef unsigned short	uint16;
+#if defined(__linux__)
+typedef unsigned int	uint32;
+#else
 typedef unsigned long	uint32;
+#endif
 typedef unsigned int    uint;
 
 typedef signed char		sint8;
 typedef signed short		sint16;
+#if defined(__linux__)
+typedef signed int		sint32;
+#else
 typedef signed long		sint32;
+#endif
 typedef signed int      sint;
 
 typedef float				float32;
 typedef double				float64;
 
-typedef unsigned long   DWORD;
+typedef uint32          DWORD;
 typedef unsigned short	WORD;
 typedef unsigned char   BYTE;
 typedef int             BOOL;
 typedef unsigned short	USHORT;
 typedef const char *		LPCSTR;
 typedef unsigned int    UINT;
-typedef unsigned long   ULONG;
+typedef uint32          ULONG;
+#if defined(__linux__)
+typedef char16_t         WCHAR;
+#endif
 
 #endif //BITTYPE_H

@@ -26,9 +26,8 @@
 //------------------------------------------------------------------------------------
 #include "netstats.h" // I WANNA BE FIRST!
 
-#include "win.h"
 #include "systimer.h"
-#include "miscutil.h"
+#include "mathutil.h"
 #include "netutil.h"
 #include "wwdebug.h"
 
