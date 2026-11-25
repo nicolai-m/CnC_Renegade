@@ -730,7 +730,7 @@ int Run_Headless(const Settings &settings, const Options &options, const in_addr
         }
         session.Advance(frame_start - previous);
         if (join) {
-            join->Update_Respawns();
+            join->Update_Combat();
         }
         previous = frame_start;
         server.Service_Send(true);

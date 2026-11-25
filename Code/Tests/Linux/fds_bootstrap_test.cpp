@@ -704,7 +704,11 @@ struct Join_Client_State {
     };
 
     std::set<int> Teams;
+    std::map<int, int> TeamObjects; // Network object ID to team.
+    std::map<int, std::pair<int, int>> TeamCounts;
     std::map<int, int> Players; // Peer ID to network object ID.
+    std::map<int, std::pair<int, int>> PlayerCounts; // By network object ID.
+    std::vector<std::pair<int, int>> KillMessages;
     std::map<int, int> Soldiers;
     std::map<int, float> Y;
     std::map<int, int> SelectedWeapon;
@@ -722,6 +726,7 @@ struct Join_Client_State {
 Join_Client_State FirstJoinClient;
 Join_Client_State SecondJoinClient;
 Join_Client_State LateJoinClient;
+Join_Client_State LoadingJoinClient;
 unsigned short JoinPort;
 uint32 JoinKey;
 const uint32 TestMapCRC = CRC::String("C&C_TEST.MIX");
@@ -802,6 +807,26 @@ private:
     uint32 LastSequence = 0;
 };
 
+std::pair<int, int> Read_Combat_Counts(cPacket &packet)
+{
+    const int kills = Field<int>(packet);
+    const int deaths = Field<int>(packet);
+    Check(kills >= 0 && deaths >= 0, "Invalid combat counts");
+    return {kills, deaths};
+}
+
+void Read_Player_Counts(cPacket &packet, Join_Client_State &client, int object)
+{
+    Check(Field<float>(packet) == 0 && Field<float>(packet) == 0, "Unexpected player score or money");
+    client.PlayerCounts[object] = Read_Combat_Counts(packet);
+}
+
+void Read_Team_Counts(cPacket &packet, Join_Client_State &client, int team)
+{
+    client.TeamCounts[team] = Read_Combat_Counts(packet);
+    Check(Field<float>(packet) == 0, "Unexpected team score");
+}
+
 void Read_Player(cPacket &packet, Join_Client_State &client, int object, bool creation)
 {
     if (creation) {
@@ -822,9 +847,7 @@ void Read_Player(cPacket &packet, Join_Client_State &client, int object, bool cr
     ULONG ranking;
     packet.Get_Bits(ranking, 32);
     packet.Get_Bits(ranking, 32);
-    for (int i = 0; i < 4; ++i) {
-        Check(Field<uint32>(packet) == 0, "Unexpected player statistics");
-    }
+    Read_Player_Counts(packet, client, object);
 }
 
 float Read_Join_Position_Y(cPacket &packet, uint32 map_crc)
@@ -915,6 +938,11 @@ void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
         Check(packet.Is_Flushed(), "Unexpected data in object deletion");
         return;
     }
+    if (dirty == NetworkObjectClass::BIT_OCCASIONAL && client.PlayerCounts.count(object)) {
+        Read_Player_Counts(packet, client, object);
+        Check(!deleting && packet.Is_Flushed(), "Incorrect cPlayer statistics update");
+        return;
+    }
     if (dirty == NetworkObjectClass::BIT_FREQUENT || dirty == NetworkObjectClass::BIT_OCCASIONAL) {
         Check(!deleting, "Unexpected deletion flag on soldier update");
         if (dirty == NetworkObjectClass::BIT_OCCASIONAL) {
@@ -924,18 +952,31 @@ void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
         Check(packet.Is_Flushed(), "Unexpected data in soldier update");
         return;
     }
-    if (dirty == NetworkObjectClass::BIT_RARE) { // cPlayer update after loading.
-        Read_Player(packet, client, object, false);
-        Check(!deleting && packet.Is_Flushed(), "Incorrect player update after loading");
+    if (dirty == NetworkObjectClass::BIT_RARE) {
+        if (const auto team = client.TeamObjects.find(object); team != client.TeamObjects.end()) {
+            Read_Team_Counts(packet, client, team->second);
+        } else {
+            Read_Player(packet, client, object, false);
+        }
+        Check(!deleting && packet.Is_Flushed(), "Incorrect cTeam or cPlayer update");
         return;
     }
     Check(dirty == 15, "Unexpected object update in the join sequence");
     switch (Field<int>(packet)) {
-    case 1010: // cTeam.
-        Check(!deleting && client.Teams.insert(Field<int>(packet)).second &&
-            Field<int>(packet) == 0 && Field<int>(packet) == 0 && Field<float>(packet) == 0,
-            "Incorrect team creation");
+    case 1010: { // cTeam.
+        const int team = Field<int>(packet);
+        Check(!deleting && client.Teams.insert(team).second && client.TeamObjects.emplace(object, team).second,
+            "Incorrect team identity");
+        Read_Team_Counts(packet, client, team);
         break;
+    }
+    case 1002: { // cPlayerKill.
+        const int killer = Field<int>(packet);
+        const int victim = Field<int>(packet);
+        Check(deleting && client.Players.count(killer) && client.Players.count(victim), "Invalid kill message");
+        client.KillMessages.emplace_back(killer, victim);
+        break;
+    }
     case 1008: { // cGameOptionsEvent.
         Check(client.Teams == std::set<int>{PLAYERTYPE_NOD, PLAYERTYPE_GDI}, "Teams must arrive before game options");
         Check_Game_Info(packet);
@@ -1016,6 +1057,7 @@ void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
 void Receive_First_Join(cPacket &packet) { Receive_Join_Packet(packet, FirstJoinClient); }
 void Receive_Second_Join(cPacket &packet) { Receive_Join_Packet(packet, SecondJoinClient); }
 void Receive_Late_Join(cPacket &packet) { Receive_Join_Packet(packet, LateJoinClient); }
+void Receive_Loading_Join(cPacket &packet) { Receive_Join_Packet(packet, LoadingJoinClient); }
 
 template<class CheckReady>
 void Pump_Clients(std::initializer_list<cConnection *> connections, CheckReady ready)
@@ -1079,15 +1121,28 @@ void Send_Loading(cConnection &client, int id_offset, bool loading)
     client.Send_Packet_To_Individual(packet, SERVER_RHOST_ID, SEND_RELIABLE);
 }
 
+bool Has_Combat_Counts(const Join_Client_State &client, int killer, int victim, int killer_team, int victim_team)
+{
+    using Counts = std::pair<int, int>;
+    return client.PlayerCounts.at(client.Players.at(killer)) == Counts{1, 0} &&
+        client.PlayerCounts.at(client.Players.at(victim)) == Counts{0, 1} &&
+        client.TeamCounts.at(killer_team) == Counts{1, killer_team == victim_team ? 1 : 0} &&
+        client.TeamCounts.at(victim_team) == Counts{killer_team == victim_team ? 1 : 0, 1} &&
+        client.KillMessages == std::vector<Counts>{{killer, victim}};
+}
+
 void Check_Map_Rotation(const HeadlessCollision &collision, const HeadlessCollision &next_collision, bool loop)
 {
     FirstJoinClient = {};
     SecondJoinClient = {};
     LateJoinClient = {};
-    const HeadlessJoinData data{42, 1, 2, {{17, {}}, {23, {}}}, {{{400, "soldier0", 100, 50, 1, Fixture_Weapons(0), 600},
+    LoadingJoinClient = {};
+    const std::vector<HeadlessDamageRule> rules{{1, 0}};
+    const HeadlessJoinData data{42, 1, 2, {{17, rules}, {23, rules}}, {{{400, "soldier0", 100, 50, 1, Fixture_Weapons(0), 600},
         {401, "soldier1", 100, 50, 1, Fixture_Weapons(1), 601}}}};
     auto next_data = data;
     next_data.Soldiers[PLAYERTYPE_NOD].DefinitionId = 410;
+    next_data.Soldiers[PLAYERTYPE_NOD].Weapons[1].PrimaryFire->Bullet = HeadlessBulletDefinition{200, 0, 20, 400, 0};
     next_data.Soldiers[PLAYERTYPE_GDI].DefinitionId = 411;
     const std::vector<HeadlessMap> maps{{"C&C_Test.mix", collision, data}, {"C&C_Next.mix", next_collision, next_data}};
     HeadlessJoinOptions options;
@@ -1098,6 +1153,7 @@ void Check_Map_Rotation(const HeadlessCollision &collision, const HeadlessCollis
     options.Address = htonl(INADDR_LOOPBACK);
     options.TimeLimit = 23;
     options.LoopMaps = loop;
+    options.FriendlyFire = true;
     cConnection server;
     Check(server.Init_As_Server(0, 16, true, INADDR_LOOPBACK), "Could not bind round test server");
     server.Set_Bandwidth_Budget_Out(TestBandwidth);
@@ -1116,8 +1172,9 @@ void Check_Map_Rotation(const HeadlessCollision &collision, const HeadlessCollis
     cConnection first;
     cConnection second;
     cConnection late;
+    cConnection loading;
     const auto pump = [&](const auto &ready) {
-        Pump_Clients({&first, &second, &late}, [&] {
+        Pump_Clients({&first, &second, &late, &loading}, [&] {
             server.Service_Read();
             join.Close_Pending();
             server.Service_Send(true);
@@ -1127,7 +1184,9 @@ void Check_Map_Rotation(const HeadlessCollision &collision, const HeadlessCollis
     Connect_Join_Client(first, u"First", u"testpass", JoinKey, Receive_First_Join);
     Connect_Join_Client(second, u"Second", u"testpass", JoinKey, Receive_Second_Join);
     Connect_Join_Client(late, u"Late", u"testpass", JoinKey, Receive_Late_Join);
-    pump([&] { return FirstJoinClient.OptionsTime && SecondJoinClient.OptionsTime && LateJoinClient.OptionsTime; });
+    Connect_Join_Client(loading, u"Loading", u"testpass", JoinKey, Receive_Loading_Join);
+    pump([&] { return FirstJoinClient.OptionsTime && SecondJoinClient.OptionsTime && LateJoinClient.OptionsTime &&
+        LoadingJoinClient.OptionsTime; });
     Check(first.Get_Local_Id() == 1 && second.Get_Local_Id() == 2, "Unexpected round test peer IDs");
     cPacket control;
     Write_Movement(control, FirstControlObject, 1, -1, {0, 0, 0});
@@ -1149,7 +1208,7 @@ void Check_Map_Rotation(const HeadlessCollision &collision, const HeadlessCollis
     WCHAR owner[64];
     announcement.Get_Wide_Terminated_String(owner, 64);
     Check(Field<uint32>(announcement) == 1 && Field<bool>(announcement) && Field<int>(announcement) == 2 &&
-        Check_Game_Info(announcement, NextMapCRC) == 3, "LAN discovery must advertise the incoming map");
+        Check_Game_Info(announcement, NextMapCRC) == 4, "LAN discovery must advertise the incoming map");
 
     const auto finish_loading = [&](cConnection &client, int offset = 2) {
         const int before = received;
@@ -1194,6 +1253,26 @@ void Check_Map_Rotation(const HeadlessCollision &collision, const HeadlessCollis
     finish_loading(late);
     pump([&] { return LateJoinClient.GameDataTime && FirstJoinClient.Soldiers.count(3); });
 
+    for (int i = 0; i < 11; ++i) {
+        session.Advance(100ms); // Wait out the automatic weapon switch after spawning.
+    }
+    const int before_shot = received;
+    cPacket friendly_shot;
+    Write_Movement(friendly_shot, FirstControlObject + 100000, 2, SecondJoinClient.Soldiers.at(2),
+        {12, 0, 1.62f}, 61.0f, 10, 0, 1, false);
+    second.Send_Packet_To_Individual(friendly_shot, SERVER_RHOST_ID, SEND_RELIABLE);
+    pump([&] { return received > before_shot; });
+    session.Advance(50ms);
+    join.Update_Combat();
+    pump([&] {
+        return Has_Combat_Counts(FirstJoinClient, 2, 3, PLAYERTYPE_NOD, PLAYERTYPE_NOD) &&
+            Has_Combat_Counts(SecondJoinClient, 2, 3, PLAYERTYPE_NOD, PLAYERTYPE_NOD) &&
+            Has_Combat_Counts(LateJoinClient, 2, 3, PLAYERTYPE_NOD, PLAYERTYPE_NOD) &&
+            LoadingJoinClient.TeamCounts.at(PLAYERTYPE_NOD) == std::pair<int, int>{1, 1};
+    });
+    Check(LoadingJoinClient.KillMessages.empty() && LoadingJoinClient.PlayerCounts.empty(),
+        "A peer still loading received player statistics or a kill message before the player objects");
+
     const auto cycle_end = expired + 10s + 23min;
     Check(join.Update_Round(cycle_end), "The last map must send a result before finishing the cycle");
     pump([&] { return FirstJoinClient.Round == 3 && SecondJoinClient.Round == 3 && LateJoinClient.Round == 3; });
@@ -1211,6 +1290,12 @@ void Check_Map_Rotation(const HeadlessCollision &collision, const HeadlessCollis
         pump([&] { return FirstJoinClient.GameDataTime && FirstJoinClient.Soldiers.count(1); });
         Check(std::abs(FirstJoinClient.Y.at(FirstJoinClient.Soldiers.at(1)) - 2.0f) < 0.1f,
             "Wrapping the map cycle did not restore the first map's spawn and coordinate precision");
+        for (const auto *client : {&FirstJoinClient, &SecondJoinClient, &LateJoinClient, &LoadingJoinClient}) {
+            const auto zero = [](const auto &entry) { return entry.second == std::pair<int, int>{0, 0}; };
+            Check(std::all_of(client->PlayerCounts.begin(), client->PlayerCounts.end(), zero) &&
+                std::all_of(client->TeamCounts.begin(), client->TeamCounts.end(), zero),
+                "The next round did not reset player and team combat counts");
+        }
     }
 }
 
@@ -1350,9 +1435,17 @@ void Check_Original_Join(unsigned short port, const std::string &definitions, co
     wait(550ms);
     fire(secondary, 93, aim_at_second());
     Pump_Clients({&first, &second}, [&] { return defense(3, 0); });
+    Check(FirstJoinClient.KillMessages.empty() && SecondJoinClient.KillMessages.empty() &&
+        FirstJoinClient.PlayerCounts.at(FirstJoinClient.Players.at(1)) == std::pair<int, int>{0, 0},
+        "A nonlethal hit was counted as a kill");
     wait(550ms);
     fire(secondary, 86, aim_at_second());
     Pump_Clients({&first, &second}, [&] { return defense(0, 0); });
+    const auto counted = [&] {
+        return Has_Combat_Counts(FirstJoinClient, 1, 2, PLAYERTYPE_GDI, PLAYERTYPE_NOD) &&
+            Has_Combat_Counts(SecondJoinClient, 1, 2, PLAYERTYPE_GDI, PLAYERTYPE_NOD);
+    };
+    Pump_Clients({&first, &second}, counted);
 
     const float dead_position = SecondJoinClient.Y.at(second_soldier);
     cPacket dead_input;
@@ -1381,6 +1474,7 @@ void Check_Original_Join(unsigned short port, const std::string &definitions, co
     Check(std::abs(spawn_y - 2.0f) < 0.1f && SecondJoinClient.Rounds.at(replacement) == 240 &&
         SecondJoinClient.SelectedWeapon.at(replacement) == 600,
         "The replacement did not spawn with the same team's original health, position and loadout");
+    Check(counted(), "Respawning cleared or duplicated the combat counts or kill message");
 
     cPacket stale;
     Write_Movement(stale, second_control_id, 0, second_soldier, {0, -8, 0});

@@ -100,10 +100,14 @@ bool HeadlessJoin::Update_Round(Clock::time_point now)
     return true;
 }
 
-void HeadlessJoin::Update_Respawns()
+void HeadlessJoin::Update_Combat()
 {
+    const auto deaths = Session.Take_Soldier_Deaths();
     if (IntermissionEnd) {
         return;
+    }
+    for (const auto &death : deaths) {
+        Record_Death(death);
     }
     for (auto &[id, peer] : Peers) {
         if (peer.State != LoadState::Ready || !Session.Soldier_Is_Dead(id)) {
@@ -116,6 +120,63 @@ void HeadlessJoin::Update_Respawns()
             Session.Remove_Soldier(id);
             Spawn_Player(id, peer, true);
         }
+    }
+}
+
+void HeadlessJoin::Record_Death(const HeadlessPlayerSession::SoldierDeath &death)
+{
+    const auto victim = Peers.find(death.VictimPeer);
+    if (victim == Peers.end()) {
+        return;
+    }
+    const auto killer = std::find_if(Peers.begin(), Peers.end(), [&](const auto &entry) {
+        return entry.second.SoldierObject == death.KillerSoldier;
+    });
+    auto &defeated = victim->second;
+    ++defeated.Counts.Deaths;
+    ++TeamCounts[defeated.Team].Deaths;
+
+    // The original server counts friendly-fire kills too. A departed shooter has no surviving soldier.
+    const bool credited = killer != Peers.end() && killer != victim;
+    cPacket kill_message;
+    if (credited) {
+        ++killer->second.Counts.Kills;
+        ++TeamCounts[killer->second.Team].Kills;
+        Write_Creation(kill_message, NextObject--, NETCLASSID_PLAYERKILL, true);
+        kill_message.Add(killer->first);
+        kill_message.Add(victim->first);
+    }
+    for (const auto &[recipient, peer] : Peers) {
+        // Team objects are introduced on connection, before the player finishes loading.
+        Send_Team(recipient, defeated.Team, false);
+        if (credited && killer->second.Team != defeated.Team) {
+            Send_Team(recipient, killer->second.Team, false);
+        }
+        if (peer.PlayerObject == 0) {
+            continue;
+        }
+        Send_Player(recipient, victim->first, defeated, NetworkObjectClass::BIT_OCCASIONAL);
+        if (credited) {
+            Send_Player(recipient, killer->first, killer->second, NetworkObjectClass::BIT_OCCASIONAL);
+            Connection.Send_Packet_To_Individual(kill_message, recipient, SEND_RELIABLE);
+        }
+    }
+}
+
+void HeadlessJoin::Reset_Combat_Counts()
+{
+    TeamCounts = {};
+    for (auto &[id, peer] : Peers) {
+        if (peer.Counts.Kills != 0 || peer.Counts.Deaths != 0) {
+            peer.Counts = {};
+            for (const auto &[recipient, other] : Peers) {
+                if (other.PlayerObject != 0) {
+                    Send_Player(recipient, id, peer, NetworkObjectClass::BIT_OCCASIONAL);
+                }
+            }
+        }
+        Send_Team(id, PLAYERTYPE_NOD, false);
+        Send_Team(id, PLAYERTYPE_GDI, false);
     }
 }
 
@@ -142,6 +203,7 @@ void HeadlessJoin::Restart_Round()
     IntermissionEnd.reset();
     RoundEnd = FrameTime + std::chrono::minutes(Options.TimeLimit);
     ++HostedGameNumber;
+    Reset_Combat_Counts();
     for (auto &[id, peer] : Peers) {
         Delete_Soldier(peer);
         peer.RespawnAt.reset();
@@ -196,8 +258,8 @@ void HeadlessJoin::Connected(int peer_id)
     peer.Name = std::move(PendingName);
     peer.MapIndex = MapIndex;
     Connection.Set_Rhost_Is_In_Game(peer_id, false);
-    Send_Team(peer_id, PLAYERTYPE_NOD);
-    Send_Team(peer_id, PLAYERTYPE_GDI);
+    Send_Team(peer_id, PLAYERTYPE_NOD, true);
+    Send_Team(peer_id, PLAYERTYPE_GDI, true);
     Send_Game_Options(peer_id);
 }
 
@@ -301,9 +363,9 @@ void HeadlessJoin::Create_Player(int peer_id, Peer &peer)
     peer.PlayerObject = NextObject--;
     for (const auto &[id, other] : Peers) {
         if (other.PlayerObject != 0) {
-            Send_Player(peer_id, id, other, true);
+            Send_Player(peer_id, id, other, NetworkObjectClass::BIT_CREATION);
             if (id != peer_id) {
-                Send_Player(id, peer_id, peer, true);
+                Send_Player(id, peer_id, peer, NetworkObjectClass::BIT_CREATION);
             }
         }
     }
@@ -343,7 +405,7 @@ void HeadlessJoin::Spawn_Player(int peer_id, Peer &peer, bool respawning)
             continue;
         }
         if (!respawning && !joining && other.State == LoadState::Ready) {
-            Send_Player(id, peer_id, peer, false);
+            Send_Player(id, peer_id, peer, NetworkObjectClass::BIT_RARE);
         }
         if (other.SoldierObject != 0) {
             if (!respawning) {
@@ -380,7 +442,7 @@ void HeadlessJoin::Set_Loading(int peer_id, Peer &peer, bool loading)
     Connection.Set_Rhost_Is_In_Game(peer_id, !loading);
     for (const auto &[id, other] : Peers) {
         if (other.PlayerObject != 0 && other.State == LoadState::Ready) {
-            Send_Player(id, peer_id, peer, false);
+            Send_Player(id, peer_id, peer, NetworkObjectClass::BIT_RARE);
         }
     }
     if (!loading) {
@@ -418,13 +480,17 @@ void HeadlessJoin::Close_Pending()
     Closing.clear();
 }
 
-void HeadlessJoin::Send_Team(int recipient, int team)
+void HeadlessJoin::Send_Team(int recipient, int team, bool creation)
 {
     cPacket packet;
-    Write_Creation(packet, Teams[team], NETCLASSID_TEAM);
-    packet.Add(team);
-    packet.Add(0); // Kills.
-    packet.Add(0); // Deaths.
+    if (creation) {
+        Write_Creation(packet, Teams[team], NETCLASSID_TEAM);
+        packet.Add(team);
+    } else {
+        Write_Header(packet, Teams[team], NetworkObjectClass::BIT_RARE, false);
+    }
+    packet.Add(TeamCounts[team].Kills);
+    packet.Add(TeamCounts[team].Deaths);
     packet.Add(0.0f); // Score.
     Connection.Send_Packet_To_Individual(packet, recipient, SEND_RELIABLE);
 }
@@ -520,29 +586,30 @@ void HeadlessJoin::Send_Round_Result(int recipient)
     Connection.Send_Packet_To_Individual(packet, recipient, SEND_RELIABLE);
 }
 
-void HeadlessJoin::Send_Player(int recipient, int player_id, const Peer &peer, bool creation)
+void HeadlessJoin::Send_Player(int recipient, int player_id, const Peer &peer, BYTE dirty)
 {
     cPacket packet;
-    if (creation) {
-        Write_Creation(packet, peer.PlayerObject, NETCLASSID_PLAYER);
+    Write_Header(packet, peer.PlayerObject, dirty, false);
+    if (dirty == NetworkObjectClass::BIT_CREATION) {
+        packet.Add(NETCLASSID_PLAYER);
         packet.Add_Wide_Terminated_String(peer.Name.c_str());
-    } else {
-        Write_Header(packet, peer.PlayerObject, NetworkObjectClass::BIT_RARE, false);
     }
-    packet.Add(player_id);
-    packet.Add(0); // Ladder points.
-    packet.Add(peer.Team);
-    packet.Add(100); // Damage scale.
-    packet.Add(0); // Ping.
-    packet.Add(peer.State == LoadState::Ready);
-    packet.Add(false); // Invulnerable.
-    packet.Add(true); // Active.
-    packet.Add(0); // Rank.
-    packet.Add(0); // Ranked games.
+    if ((dirty & NetworkObjectClass::BIT_RARE) == NetworkObjectClass::BIT_RARE) {
+        packet.Add(player_id);
+        packet.Add(0); // Ladder points.
+        packet.Add(peer.Team);
+        packet.Add(100); // Damage scale.
+        packet.Add(0); // Ping.
+        packet.Add(peer.State == LoadState::Ready);
+        packet.Add(false); // Invulnerable.
+        packet.Add(true); // Active.
+        packet.Add(0); // Rank.
+        packet.Add(0); // Ranked games.
+    }
     packet.Add(0.0f); // Score.
     packet.Add(0.0f); // Money.
-    packet.Add(0); // Kills.
-    packet.Add(0); // Deaths.
+    packet.Add(peer.Counts.Kills);
+    packet.Add(peer.Counts.Deaths);
     Connection.Send_Packet_To_Individual(packet, recipient, SEND_RELIABLE);
 }
 

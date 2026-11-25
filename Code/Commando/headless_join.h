@@ -40,7 +40,7 @@ public:
         const HeadlessJoinOptions &options);
 
     bool Update_Round(Clock::time_point now);
-    void Update_Respawns();
+    void Update_Combat();
     REFUSAL_CODE Accept(cPacket &packet);
     void Connected(int peer_id);
     void Receive(cPacket &packet, int peer_id);
@@ -51,6 +51,11 @@ public:
 private:
     enum class LoadState { Loading, Ready, AwaitingReload };
 
+    struct CombatCounts {
+        int Kills = 0;
+        int Deaths = 0;
+    };
+
     struct Peer {
         std::u16string Name;
         std::unique_ptr<cPacket> InitialControl;
@@ -60,6 +65,7 @@ private:
         std::size_t MapIndex = 0; // Map last sent to this player.
         LoadState State = LoadState::Loading;
         std::optional<Clock::time_point> RespawnAt;
+        CombatCounts Counts;
     };
 
     void Receive_Bio(cPacket &packet, int peer_id, Peer &peer);
@@ -70,13 +76,15 @@ private:
     void Request_Reload(int peer_id, Peer &peer);
     void Begin_Intermission();
     void Restart_Round();
+    void Record_Death(const HeadlessPlayerSession::SoldierDeath &death);
+    void Reset_Combat_Counts();
     Clock::duration Time_Remaining() const;
     void Write_Game_Info(cPacket &packet, uint32 address) const;
     void Send_Game_Options(int recipient);
     void Send_Game_Data(int recipient);
     void Send_Round_Result(int recipient);
-    void Send_Team(int recipient, int team);
-    void Send_Player(int recipient, int player_id, const Peer &peer, bool creation);
+    void Send_Team(int recipient, int team, bool creation);
+    void Send_Player(int recipient, int player_id, const Peer &peer, BYTE dirty);
     void Introduce_Soldier(int recipient, int player_id, const Peer &peer);
     void Delete_Object(int recipient, int object);
 
@@ -97,6 +105,7 @@ private:
     // Allocate from the high end of the original dynamic object range.
     int NextObject = 2100000000;
     const std::array<int, 2> Teams;
+    std::array<CombatCounts, 2> TeamCounts;
 };
 
 #endif // HEADLESS_JOIN_H

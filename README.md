@@ -120,6 +120,11 @@ Set `IsFriendlyFirePermitted=yes` in `[Settings]` to enable damage between
 teammates. It defaults to off. Skeletal hit zones, damage to vehicles and
 buildings, and C4 placement and detonation remain open.
 
+The server records kills and deaths on the player and team objects and sends
+the original kill notification to players in the match. A respawn preserves the
+counters. The next round resets them. Friendly-fire kills count when enabled,
+as on the Windows server.
+
 `TimeLimitMinutes` starts counting down when the server starts the loaded map.
 Clients receive the remaining round time when joining and after loading the
 map. A value of `0` disables the time limit. When the timer expires, the server
@@ -137,7 +142,8 @@ The two-client UDP fixture covers login, map readiness, movement replication,
 the remaining time for a late join, spawn inventory, weapon selection visible
 to both peers, firing and reloads, cover, projectile travel, shield and health
 damage, blocked input at zero health, respawn with the original player and
-control objects, object removal, and LAN announcements and withdrawal.
+control objects, combat counts and kill notifications, object removal, and
+LAN announcements and withdrawal.
 The round fixture advances the server clock through a timeout
 and checks the announced map, its spawn and position encoding, movement after
 a map reload, and the end of the map cycle.
