@@ -35,7 +35,7 @@ public:
     bool Attach_Player(int peer_id, int player_type, int soldier_object_id, const HeadlessSoldierPreset &preset);
     void Introduce_Soldier(int owner_id, int recipient, const HeadlessSoldierPreset &preset);
     int Allocate_Network_Object() { return NextObject--; }
-    void Initialize_Buildings();
+    void Initialize_Map_Objects();
     void Introduce_Map_Objects(int recipient);
     bool Base_Is_Destroyed(int team) const;
     void End_Combat();
@@ -80,6 +80,8 @@ private:
         float DeathPoints = 0;
         float BullseyeHeight = 0;
         bool DefenseChanged = false;
+        std::optional<std::size_t> Vehicle;
+        Vector3 VehicleExit{0, 0, 0};
     };
 
     struct Offense {
@@ -132,7 +134,17 @@ private:
         bool Changed = false;
     };
 
+    struct VehicleState {
+        int ObjectId;
+        int PlayerType;
+        int DriverObject = -1;
+    };
+
     bool Read_Control(cPacket &packet, int peer_id, Peer &peer);
+    bool Use_Vehicle(int peer_id, Peer &peer);
+    void Release_Driver(int peer_id, Peer &peer);
+    void Broadcast_Vehicle(std::size_t index);
+    void Send_Vehicle(std::size_t index, int recipient, BYTE dirty);
     static void Clear_Soldier(Peer &peer);
     static void Select_Weapon(Peer &peer, ULONG controls);
     void Advance_Weapon(int player_id, Peer &peer, float seconds, ULONG fire_controls, bool reload);
@@ -159,10 +171,11 @@ private:
     void Write_Defense(cPacket &packet, float health, float shield, unsigned shield_type);
     void Write_Occasional(cPacket &packet, const Peer &peer);
     void Write_Frequent(cPacket &packet, int peer_id, const Peer &peer);
+    void Write_Smart_Frequent(cPacket &packet, const Vector3 &target, ULONG controls, const Vector2 &move);
     void Publish_Player(int peer_id, Peer &peer);
     void Send_Building(std::size_t index, int recipient, BYTE dirty);
     void Publish_Buildings();
-    void Clear_Buildings();
+    void Clear_Map_Objects();
 
     HeadlessSimulation Simulation;
     cConnection &Connection;
@@ -181,10 +194,13 @@ private:
     std::vector<Charge> Charges;
     std::vector<CombatHit> Hits;
     std::vector<BuildingState> Buildings;
+    std::vector<VehicleState> Vehicles;
     std::set<int> MapViewers;
     cEncoderTypeEntry BuildingRadiusEncoder;
     cEncoderTypeEntry BuildingStateEncoder;
-    cEncoderTypeEntry ChargeVelocityEncoder;
+    cEncoderTypeEntry VelocityEncoder;
+    cEncoderTypeEntry VehicleRotationEncoder;
+    cEncoderTypeEntry VehicleAngularVelocityEncoder;
     HeadlessSimulation::Clock::duration PublishElapsed{};
 };
 

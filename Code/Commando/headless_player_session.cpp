@@ -20,6 +20,7 @@
 #include "netclassids.h"
 #include "networkobject.h"
 #include "playertype.h"
+#include "quat.h"
 #include "sphere.h"
 
 namespace {
@@ -32,6 +33,7 @@ constexpr float Gravity = 9.8f;
 // NetworkObjectMgrClass reserves 100,000 client object IDs per peer.
 constexpr int ClientObjectBase = 2110000001;
 constexpr int ClientObjectCount = 100000;
+constexpr int ServerControlOwner = -99999; // SmartGameObj::SERVER_CONTROL_OWNER.
 constexpr UINT ObjectHeaderBits = 32 + 8 + 1;
 constexpr UINT HumanStateBits = 5;
 constexpr UINT HumanSubStateBits = 9;
@@ -66,7 +68,9 @@ HeadlessPlayerSession::HeadlessPlayerSession(const HeadlessCollision &collision,
     ArmorEncoder.Init(0, 1, 1);
     BuildingRadiusEncoder.Init(0, 50, 0.1);
     BuildingStateEncoder.Init(-1, BuildingStateClass::STATE_COUNT, 1);
-    ChargeVelocityEncoder.Init(-90, 90, 0.01); // VehicleGameObj::Set_Precision.
+    VelocityEncoder.Init(-90, 90, 0.01); // VehicleGameObj::Set_Precision.
+    VehicleRotationEncoder.Init(-1, 1, 0.0005);
+    VehicleAngularVelocityEncoder.Init(-20, 20, 0.01);
     Init_Position_Encoders(collision, PositionEncoders);
 }
 
@@ -176,6 +180,7 @@ void HeadlessPlayerSession::Set_Player_Loading(int peer_id, bool loading)
         auto &peer = found->second;
         peer.Ready = !loading;
         if (loading) {
+            Release_Driver(peer_id, peer);
             peer.MoveAxes.Set(0, 0);
             peer.InputRemaining = {};
             peer.FireControls = 0;
@@ -201,17 +206,18 @@ void HeadlessPlayerSession::Clear_Soldier(Peer &peer)
 
 void HeadlessPlayerSession::Remove_Soldier(int peer_id)
 {
-    Simulation.Remove_Soldier(peer_id);
     if (const auto peer = Peers.find(peer_id); peer != Peers.end()) {
+        Release_Driver(peer_id, peer->second);
         Clear_Soldier(peer->second);
     }
+    Simulation.Remove_Soldier(peer_id);
 }
 
 void HeadlessPlayerSession::Remove_Player(int peer_id)
 {
-    Peers.erase(peer_id);
-    Simulation.Remove_Soldier(peer_id);
     MapViewers.erase(peer_id);
+    Remove_Soldier(peer_id);
+    Peers.erase(peer_id);
     Charges.erase(std::remove_if(Charges.begin(), Charges.end(), [&](const auto &charge) {
         if (charge.OwnerPeer != peer_id && charge.AttachedPeer != peer_id) {
             return false;
@@ -227,7 +233,7 @@ void HeadlessPlayerSession::Remove_Player(int peer_id)
 void HeadlessPlayerSession::Reset_Map(const HeadlessCollision &collision)
 {
     End_Combat();
-    Clear_Buildings();
+    Clear_Map_Objects();
     Init_Position_Encoders(collision, PositionEncoders);
     Simulation = HeadlessSimulation(collision);
     Hits.clear();
@@ -237,9 +243,10 @@ void HeadlessPlayerSession::Reset_Map(const HeadlessCollision &collision)
     }
 }
 
-void HeadlessPlayerSession::Initialize_Buildings()
+void HeadlessPlayerSession::Initialize_Map_Objects()
 {
-    const auto &definitions = Simulation.Map_Collision().Level().Buildings();
+    const auto &level = Simulation.Map_Collision().Level();
+    const auto &definitions = level.Buildings();
     Buildings.resize(definitions.size());
     for (std::size_t index = 0; index < definitions.size(); ++index) {
         const auto &def = definitions[index];
@@ -248,6 +255,9 @@ void HeadlessPlayerSession::Initialize_Buildings()
         }
         Buildings[index] = {Allocate_Network_Object(), def.Health, Headless_Armor_Index(*Armor, def.SkinSaveId),
             Headless_Armor_Index(*Armor, def.ShieldSaveId), Building_State(def, def.Health), false};
+    }
+    for (const auto &vehicle : level.Vehicles()) {
+        Vehicles.push_back({Allocate_Network_Object(), vehicle.PlayerType});
     }
 }
 
@@ -269,6 +279,9 @@ void HeadlessPlayerSession::Introduce_Map_Objects(int recipient)
     }
     for (const auto &charge : Charges) {
         Send_Charge(charge, recipient, NetworkObjectClass::BIT_CREATION);
+    }
+    for (std::size_t index = 0; index < Vehicles.size(); ++index) {
+        Send_Vehicle(index, recipient, NetworkObjectClass::BIT_CREATION);
     }
 }
 
@@ -293,13 +306,14 @@ void HeadlessPlayerSession::End_Combat()
     Charges.clear();
     Bullets.clear();
     for (auto &[id, peer] : Peers) {
+        Release_Driver(id, peer);
         if (peer.DefenseChanged) {
             Publish_Player(id, peer);
         }
     }
 }
 
-void HeadlessPlayerSession::Clear_Buildings()
+void HeadlessPlayerSession::Clear_Map_Objects()
 {
     for (const auto &building : Buildings) {
         if (building.ObjectId != 0) {
@@ -307,6 +321,10 @@ void HeadlessPlayerSession::Clear_Buildings()
         }
     }
     Buildings.clear();
+    for (const auto &vehicle : Vehicles) {
+        Send_Map_Object_Deletion(vehicle.ObjectId);
+    }
+    Vehicles.clear();
     MapViewers.clear();
 }
 
@@ -413,6 +431,13 @@ bool HeadlessPlayerSession::Read_Control(cPacket &packet, int peer_id, Peer &pee
         relative_target[axis] = static_cast<float>(encoder.Unscale(bits));
     }
 
+    peer.ControlObject = object_id;
+    if ((one_time & (1u << ControlClass::BOOLEAN_ACTION)) && Use_Vehicle(peer_id, peer)) {
+        return true;
+    }
+    if (peer.Vehicle) {
+        return true;
+    }
     Vector2 forward(relative_target.X, relative_target.Y);
     if (forward.Length2() > 0.01f) {
         forward.Normalize();
@@ -425,7 +450,6 @@ bool HeadlessPlayerSession::Read_Control(cPacket &packet, int peer_id, Peer &pee
     Simulation.Set_Move_Input(peer_id, Vector2(std::clamp(world_move.X, -1.0f, 1.0f),
         std::clamp(world_move.Y, -1.0f, 1.0f)));
     peer.InputRemaining = InputTimeout;
-    peer.ControlObject = object_id;
     const auto previous_slot = peer.WeaponSlot;
     Select_Weapon(peer, one_time);
     if (peer.WeaponSlot != previous_slot) {
@@ -446,6 +470,90 @@ bool HeadlessPlayerSession::Read_Control(cPacket &packet, int peer_id, Peer &pee
     peer.FireControls = fire_controls;
     peer.ReloadRequested |= (one_time & (1u << ControlClass::BOOLEAN_WEAPON_RELOAD)) != 0;
     return true;
+}
+
+bool HeadlessPlayerSession::Use_Vehicle(int peer_id, Peer &peer)
+{
+    if (peer.Vehicle) {
+        Release_Driver(peer_id, peer);
+        return true;
+    }
+
+    const auto &collision = Simulation.Map_Collision();
+    const auto &definitions = collision.Level().Vehicles();
+    const auto &soldier = *Simulation.Find_Soldier(peer_id);
+    if (!soldier.Grounded) {
+        return false;
+    }
+    for (std::size_t index = 0; index < Vehicles.size(); ++index) {
+        auto &vehicle = Vehicles[index];
+        const auto &definition = definitions[index];
+        if (definition.Seats == 0 || vehicle.DriverObject != -1 || definition.Health == 0 ||
+            definition.Entrances.empty() || definition.Exits.empty()) {
+            continue;
+        }
+        Vector3 local;
+        Matrix3D::Inverse_Transform_Vector(definition.Transform, soldier.Position, &local);
+        const bool in_zone = std::any_of(definition.Entrances.begin(), definition.Entrances.end(), [&](const auto &box) {
+            Vector3 offset;
+            Matrix3::Transpose_Rotate_Vector(box.Basis, local - box.Center, &offset);
+            return std::abs(offset.X) <= box.Extent.X && std::abs(offset.Y) <= box.Extent.Y &&
+                std::abs(offset.Z) <= box.Extent.Z;
+        });
+        const auto position = definition.Transform.Get_Translation();
+        if (!in_zone || collision.Cast_Ray(position, soldier.Position, COLLISION_TYPE_PHYSICAL)) {
+            continue;
+        }
+        // Parked vehicles must have a walkable exit before accepting a driver.
+        std::optional<Vector3> exit;
+        for (const auto &offset : definition.Exits) {
+            const auto candidate = definition.Transform * offset;
+            exit = Simulation.Find_Stand_Position(candidate + Vector3(0, 0, 0.5f), 2.0f);
+            if (exit) {
+                break;
+            }
+        }
+        if (!exit) {
+            continue;
+        }
+        peer.VehicleExit = *exit;
+        peer.Vehicle = index;
+        peer.MoveAxes.Set(0, 0);
+        peer.FireControls = 0;
+        peer.ReloadRequested = false;
+        peer.DetonateRemoteCharges = false;
+        peer.InputRemaining = {};
+        vehicle.DriverObject = peer.SoldierObject;
+        vehicle.PlayerType = soldier.PlayerType;
+        Simulation.Set_Soldier_Vehicle_State(peer_id, position, true);
+        Broadcast_Vehicle(index);
+        return true;
+    }
+    return false;
+}
+
+void HeadlessPlayerSession::Release_Driver(int peer_id, Peer &peer)
+{
+    if (!peer.Vehicle) {
+        return;
+    }
+    const auto index = *peer.Vehicle;
+    auto &vehicle = Vehicles[index];
+    vehicle.DriverObject = -1;
+    vehicle.PlayerType = PLAYERTYPE_NEUTRAL;
+    peer.Vehicle.reset();
+    peer.Target = peer.VehicleExit + Vector3(peer.Forward.X, peer.Forward.Y, SoldierEyeHeight);
+    Simulation.Set_Soldier_Vehicle_State(peer_id, peer.VehicleExit, false);
+    Broadcast_Vehicle(index);
+}
+
+void HeadlessPlayerSession::Broadcast_Vehicle(std::size_t index)
+{
+    for (const int recipient : MapViewers) {
+        if (Connection.Get_Remote_Host(recipient)) {
+            Send_Vehicle(index, recipient, NetworkObjectClass::BIT_RARE);
+        }
+    }
 }
 
 void HeadlessPlayerSession::Advance_Weapon(int player_id, Peer &peer, float seconds, ULONG fire_controls, bool reload)
@@ -602,7 +710,7 @@ std::optional<HeadlessPlayerSession::SoldierIntersection> HeadlessPlayerSession:
     hit.Fraction = limit;
     std::optional<SoldierIntersection> intersection;
     for (const auto &[id, peer] : Peers) {
-        if (!peer.Ready || peer.Health <= 0 || peer.SoldierObject == ignore_object) {
+        if (!peer.Ready || peer.Health <= 0 || peer.Vehicle || peer.SoldierObject == ignore_object) {
             continue;
         }
         const auto &soldier = *Simulation.Find_Soldier(id);
@@ -690,6 +798,9 @@ double HeadlessPlayerSession::Apply_Physical_Damage(const Offense &attack, bool 
 
 void HeadlessPlayerSession::Apply_Soldier_Damage(int player_id, Peer &peer, const Offense &attack)
 {
+    if (peer.Vehicle) {
+        return;
+    }
     if (peer.Health <= 0) {
         return;
     }
@@ -852,7 +963,8 @@ bool HeadlessPlayerSession::Charge_Triggers(Charge &charge, const Peer &owner, d
     const float range_squared = charge.TriggerRange * charge.TriggerRange;
     return std::any_of(Peers.begin(), Peers.end(), [&](const auto &entry) {
         const auto *soldier = Simulation.Find_Soldier(entry.first);
-        return entry.second.Ready && soldier && Player_Types_Are_Enemies(charge.Team, soldier->PlayerType) &&
+        return entry.second.Ready && !entry.second.Vehicle && soldier &&
+            Player_Types_Are_Enemies(charge.Team, soldier->PlayerType) &&
             (soldier->Position - charge.Position).Length2() <= range_squared;
     });
 }
@@ -995,8 +1107,8 @@ void HeadlessPlayerSession::Write_Charge_Rare(cPacket &packet, const Charge &cha
     const auto write_velocity = [&](const Vector3 &value) {
         for (int axis = 0; axis < 3; ++axis) {
             ULONG code;
-            ChargeVelocityEncoder.Scale(value[axis], code);
-            packet.Add_Bits(code, ChargeVelocityEncoder.Get_Bit_Precision());
+            VelocityEncoder.Scale(value[axis], code);
+            packet.Add_Bits(code, VelocityEncoder.Get_Bit_Precision());
         }
     };
     write_velocity(charge.Velocity);
@@ -1066,7 +1178,7 @@ void HeadlessPlayerSession::Advance(HeadlessSimulation::Clock::duration elapsed)
     Advance_Bullets(movement_seconds);
     Advance_Charges(std::chrono::duration<double>(elapsed).count(), movement_seconds);
     for (auto &[id, peer] : Peers) {
-        if (peer.Ready && peer.Health > 0) {
+        if (peer.Ready && peer.Health > 0 && !peer.Vehicle) {
             const auto held = std::min(weapon_elapsed, peer.InputRemaining);
             const bool reload = std::exchange(peer.ReloadRequested, false);
             Advance_Weapon(id, peer, std::chrono::duration<float>(held).count(), peer.FireControls, reload);
@@ -1112,6 +1224,64 @@ void HeadlessPlayerSession::Write_Occasional(cPacket &packet, const Peer &peer)
         packet.Add(weapon.DefinitionId);
         packet.Add(weapon.Total_Rounds());
     }
+}
+
+void HeadlessPlayerSession::Send_Vehicle(std::size_t index, int recipient, BYTE dirty)
+{
+    const auto &vehicle = Vehicles[index];
+    const auto &definition = Simulation.Map_Collision().Level().Vehicles()[index];
+    const auto position = definition.Transform.Get_Translation();
+    cPacket packet;
+    packet.Add(vehicle.ObjectId);
+    packet.Add(dirty);
+    packet.Add(false);
+    if (dirty == NetworkObjectClass::BIT_CREATION) {
+        packet.Add(NETCLASSID_GAMEOBJ);
+        packet.Add(definition.DefinitionId);
+        Write_Position(packet, position);
+        packet.Add(definition.Transform.Get_Z_Rotation());
+        packet.Add(ServerControlOwner);
+        packet.Add(0); // VehicleGameObj lock owner.
+    }
+    packet.Add_Terminated_String(definition.Model.c_str(), true);
+    packet.Add_Terminated_String("", true); // Animation.
+    packet.Add(0); // Current frame.
+    packet.Add(0); // Target frame.
+    packet.Add(3); // ANIM_MODE_TARGET.
+    packet.Add(0); // Host object.
+    packet.Add(0); // Host bone.
+    packet.Add(vehicle.PlayerType);
+    packet.Add(false); // HUD poke indicator.
+    packet.Add(false); // Hidden.
+    for (int seat = 0; seat < definition.Seats; ++seat) {
+        packet.Add(seat == 0 ? vehicle.DriverObject : -1);
+    }
+    packet.Add(false); // Vehicle delivered by a factory.
+    const auto shield_type = Armor ? Headless_Armor_Index(*Armor, definition.ShieldSaveId) : 0;
+    Write_Defense(packet, definition.Health, definition.Shield, shield_type);
+    packet.Add(0); // Total rounds in the vehicle weapon.
+    if (definition.UsesVehiclePhysics) {
+        packet.Add(false); // Engine state.
+        Write_Position(packet, position);
+        const auto rotation = Build_Quaternion(definition.Transform);
+        const auto write_scaled = [&](cEncoderTypeEntry &encoder, float component) {
+            ULONG bits;
+            encoder.Scale(component, bits);
+            packet.Add_Bits(bits, encoder.Get_Bit_Precision());
+        };
+        for (int axis = 0; axis < 4; ++axis) {
+            write_scaled(VehicleRotationEncoder, rotation[axis]);
+        }
+        for (int axis = 0; axis < 3; ++axis) {
+            write_scaled(VelocityEncoder, 0);
+        }
+        for (int axis = 0; axis < 3; ++axis) {
+            write_scaled(VehicleAngularVelocityEncoder, 0);
+        }
+    }
+    packet.Add(false); // DriverIsGunner override.
+    Write_Smart_Frequent(packet, position + definition.Transform.Get_X_Vector(), 0, Vector2(0, 0));
+    Connection.Send_Packet_To_Individual(packet, recipient, SEND_RELIABLE);
 }
 
 void HeadlessPlayerSession::Send_Building(std::size_t index, int recipient, BYTE dirty)
@@ -1176,7 +1346,11 @@ void HeadlessPlayerSession::Write_Position(cPacket &packet, const Vector3 &posit
 void HeadlessPlayerSession::Write_Frequent(cPacket &packet, int peer_id, const Peer &peer)
 {
     const auto &soldier = *Simulation.Find_Soldier(peer_id);
-    packet.Add(false); // In vehicle.
+    packet.Add(peer.Vehicle.has_value());
+    if (peer.Vehicle) {
+        Write_Smart_Frequent(packet, peer.Target, 0, Vector2(0, 0));
+        return;
+    }
     packet.Add(peer.WeaponSlot != 0);
     ULONG fire_controls = 0;
     if (peer.WeaponSlot != 0) {
@@ -1206,10 +1380,16 @@ void HeadlessPlayerSession::Write_Frequent(cPacket &packet, int peer_id, const P
         packet.Add(soldier.Velocity.Z);
     }
     packet.Add(false); // Special damage.
+    Write_Smart_Frequent(packet, peer.Target, fire_controls, peer.MoveAxes);
+}
+
+void HeadlessPlayerSession::Write_Smart_Frequent(cPacket &packet, const Vector3 &target, ULONG controls,
+    const Vector2 &move)
+{
     packet.Add(false); // Attached to a host bone.
-    Write_Position(packet, peer.Target);
-    packet.Add_Bits(fire_controls, ControlClass::NUM_BOOLEAN_CONTINUOUS);
-    const float analog[] = {peer.MoveAxes.X, peer.MoveAxes.Y, 0, 0};
+    Write_Position(packet, target);
+    packet.Add_Bits(controls, ControlClass::NUM_BOOLEAN_CONTINUOUS);
+    const float analog[] = {move.X, move.Y, 0, 0};
     for (const auto value : analog) {
         ULONG bits;
         AnalogEncoder.Scale(value, bits);

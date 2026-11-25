@@ -37,6 +37,8 @@ public:
 
     // World-space movement axes in [-1, 1], held until the next input.
     bool Set_Move_Input(int player_id, const Vector2 &direction);
+    void Set_Soldier_Vehicle_State(int player_id, const Vector3 &position, bool seated);
+    std::optional<Vector3> Find_Stand_Position(const Vector3 &position, float drop) const;
     void Advance(Clock::duration elapsed);
 
 private:
@@ -44,9 +46,9 @@ private:
         Soldier State;
         Vector2 MoveInput{0, 0};
         float VerticalSpeed = 0;
+        bool Seated = false;
     };
 
-    std::optional<Vector3> Find_Stand_Position(const Vector3 &position, float drop) const;
     void Slide_Soldier(Soldier &soldier, Vector3 move) const;
     void Tick();
 

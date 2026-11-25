@@ -86,7 +86,7 @@ HeadlessJoin::HeadlessJoin(cConnection &connection, HeadlessPlayerSession &sessi
       Teams{Session.Allocate_Network_Object(), Session.Allocate_Network_Object()}
 {
     Session.Set_Combat_Rules(Maps[0].Join.Armor, Options.FriendlyFire, Options.CanRepairBuildings);
-    Session.Initialize_Buildings();
+    Session.Initialize_Map_Objects();
 }
 
 bool HeadlessJoin::Update_Round(Clock::time_point now)
@@ -143,8 +143,8 @@ void HeadlessJoin::Update_Combat()
         if (!peer.RespawnAt) {
             peer.RespawnAt = FrameTime + std::chrono::duration_cast<Clock::duration>(RespawnDelay);
         } else if (FrameTime >= *peer.RespawnAt) {
-            Delete_Soldier(peer);
             Session.Remove_Soldier(id);
+            Delete_Soldier(peer);
             Spawn_Player(id, peer, true);
         }
     }
@@ -279,7 +279,7 @@ void HeadlessJoin::Restart_Round()
     }
     Session.Reset_Map(Maps[MapIndex].Collision);
     Session.Set_Combat_Rules(Maps[MapIndex].Join.Armor, Options.FriendlyFire, Options.CanRepairBuildings);
-    Session.Initialize_Buildings();
+    Session.Initialize_Map_Objects();
     for (auto &[id, peer] : Peers) {
         if (peer.State == LoadState::Ready) {
             Spawn_Player(id, peer);

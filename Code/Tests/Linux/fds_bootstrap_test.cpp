@@ -209,7 +209,8 @@ std::string Collision_Data(uint32 last_vertex = 2)
                 part("testmesh.wall", 0) + part("testmesh.bulletwall", 0)));
 }
 
-std::string Dynamic_Data(float spawn_y = 2, bool with_buildings = false, float gdi_spawn_x = 6)
+std::string Dynamic_Data(float spawn_y = 2, bool with_buildings = false, float gdi_spawn_x = 6,
+    bool with_vehicle = false)
 {
     auto spawner = [spawn_y](sint32 id, sint32 definition, float x) {
         const std::array<float, 12> transform{1, 0, 0, x, 0, 1, 0, spawn_y, 0, 0, 1, 3};
@@ -229,8 +230,20 @@ std::string Dynamic_Data(float spawn_y = 2, bool with_buildings = false, float g
     const auto buildings = with_buildings ?
         building(300, 42, {-4, 2, 1.62f}, 30) + building(301, 43, {-6, 0.8f, 1.62f}, 80) :
         building(300, 42, {5, 1, 2}, 0);
-    const auto objects = Chunk(916991654, Chunk(916991653, buildings));
-    return Chunk(1011991649, Chunk(CHUNKID_COMBAT, objects + spawners));
+    constexpr uint32 vehicle_pointer = 0x10203040;
+    const auto vehicle = with_vehicle ? Chunk(CHUNKID_GAME_OBJECT_VEHICLE, Chunk(0x00100101,
+        Chunk(910991407, Micro(2, sint32{310}), false) +
+        Chunk(207011214, Micro(1, sint32{PLAYERTYPE_NEUTRAL}), false) +
+        Chunk(910991146, Micro(10, vehicle_pointer), false) +
+        Chunk(914991020, Micro(3, 125.0f) + Micro(6, 50.0f) + Micro(8, sint32{23}), false))) : "";
+    const std::array<float, 12> transform{1, 0, 0, -6.5f, 0, 1, 0, 2, 0, 0, 1, 0.25f};
+    const auto physical = Chunk(0x00100100, Bytes(vehicle_pointer + uint32{0x28}), false) + Chunk(0x00100101,
+        Chunk(0x00660055, Micro(2, vehicle_pointer), false) +
+        Chunk(0x00660056, Chunk(0x10000, Chunk(0x00555040, Micro(1, "TEST_CAR") + Micro(2, transform), false))));
+    const auto dynamic = with_vehicle ? Chunk(CHUNKID_WWPHYS_BEGIN + 0x50, Chunk(0x7001,
+        Chunk(0x890100, Chunk(0x890101, Chunk(0x2010a, physical))))) : "";
+    const auto objects = Chunk(916991654, Chunk(916991653, buildings + vehicle));
+    return Chunk(1011991649, Chunk(CHUNKID_COMBAT, objects + spawners) + dynamic);
 }
 
 void Check_Box_Sweeps(const HeadlessCollision &collision)
@@ -424,8 +437,15 @@ std::string Definitions(bool with_repair_weapon = false)
     const auto disarm_effect = Chunk(CHUNKID_EXPLOSION_DEF, Chunk(0x00100101,
         Chunk(0317001526, Chunk(0x100, Micro(1, sint32{649}), false)) +
         Chunk(0317001525, Micro(3, 0.0f) + Micro(4, 0.0f), false)));
+    const std::array<float, 15> entry_zone{1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1.4f, 1.1f, 1.0f};
+    const std::array<float, 12> exit_transform{1, 0, 0, 0.5f, 0, 1, 0, -0.65f, 0, 0, 1, 0};
+    const auto vehicle = Chunk(CHUNKID_GAME_OBJECT_DEF_VEHICLE, Chunk(0x00100101,
+        Chunk(0x100, Micro(1, sint32{310}), false) +
+        Chunk(930991657, Micro(1, sint32{0}) + Micro(32, sint32{2}), false) +
+        Chunk(0x11051106, Micro(1, sint32{8}) + Micro(2, entry_zone), false) +
+        Chunk(0x11051106, Micro(1, sint32{9}) + Micro(4, exit_transform), false)));
     return Chunk(CHUNKID_SAVELOAD_DEFMGR, Chunk(0x101,
-        definition(100, PLAYERTYPE_NOD) + definition(200, PLAYERTYPE_GDI) +
+        definition(100, PLAYERTYPE_NOD) + definition(200, PLAYERTYPE_GDI) + vehicle +
         building(300, "plant") + building(301, "base") + terminal +
         soldier(400, "CnC_Nod_Minigunner_0", 500) + soldier(401, "CnC_GDI_MiniGunner_0", 501) +
         soldier(402, "CnC_Nod_Engineer_0", 500, 624) + soldier(403, "CnC_GDI_Engineer_0", 501, 624) +
@@ -801,6 +821,8 @@ struct Join_Client_State {
     std::map<int, int> Buildings; // Preset ID to network object ID.
     std::map<int, Defense> BuildingVitals;
     std::map<int, bool> BuildingDestroyed;
+    std::map<int, int> VehicleDriver;
+    std::set<int> SeatedSoldiers;
     struct Charge {
         int Owner = 0;
         bool Stuck = false;
@@ -984,7 +1006,17 @@ std::vector<HeadlessSpawnWeapon> Fixture_Weapons(int team, int charge = 620, boo
 
 void Read_Soldier_Frequent(cPacket &packet, Join_Client_State &client, int object)
 {
-    Check(!Field<bool>(packet), "Soldier was unexpectedly in a vehicle");
+    if (Field<bool>(packet)) {
+        client.SeatedSoldiers.insert(object);
+        Check(!Field<bool>(packet), "Mounted soldier should have no host bone");
+        Read_Join_Position_Y(packet, client.MapCRC);
+        ULONG controls, analog;
+        packet.Get_Bits(controls, ControlClass::NUM_BOOLEAN_CONTINUOUS);
+        packet.Get_Bits(analog, 32);
+        Check(controls == 0 && analog == 0x80808080u, "Mounted soldier exported infantry controls");
+        return;
+    }
+    client.SeatedSoldiers.erase(object);
     int id = 0;
     int rounds = 0;
     if (Field<bool>(packet)) {
@@ -1011,6 +1043,53 @@ void Read_Soldier_Frequent(cPacket &packet, Join_Client_State &client, int objec
     packet.Get_Bits(bits, ControlClass::NUM_BOOLEAN_CONTINUOUS);
     client.FireControls[object] = bits;
     packet.Get_Bits(bits, 32); // Analog controls.
+}
+
+void Read_Vehicle(cPacket &packet, Join_Client_State &client, int object)
+{
+    char model[32];
+    char animation[32];
+    packet.Get_Terminated_String(model, sizeof(model), true);
+    packet.Get_Terminated_String(animation, sizeof(animation), true);
+    Check(std::string(model) == "TEST_CAR" && *animation == 0, "Wrong vehicle model or animation");
+    Check(Field<int>(packet) == 0 && Field<int>(packet) == 0 && Field<int>(packet) == 3 &&
+        Field<int>(packet) == 0 && Field<int>(packet) == 0, "Incorrect vehicle animation fields");
+    const int team = Field<int>(packet);
+    Check(!Field<bool>(packet) && !Field<bool>(packet), "Unexpected vehicle HUD or visibility flag");
+    const int driver = Field<int>(packet);
+    Check((driver == -1 && team == PLAYERTYPE_NEUTRAL) ||
+        (team == PLAYERTYPE_NOD && std::any_of(client.Soldiers.begin(), client.Soldiers.end(), [=](const auto &soldier) {
+            return soldier.second == driver;
+        })), "Vehicle driver must refer to an introduced soldier");
+    client.VehicleDriver[object] = driver;
+    Check(Field<int>(packet) == -1 && !Field<bool>(packet), "Unexpected second occupant or delivery");
+    Check(!Field<bool>(packet), "Live vehicle was marked as destroyed");
+    ULONG health, shield, armor;
+    packet.Get_Bits(health, 11);
+    packet.Get_Bits(shield, 11);
+    packet.Get_Bits(armor, 2);
+    Check(health == 128 && shield == 51 && armor == client.ShieldArmorCode, "Wrong vehicle defense state");
+    Check(Field<int>(packet) == 0 && !Field<bool>(packet), "Unexpected vehicle weapon or engine state");
+    Check(std::abs(Read_Join_Position_Y(packet, client.MapCRC) - 2.0f) <= 0.11f, "Wrong vehicle position");
+    ULONG bits;
+    for (int axis = 0; axis < 4; ++axis) {
+        packet.Get_Bits(bits, 12); // Quaternion.
+        Check(bits == (axis == 3 ? 4095u : 2048u), "Wrong vehicle orientation");
+    }
+    for (int axis = 0; axis < 3; ++axis) {
+        packet.Get_Bits(bits, 15);
+        Check(bits == 16384u, "Parked vehicle has linear velocity");
+    }
+    for (int axis = 0; axis < 3; ++axis) {
+        packet.Get_Bits(bits, 12);
+        Check(bits == 2048u, "Parked vehicle has angular velocity");
+    }
+    Check(!Field<bool>(packet) && !Field<bool>(packet), "Unexpected vehicle gunner override or host bone");
+    Read_Join_Position_Y(packet, client.MapCRC);
+    packet.Get_Bits(bits, ControlClass::NUM_BOOLEAN_CONTINUOUS);
+    Check(bits == 0, "Unexpected vehicle controls");
+    packet.Get_Bits(bits, 32);
+    Check(bits == 0x80808080u, "Unexpected vehicle analog axes");
 }
 
 void Read_Soldier_Occasional(cPacket &packet, Join_Client_State &client, int object, int team = -1, int charge = 620)
@@ -1102,6 +1181,11 @@ void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
     if (dirty == 0 && deleting) {
         client.Deleted.insert(object);
         client.Charges.erase(object);
+        client.VehicleDriver.erase(object);
+        client.SeatedSoldiers.erase(object);
+        Check(std::none_of(client.VehicleDriver.begin(), client.VehicleDriver.end(), [=](const auto &vehicle) {
+            return vehicle.second == object;
+        }), "Driver was deleted before its seat was cleared");
         const auto old_soldier = std::find_if(client.Soldiers.begin(), client.Soldiers.end(), [object](const auto &entry) {
             return entry.second == object;
         });
@@ -1134,6 +1218,12 @@ void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
             "Incorrect building update");
         Read_Building(packet, client, object, dirty == NetworkObjectClass::BIT_RARE);
         Check(packet.Is_Flushed(), "Unexpected data in building update");
+        return;
+    }
+    if (client.VehicleDriver.count(object)) {
+        Check(!deleting && dirty == NetworkObjectClass::BIT_RARE, "Incorrect vehicle state update");
+        Read_Vehicle(packet, client, object);
+        Check(packet.Is_Flushed(), "Unexpected data in vehicle state update");
         return;
     }
     if (dirty == NetworkObjectClass::BIT_OCCASIONAL && client.PlayerCounts.count(object)) {
@@ -1207,6 +1297,14 @@ void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
         break;
     case 1000: { // GameObj with factory data and all update tiers.
         const int preset = Field<int>(packet);
+        if (preset == 310) {
+            Check(!deleting && !client.VehicleDriver.count(object), "Invalid vehicle creation");
+            Read_Join_Position_Y(packet, client.MapCRC);
+            Check(Field<float>(packet) == 0.0f && Field<int>(packet) == -99999 && Field<int>(packet) == 0,
+                "Vehicle creation must carry facing, server ownership and the lock owner");
+            Read_Vehicle(packet, client, object);
+            break;
+        }
         if (preset == 621) {
             Check(!deleting, "C4 deleted on creation");
             Read_Join_Position_Y(packet, client.MapCRC);
@@ -1248,7 +1346,8 @@ void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
         const auto &defense = client.Vitals.at(object);
         Check(!defense.Dead && defense.Health == 102 && defense.Shield == 51, "Incorrect spawn vitals");
         Read_Soldier_Frequent(packet, client, object);
-        Check(client.JoiningActiveCombat || client.SelectedWeapon.at(object) == 600 + preset - first_preset,
+        Check(client.JoiningActiveCombat || client.SeatedSoldiers.count(object) ||
+            client.SelectedWeapon.at(object) == 600 + preset - first_preset,
             "The primary weapon must start equipped");
         break;
     }
@@ -1358,6 +1457,93 @@ void Send_Loading(cConnection &client, int id_offset, bool loading)
     packet.Add(owner);
     packet.Add(loading);
     client.Send_Packet_To_Individual(packet, SERVER_RHOST_ID, SEND_RELIABLE);
+}
+
+void Check_Vehicle_Seats(const HeadlessCollision &collision, const HeadlessJoinData &data)
+{
+    FirstJoinClient = {};
+    SecondJoinClient = {};
+    LateJoinClient = {};
+    const std::vector<HeadlessMap> maps{{"C&C_Test.mix", collision, data}};
+    HeadlessJoinOptions options;
+    options.Owner = u"FixtureHost";
+    options.Title = u"Join fixture";
+    options.Motd = u"Ready";
+    options.Password = u"testpass";
+    options.Address = htonl(INADDR_LOOPBACK);
+    options.TimeLimit = 23;
+    cConnection server;
+    Check(server.Init_As_Server(0, 16, true, INADDR_LOOPBACK), "Could not bind the vehicle test server");
+    server.Set_Bandwidth_Budget_Out(TestBandwidth);
+    JoinPort = server.Get_Local_Port();
+    JoinKey = data.VersionKey;
+    HeadlessPlayerSession session(maps.front().Collision, server);
+    HeadlessJoin join(server, session, maps, options);
+    server.Install_Application_Acceptance_Handler([&](cPacket &packet) { return join.Accept(packet); });
+    server.Install_Conn_Handler([&](int id) { join.Connected(id); });
+    int received = 0;
+    server.Install_Server_Packet_Handler([&](cPacket &packet, int id) {
+        join.Receive(packet, id);
+        ++received;
+    });
+
+    cConnection first;
+    cConnection second;
+    cConnection late;
+    const auto pump = [&](const auto &ready) {
+        Pump_Clients({&first, &second, &late}, [&] {
+            server.Service_Read();
+            server.Service_Send(true);
+            return ready();
+        });
+    };
+    Connect_Join_Client(first, u"First", u"testpass", JoinKey, Receive_First_Join);
+    Connect_Join_Client(second, u"Second", u"testpass", JoinKey, Receive_Second_Join);
+    pump([&] { return FirstJoinClient.OptionsTime && SecondJoinClient.OptionsTime; });
+    Send_Bio(first, u"First", PLAYERTYPE_NOD, 1, "C&C_Test.mix");
+    Send_Bio(second, u"Second", PLAYERTYPE_GDI, 1, "C&C_Test.mix");
+    pump([&] { return FirstJoinClient.Soldiers.size() == 2 && SecondJoinClient.GameDataTime; });
+    const int driver = FirstJoinClient.Soldiers.at(1);
+    const int distant = FirstJoinClient.Soldiers.at(2);
+    Check(FirstJoinClient.VehicleDriver.size() == 1, "Placed vehicle did not join the map");
+    const int vehicle = FirstJoinClient.VehicleDriver.begin()->first;
+    const auto use = [&](cConnection &client, int soldier, bool create) {
+        const int peer = client.Get_Local_Id();
+        const int before = received;
+        cPacket packet;
+        Write_Movement(packet, FirstControlObject + (peer - 1) * 100000, create ? peer : 0, soldier,
+            {0, -8, 1.62f}, 21.0f, 8, 1u << ControlClass::BOOLEAN_ACTION, 0, false);
+        client.Send_Packet_To_Individual(packet, SERVER_RHOST_ID, create ? SEND_RELIABLE : SEND_UNRELIABLE);
+        pump([&] { return received > before; });
+        session.Advance(100ms);
+    };
+    use(second, distant, true);
+    pump([&] { return SecondJoinClient.Y.count(distant); });
+    Check(SecondJoinClient.VehicleDriver.at(vehicle) == -1, "Distant player entered a vehicle");
+    use(first, driver, true);
+    pump([&] { return FirstJoinClient.VehicleDriver.at(vehicle) == driver &&
+        SecondJoinClient.VehicleDriver.at(vehicle) == driver; });
+
+    Connect_Join_Client(late, u"Late", u"testpass", JoinKey, Receive_Late_Join);
+    pump([&] { return LateJoinClient.OptionsTime.has_value(); });
+    Send_Bio(late, u"Late", PLAYERTYPE_NOD, 1, "C&C_Test.mix");
+    pump([&] { return LateJoinClient.GameDataTime && LateJoinClient.VehicleDriver.count(vehicle); });
+    Check(LateJoinClient.VehicleDriver.at(vehicle) == driver && LateJoinClient.SeatedSoldiers.count(driver),
+        "A later client did not receive the occupied driver seat");
+    const int contender = LateJoinClient.Soldiers.at(3);
+    use(late, contender, true);
+    pump([&] { return LateJoinClient.Y.count(contender); });
+    Check(LateJoinClient.VehicleDriver.at(vehicle) == driver, "A second soldier took an occupied driver seat");
+
+    use(first, driver, false);
+    pump([&] { return LateJoinClient.VehicleDriver.at(vehicle) == -1 &&
+        std::abs(LateJoinClient.Y.at(driver) - 1.35f) <= 0.13f; });
+    use(late, contender, false);
+    pump([&] { return SecondJoinClient.VehicleDriver.at(vehicle) == contender; });
+    join.Disconnected(3);
+    pump([&] { return SecondJoinClient.Deleted.count(contender) && SecondJoinClient.VehicleDriver.at(vehicle) == -1; });
+    session.Reset_Map(maps.front().Collision);
+    pump([&] { return SecondJoinClient.Deleted.count(vehicle); });
 }
 
 bool Has_Combat_Counts(const Join_Client_State &client, int killer, int victim, int killer_team, int victim_team)
@@ -2339,6 +2525,14 @@ int main(int argc, char **argv)
         const HeadlessArmorTable charge_armor{{17, {{0.5f, 0}}}, {23, {{2, 0}}}};
         const auto charge_join_data = Load_Headless_Join_Data(838, charge_armor, core.Find("strings.tdb").value(),
             core.Find("objects.ddb").value(), std::nullopt, [](const std::string &) { return std::nullopt; });
+        Write_Archive(data / "C&C_Vehicles.mix", {{"VEHICLES.LDD", Dynamic_Data(2, false, 6, true)},
+            {"VEHICLES.LSD", Static_Data()}, {"VEHICLES.DEP", dependencies}, {"COLLIDERS.W3D", collision_data}});
+        const MixArchive vehicles_archive(data / "C&C_Vehicles.mix");
+        auto vehicles_level = HeadlessLevel::Load(vehicles_archive.Find("vehicles.lsd").value(),
+            vehicles_archive.Find("vehicles.ldd").value(), core.Find("objects.ddb").value(), std::nullopt);
+        const auto vehicles_collision = HeadlessCollision::Load(std::move(vehicles_level),
+            [&](const std::string &name) { return vehicles_archive.Find(name); }, vehicles_archive.Find("vehicles.dep"));
+        Check_Vehicle_Seats(vehicles_collision, charge_join_data);
         Check_Building_Combat(buildings_collision, true, &charge_join_data);
         const auto remote_join_data = Load_Headless_Join_Data(838, charge_armor, core.Find("strings.tdb").value(),
             core.Find("objects.ddb").value(), std::nullopt, [](const std::string &) { return std::nullopt; },
@@ -2382,7 +2576,8 @@ int main(int argc, char **argv)
         Check(check_status == 0, "FDS rejected valid fixture: " + check.Output());
         Check(check.Output().find("Validated game data for 1 map(s)") != std::string::npos,
             "FDS did not validate the configured map");
-        Check(check.Output().find("3 static objects in 3 spatial nodes, 1 buildings, 2 spawners") != std::string::npos,
+        Check(check.Output().find("3 static objects in 3 spatial nodes, 1 buildings, 0 vehicles, 2 spawners") !=
+            std::string::npos,
             "FDS did not load the headless scene before startup");
         Check(check.Output().find("15 colliders, 0 static objects with incomplete geometry; "
             "2/2 soldier-start ground rays hit; 2/2 ground box sweeps hit (0 initial overlaps)") != std::string::npos,

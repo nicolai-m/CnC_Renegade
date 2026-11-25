@@ -38,6 +38,9 @@ constexpr uint32 DamageableDefinitionVariables = 207011206;
 constexpr uint32 DefenseVariables = 914991020;
 constexpr uint32 AggregateDefinitionVariables = 8281442;
 constexpr uint32 GameObjectVariables = 910991407;
+constexpr uint32 PhysicalObjectVariables = 910991146;
+constexpr uint32 VehicleDefinitionVariables = 930991657;
+constexpr uint32 TransitionVariables = 0x11051106;
 
 // PhysicsSceneClass and AABTreeCullSystemClass chunk IDs.
 constexpr uint32 StaticDataSystem = CHUNKID_WWPHYS_BEGIN;
@@ -57,6 +60,9 @@ constexpr uint32 ObjectNodeIndex = 0x200;
 // PhysClass state and RenderObjPersistFactoryClass model reference.
 constexpr uint32 PhysVariables = 0x00660055;
 constexpr uint32 ModelVariables = 0x00555040;
+constexpr uint32 DynamicDataScene = 0x00007001;
+constexpr uint32 DynamicObjectList = 0x00890100;
+constexpr uint32 DynamicObjectRecord = 0x00890101;
 
 using LevelReader = BoundedChunkReader;
 
@@ -99,11 +105,64 @@ struct BuildingDefinition {
     std::optional<int> PlayerType;
 };
 
+struct VehicleDefinition {
+    enum Type { Car, Tank, Bike, Flying, Turret };
+    int Kind = Car;
+    int Seats = 2; // VehicleGameObjDef default for saves without NumSeats.
+    std::vector<OBBoxClass> Entrances;
+    std::vector<Vector3> Exits;
+};
+
 struct MapDefinitions {
     std::map<int, SpawnDefinition> Spawners;
     std::map<int, BuildingDefinition> Buildings;
     std::map<int, bool> AggregateMCT;
+    std::map<int, VehicleDefinition> Vehicles;
 };
+
+void Read_Vehicle_Definition(LevelReader &reader, int &definition_id, VehicleDefinition &vehicle, int depth = 0)
+{
+    reader.Require(depth < 24, "Vehicle definition chunks are nested too deeply");
+    reader.Each_Chunk([&](uint32 part) {
+        if (part == DefinitionVariables || part == VehicleDefinitionVariables) {
+            reader.Each_Micro([&](uint32 field) {
+                if (part == DefinitionVariables && field == 1) {
+                    definition_id = reader.Value<sint32>();
+                } else if (part == VehicleDefinitionVariables && field == 1) {
+                    vehicle.Kind = reader.Value<sint32>();
+                } else if (part == VehicleDefinitionVariables && field == 32) {
+                    vehicle.Seats = reader.Value<sint32>();
+                }
+            });
+        } else if (part == TransitionVariables) {
+            // TransitionDataClass stores the basis, center and half extents in vehicle space.
+            int type = -1;
+            std::optional<OBBoxClass> zone;
+            std::optional<Vector3> exit;
+            reader.Each_Micro([&](uint32 field) {
+                if (field == 1) {
+                    type = reader.Value<sint32>();
+                } else if (field == 2) {
+                    const auto box = reader.Value<std::array<float, 15>>();
+                    reader.Require(std::all_of(box.begin(), box.end(), [](float v) { return std::isfinite(v); }) &&
+                        std::all_of(box.begin() + 12, box.end(), [](float v) { return v >= 0; }),
+                        "Invalid vehicle transition zone");
+                    zone.emplace(Vector3(box[9], box[10], box[11]), Vector3(box[12], box[13], box[14]),
+                        Matrix3(box[0], box[1], box[2], box[3], box[4], box[5], box[6], box[7], box[8]));
+                } else if (field == 4) {
+                    exit = Read_Transform(reader).Get_Translation();
+                }
+            });
+            if ((type == 8 || type == 4 || type == 5) && zone) {
+                vehicle.Entrances.push_back(*zone); // VEHICLE_ENTER and its legacy aliases.
+            } else if ((type == 9 || type == 6 || type == 7) && exit) {
+                vehicle.Exits.push_back(*exit); // VEHICLE_EXIT and its legacy aliases.
+            }
+        } else if (reader.Has_Children()) {
+            Read_Vehicle_Definition(reader, definition_id, vehicle, depth + 1);
+        }
+    });
+}
 
 void Read_Building_Definition(LevelReader &reader, int &definition_id, BuildingDefinition &building,
     bool &mct, int depth = 0)
@@ -137,6 +196,16 @@ void Load_Map_Definitions(const GameDataFile &data, MapDefinitions &definitions)
     reader.In_Chunk(CHUNKID_SAVELOAD_DEFMGR, [&] {
         reader.In_Chunk(DefinitionObjects, [&] {
             reader.Each_Chunk([&](uint32 id) {
+                if (id == CHUNKID_GAME_OBJECT_DEF_VEHICLE) {
+                    int definition_id = 0;
+                    VehicleDefinition vehicle;
+                    reader.In_Chunk(FactoryData, [&] { Read_Vehicle_Definition(reader, definition_id, vehicle); });
+                    reader.Require(definition_id > 0 && vehicle.Kind >= VehicleDefinition::Car &&
+                        vehicle.Kind <= VehicleDefinition::Turret && vehicle.Seats >= 0 && vehicle.Seats <= 32,
+                        "Invalid vehicle definition");
+                    definitions.Vehicles[definition_id] = std::move(vehicle);
+                    return;
+                }
                 const bool aggregate = id == PHYSICS_CHUNKID_BUILDINGAGGREGATEDEF;
                 if (aggregate || Is_Building(id - 1)) { // A building's definition follows its object factory.
                     int definition_id = 0;
@@ -276,13 +345,16 @@ void Read_Building_Parts(LevelReader &reader, HeadlessLevel::Building &building,
     });
 }
 
-void Read_Static_Parts(LevelReader &reader, HeadlessLevel::StaticObject &object, int depth)
+void Read_Physics_Parts(LevelReader &reader, HeadlessLevel::StaticObject &object, int depth,
+    uint32 *saved_pointer = nullptr)
 {
-    reader.Require(depth < 24, "Static object chunks are nested too deeply");
+    reader.Require(depth < 24, "Physics object chunks are nested too deeply");
     reader.Each_Chunk([&](uint32 part) {
         if (part == PhysVariables || part == ModelVariables) {
             reader.Each_Micro([&](uint32 field) {
-                if (part == PhysVariables && field == 3) {
+                if (part == PhysVariables && field == 2 && saved_pointer) {
+                    *saved_pointer = reader.Value<uint32>(); // PhysClass's EditableClass base.
+                } else if (part == PhysVariables && field == 3) {
                     object.Flags = reader.Value<uint32>();
                 } else if (part == PhysVariables && field == 6) {
                     object.DefinitionId = reader.Value<sint32>();
@@ -295,8 +367,71 @@ void Read_Static_Parts(LevelReader &reader, HeadlessLevel::StaticObject &object,
                 }
             });
         } else if (reader.Has_Children()) {
-            Read_Static_Parts(reader, object, depth + 1);
+            Read_Physics_Parts(reader, object, depth + 1, saved_pointer);
         }
+    });
+}
+
+struct SavedVehicle {
+    HeadlessLevel::Vehicle State;
+    uint32 PhysicsPointer = 0;
+};
+
+void Read_Vehicle_Parts(LevelReader &reader, SavedVehicle &vehicle, int depth = 0)
+{
+    reader.Require(depth < 24, "Vehicle inheritance chunks are nested too deeply");
+    reader.Each_Chunk([&](uint32 part) {
+        switch (part) {
+        case GameObjectVariables:
+        case DamageableVariables:
+        case PhysicalObjectVariables:
+        case DefenseVariables:
+            reader.Each_Micro([&](uint32 field) {
+                if (part == GameObjectVariables && field == 2) {
+                    vehicle.State.DefinitionId = reader.Value<sint32>();
+                } else if (part == DamageableVariables && field == 1) {
+                    vehicle.State.PlayerType = reader.Value<sint32>();
+                } else if (part == PhysicalObjectVariables && field == 10) {
+                    vehicle.PhysicsPointer = reader.Value<uint32>();
+                } else if (part == DefenseVariables) {
+                    switch (field) {
+                    case 3: vehicle.State.Health = reader.Value<float>(); break;
+                    case 6: vehicle.State.Shield = reader.Value<float>(); break;
+                    case 8: vehicle.State.ShieldSaveId = reader.Value<sint32>(); break;
+                    }
+                }
+            });
+            break;
+        default:
+            if (reader.Has_Children()) {
+                Read_Vehicle_Parts(reader, vehicle, depth + 1);
+            }
+        }
+    });
+}
+
+void Read_Vehicle_Physics(LevelReader &reader, std::map<uint32, HeadlessLevel::StaticObject> &physics)
+{
+    reader.In_Chunk(DynamicDataScene, [&] {
+        reader.Each_Chunk([&](uint32 id) {
+            if (id != DynamicObjectList) {
+                return;
+            }
+            reader.Each_Chunk([&](uint32 record) {
+                if (record != DynamicObjectRecord) {
+                    return;
+                }
+                reader.Each_Chunk([&](uint32) {
+                    // The Windows save links the game object to the PhysClass base pointer.
+                    HeadlessLevel::StaticObject object;
+                    uint32 saved_pointer = 0;
+                    Read_Physics_Parts(reader, object, 0, &saved_pointer);
+                    if (const auto wanted = physics.find(saved_pointer); wanted != physics.end()) {
+                        wanted->second = std::move(object);
+                    }
+                });
+            });
+        });
     });
 }
 
@@ -378,7 +513,7 @@ void HeadlessLevel::Load_Static(const GameDataFile &data)
                             reader.Each_Chunk([&](uint32 factory) {
                                 reader.Require(object.FactoryId == 0, "Static object has multiple factories");
                                 object.FactoryId = factory;
-                                Read_Static_Parts(reader, object, 0);
+                                Read_Physics_Parts(reader, object, 0);
                             });
                             reader.Require(object.FactoryId != 0, "Static object is missing its factory");
                             LevelStaticObjects.push_back(std::move(object));
@@ -419,6 +554,7 @@ void HeadlessLevel::Load_Dynamic(const GameDataFile &data, const GameDataFile &d
     }
     LevelReader reader(data);
     reader.In_Chunk(LevelData, [&] {
+        std::vector<SavedVehicle> vehicles;
         reader.In_Chunk(CHUNKID_COMBAT, [&] {
             reader.Each_Chunk([&](uint32 part) {
                 if (part == CombatSpawners) {
@@ -430,6 +566,12 @@ void HeadlessLevel::Load_Dynamic(const GameDataFile &data, const GameDataFile &d
                 } else if (part == GameObjectManager) {
                     reader.In_Chunk(GameObjects, [&] {
                         reader.Each_Chunk([&](uint32 factory) {
+                            if (factory == CHUNKID_GAME_OBJECT_VEHICLE) {
+                                SavedVehicle vehicle;
+                                reader.In_Chunk(FactoryData, [&] { Read_Vehicle_Parts(reader, vehicle); });
+                                vehicles.push_back(std::move(vehicle));
+                                return;
+                            }
                             if (!Is_Building(factory)) {
                                 return;
                             }
@@ -461,6 +603,42 @@ void HeadlessLevel::Load_Dynamic(const GameDataFile &data, const GameDataFile &d
                 }
             });
         });
+        if (vehicles.empty()) {
+            return;
+        }
+        std::map<uint32, StaticObject> physics;
+        for (const auto &vehicle : vehicles) {
+            if (vehicle.PhysicsPointer != 0) {
+                physics.try_emplace(vehicle.PhysicsPointer);
+            }
+        }
+        LevelReader physics_reader(data);
+        physics_reader.In_Chunk(LevelData, [&] {
+            physics_reader.In_Chunk(PHYSICS_CHUNKID_DYNAMIC_DATA_SUBSYSTEM, [&] {
+                Read_Vehicle_Physics(physics_reader, physics);
+            });
+        });
+        for (auto &saved : vehicles) {
+            auto &vehicle = saved.State;
+            const auto definition = map.Vehicles.find(vehicle.DefinitionId);
+            if (definition == map.Vehicles.end() || definition->second.Kind == VehicleDefinition::Flying) {
+                continue;
+            }
+            const auto part = physics.find(saved.PhysicsPointer);
+            reader.Require(part != physics.end() && !part->second.AssetName.empty() && part->second.AssetName.size() < 256,
+                "Vehicle is missing its saved physics model");
+            reader.Require(std::isfinite(vehicle.Health) && vehicle.Health >= 0 &&
+                std::isfinite(vehicle.Shield) && vehicle.Shield >= 0, "Invalid vehicle defense data");
+            vehicle.Model = part->second.AssetName;
+            vehicle.Transform = part->second.Transform;
+            vehicle.Seats = definition->second.Seats;
+            vehicle.UsesVehiclePhysics = definition->second.Kind != VehicleDefinition::Turret;
+            if (vehicle.UsesVehiclePhysics) {
+                vehicle.Entrances = definition->second.Entrances;
+                vehicle.Exits = definition->second.Exits;
+            }
+            LevelVehicles.push_back(std::move(vehicle));
+        }
     });
 }
 

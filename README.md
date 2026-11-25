@@ -171,6 +171,14 @@ original maximum health. Repairs to allies award half the damage points for
 the amount restored. A beam can also disarm enemy C4 and proximity mines.
 The server sends the original harmless disarm effect and removes the charge.
 
+Linux loads the ground vehicles and stationary turrets placed directly in a
+map's saved scene and sends them to clients. Use the action key at a ground
+vehicle's original entry zone to take the driver seat. Use it again to leave
+at an unobstructed exit. A later client receives the occupied seat, and the
+server clears it if the driver disconnects. Vehicles stay parked in this
+version. Driving, passenger seats, vehicle weapons, and AI turret behavior
+still need to be ported.
+
 `TimeLimitMinutes` starts counting down when the server starts the loaded map.
 Clients receive the remaining round time when joining and after loading the
 map. A value of `0` disables the time limit. When the timer expires, the server
@@ -211,6 +219,9 @@ delay, selected trigger radius, late-join replication, and a single detonation
 when the opposing soldier moves into range.
 The repair fixture verifies the unlimited clip, capped repairs, scoring,
 the building repair setting, and disarming remote C4 and proximity mines.
+The vehicle fixture checks the legacy save pointer and packet layout, entry
+range, exclusive driver occupancy, late joins, exit placement, disconnects,
+and vehicle removal on map reset.
 
 On Linux arm64 and with the Linux amd64 build running under QEMU, graphical EA
 1.038 Windows clients loaded `C&C_Field.mix`, spawned and displayed another

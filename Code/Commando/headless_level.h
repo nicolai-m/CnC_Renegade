@@ -10,6 +10,7 @@
 
 #include "matrix3d.h"
 #include "mixarchive.h"
+#include "obbox.h"
 
 class HeadlessLevel {
 public:
@@ -49,6 +50,20 @@ public:
         float DeathPoints = 0;
     };
 
+    struct Vehicle {
+        int DefinitionId = 0;
+        int PlayerType = 0;
+        int Seats = 0;
+        bool UsesVehiclePhysics = false;
+        float Health = 0;
+        float Shield = 0;
+        int ShieldSaveId = 0;
+        std::string Model;
+        Matrix3D Transform{true};
+        std::vector<OBBoxClass> Entrances;
+        std::vector<Vector3> Exits;
+    };
+
     struct StaticObject {
         std::uint32_t FactoryId = 0;
         std::uint32_t InstanceId = 0;
@@ -68,6 +83,7 @@ public:
     const std::vector<StaticObject> &Static_Objects() const { return LevelStaticObjects; }
     const std::vector<Spawner> &Spawners() const { return LevelSpawners; }
     const std::vector<Building> &Buildings() const { return LevelBuildings; }
+    const std::vector<Vehicle> &Vehicles() const { return LevelVehicles; }
     std::size_t Count_Player_Spawns(int player_type) const;
 
     // Returns indices into Static_Objects() for the intersected tree nodes.
@@ -97,6 +113,7 @@ private:
     std::vector<StaticObject> LevelStaticObjects;
     std::vector<Spawner> LevelSpawners;
     std::vector<Building> LevelBuildings;
+    std::vector<Vehicle> LevelVehicles;
 };
 
 #endif // HEADLESS_LEVEL_H

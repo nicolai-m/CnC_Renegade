@@ -786,6 +786,7 @@ int main(int argc, char **argv)
                   << settings.Maps.front() << '\n'
                   << "Loaded headless scene: " << level.Static_Objects().size() << " static objects in "
                   << level.Node_Count() << " spatial nodes, " << level.Buildings().size() << " buildings, "
+                  << level.Vehicles().size() << " vehicles, "
                   << level.Spawners().size() << " spawners (" << level.Count_Player_Spawns(PLAYERTYPE_NOD)
                   << " Nod and " << level.Count_Player_Spawns(PLAYERTYPE_GDI) << " GDI soldier starts)\n";
         Report_Static_Collision(collision);

@@ -82,6 +82,17 @@ bool HeadlessSimulation::Set_Move_Input(int player_id, const Vector2 &direction)
     return true;
 }
 
+void HeadlessSimulation::Set_Soldier_Vehicle_State(int player_id, const Vector3 &position, bool seated)
+{
+    auto &actor = Soldiers.at(player_id);
+    actor.State.Position = position;
+    actor.State.Velocity.Set(0, 0, 0);
+    actor.State.Grounded = !seated;
+    actor.MoveInput.Set(0, 0);
+    actor.VerticalSpeed = 0;
+    actor.Seated = seated;
+}
+
 void HeadlessSimulation::Advance(Clock::duration elapsed)
 {
     if (elapsed <= Clock::duration::zero()) {
@@ -131,6 +142,9 @@ void HeadlessSimulation::Tick()
 {
     for (auto &entry : Soldiers) {
         auto &actor = entry.second;
+        if (actor.Seated) {
+            continue;
+        }
         auto &soldier = actor.State;
         const auto previous_position = soldier.Position;
         actor.VerticalSpeed -= Gravity * TickSeconds;
