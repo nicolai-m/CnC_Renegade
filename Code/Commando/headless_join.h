@@ -13,6 +13,7 @@
 
 struct HeadlessJoinOptions {
     std::string Map;
+    std::u16string Owner = u"FDS";
     std::u16string Title = u"Dedicated Renegade Server";
     std::u16string Motd;
     std::u16string Password;
@@ -31,6 +32,7 @@ public:
     void Receive(cPacket &packet, int peer_id);
     void Disconnected(int peer_id);
     void Close_Pending();
+    void Write_Lan_Announcement(cPacket &packet, uint32 address, uint32 sequence, bool hosting) const;
 
 private:
     struct Peer {
@@ -44,6 +46,7 @@ private:
 
     void Receive_Bio(cPacket &packet, int peer_id, Peer &peer);
     void Set_Loading(int peer_id, Peer &peer, bool loading);
+    void Write_Game_Info(cPacket &packet, uint32 address) const;
     void Send_Game_Options(int recipient);
     void Send_Game_Data(int recipient);
     void Send_Team(int recipient, int team);
@@ -54,6 +57,7 @@ private:
     HeadlessPlayerSession &Session;
     const HeadlessJoinData &Data;
     const HeadlessJoinOptions &Options;
+    const uint32 MapCrc;
     std::u16string PendingName;
     std::map<int, Peer> Peers;
     std::set<int> Closing;

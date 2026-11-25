@@ -89,11 +89,19 @@ data. The server computes the original version key from the build number,
 `strings.tdb`, and the compatibility file list. With `--check`, it prints the
 computed key. Without `ClientBuildNumber`, the bootstrap refuses joins.
 
+With joins enabled, the server announces the game on UDP port `3373` once per
+second so it appears in the original client's LAN list. Use `--bind` with the
+server's LAN IPv4 address, or `0.0.0.0` to announce on all broadcast-capable
+IPv4 interfaces. The default loopback binding stays local. To send the
+announcement to a specific broadcast or unicast address, use
+`--lan-destination IPV4`. Give each server a distinct `[Server] Nickname` when
+running multiple servers on the same LAN.
+
 The join sends the original teams and game options and waits for the client's
 post-load biography before creating its player and soldier objects. Connected
 peers receive position and movement updates for the soldiers known to them.
 The two-client UDP fixture covers login, map readiness, movement replication,
-and object removal when a player leaves.
+object removal when a player leaves, and LAN announcements and withdrawal.
 
 On Linux arm64 and with the Linux amd64 build running under QEMU, graphical EA
 1.038 Windows clients loaded `C&C_Field.mix`, spawned and displayed another
@@ -101,8 +109,8 @@ player's movement. The test used a separate copy of the client with
 `C&C_Field.mix` as the only `.mix` map in `Data`. Adding
 `C&C_Under.mix` to that copy reproduced the client's "Missing map" error on
 the next join to `C&C_Field.mix`. Removing the extra map restored the join.
-Graphical testing on native Linux amd64, weapons, match rules, map rotation,
-and server discovery are still pending.
+Graphical testing on native Linux amd64, weapons, match rules, and map rotation
+are still pending.
 
 
 ### Level Edit (Public Release)

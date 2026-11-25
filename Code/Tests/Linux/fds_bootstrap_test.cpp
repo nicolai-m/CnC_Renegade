@@ -686,6 +686,81 @@ unsigned short JoinPort;
 uint32 JoinKey;
 const uint32 TestMapCRC = CRC::String("C&C_TEST.MIX");
 
+int Check_Game_Info(cPacket &packet)
+{
+    Check(Field<uint32>(packet) == htonl(INADDR_LOOPBACK), "Wrong advertised server address");
+    WCHAR owner[64];
+    WCHAR title[64];
+    packet.Get_Wide_Terminated_String(owner, 64);
+    packet.Get_Wide_Terminated_String(title, 64);
+    Check(std::u16string(owner) == u"FixtureHost" && std::u16string(title) == u"Join fixture" &&
+        Field<int>(packet) == JoinPort, "Game info did not describe this server");
+    const int players = Field<int>(packet);
+    Check(Field<int>(packet) == 16 && Field<uint32>(packet) == JoinKey &&
+        Field<uint32>(packet) != 0 && Field<uint32>(packet) != 0, "Wrong version or capacity in game info");
+    Check(Field<bool>(packet) && !Field<bool>(packet) && Field<bool>(packet) &&
+        !Field<bool>(packet) && !Field<bool>(packet), "Incorrect game info flags");
+    Check(Field<uint32>(packet) == TestMapCRC && Field<uint32>(packet) == 0, "Wrong map in game info");
+    return players;
+}
+
+class LanReceiver {
+public:
+    LanReceiver()
+    {
+        cNetUtil::Create_Unbound_Socket(Socket);
+        sockaddr_in address{};
+        cNetUtil::Create_Local_Address(&address, 3373);
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (Socket == INVALID_SOCKET || bind(Socket, reinterpret_cast<const sockaddr *>(&address), sizeof(address)) != 0) {
+            cNetUtil::Close_Socket(Socket);
+            throw std::runtime_error("Could not listen on the original LAN discovery port");
+        }
+    }
+
+    LanReceiver(const LanReceiver &) = delete;
+    LanReceiver &operator=(const LanReceiver &) = delete;
+
+    ~LanReceiver() { cNetUtil::Close_Socket(Socket); }
+
+    void Expect(bool hosting, int players = 0)
+    {
+        const auto deadline = std::chrono::steady_clock::now() + 3s;
+        do {
+            cPacket packet;
+            const auto size = recv(Socket, packet.Get_Data(), packet.Get_Max_Size(), MSG_TRUNC);
+            if (size < 0 && (errno == EAGAIN || errno == EINTR)) {
+                std::this_thread::sleep_for(5ms);
+                continue;
+            }
+            Check(size > 0 && size <= packet.Get_Max_Size(), "Invalid LAN announcement length");
+            packet.Set_Bit_Length(size * 8);
+            Check(Field<BYTE>(packet) == 0, "LAN announcement was not a raw position message");
+            WCHAR sender[64];
+            packet.Get_Wide_Terminated_String(sender, 64);
+            Check(std::u16string(sender) == u"FixtureHost", "Wrong LAN announcer");
+            const auto sequence = Field<uint32>(packet);
+            Check(sequence > LastSequence, "LAN announcement sequence did not advance");
+            LastSequence = sequence;
+            const bool active = Field<bool>(packet);
+            int count = 0;
+            if (active) {
+                Check(Field<int>(packet) == 2, "LAN announcement was not for C&C mode");
+                count = Check_Game_Info(packet);
+            }
+            Check(packet.Get_Bits_Remaining() < 8, "Unexpected data in LAN announcement");
+            if (active == hosting && count == players) {
+                return;
+            }
+        } while (std::chrono::steady_clock::now() < deadline);
+        throw std::runtime_error("Timed out waiting for a LAN announcement");
+    }
+
+private:
+    SOCKET Socket = INVALID_SOCKET;
+    uint32 LastSequence = 0;
+};
+
 void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
 {
     const int object = Field<int>(packet);
@@ -713,19 +788,7 @@ void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
         break;
     case 1008: { // cGameOptionsEvent.
         Check(client.Teams == std::set<int>{PLAYERTYPE_NOD, PLAYERTYPE_GDI}, "Teams must arrive before game options");
-        Check(Field<uint32>(packet) == htonl(INADDR_LOOPBACK), "Wrong address in game options");
-        WCHAR owner[64];
-        WCHAR title[64];
-        packet.Get_Wide_Terminated_String(owner, 64);
-        packet.Get_Wide_Terminated_String(title, 64);
-        Check(std::u16string(owner) == u"FDS" && std::u16string(title) == u"Join fixture" &&
-            Field<int>(packet) == JoinPort, "Game options did not describe this server");
-        (void)Field<int>(packet); // Connected player count.
-        Check(Field<int>(packet) == 16 && Field<uint32>(packet) == JoinKey &&
-            Field<uint32>(packet) != 0 && Field<uint32>(packet) != 0, "Wrong version or capacity in game options");
-        Check(Field<bool>(packet) && !Field<bool>(packet) && Field<bool>(packet) &&
-            !Field<bool>(packet) && !Field<bool>(packet), "Incorrect game option flags");
-        Check(Field<uint32>(packet) == TestMapCRC && Field<uint32>(packet) == 0, "Wrong map in game options");
+        Check_Game_Info(packet);
         Check(Field<int>(packet) == 23 && Field<int>(packet) == 1 &&
             Field<int>(packet) == 10 && Field<int>(packet) == 0, "Wrong second-tier game settings");
         ULONG flags;
@@ -853,7 +916,8 @@ void Send_Bio(cConnection &client, const WCHAR *name, int team, int id_offset, c
     client.Send_Packet_To_Individual(packet, SERVER_RHOST_ID, SEND_RELIABLE);
 }
 
-void Check_Original_Join(unsigned short port, const std::string &definitions, const std::string &armor)
+void Check_Original_Join(unsigned short port, const std::string &definitions, const std::string &armor,
+    LanReceiver &lan)
 {
     Check(cNetUtil::Protocol_Init(false), "IPv4 unavailable for the join test");
     JoinPort = port;
@@ -861,6 +925,7 @@ void Check_Original_Join(unsigned short port, const std::string &definitions, co
     auto ddb_crc = CRC::Memory(reinterpret_cast<const unsigned char *>(definitions.data()), definitions.size());
     const auto data_crc = CRC::Memory(reinterpret_cast<const unsigned char *>(armor.data()), armor.size(), ddb_crc);
     JoinKey = static_cast<uint32>(CRCEngine()(version.data(), version.size())) ^ data_crc;
+    lan.Expect(true, 0);
 
     auto refuse = [&](const WCHAR *name, const WCHAR *password, uint32 key, REFUSAL_CODE expected) {
         cConnection client;
@@ -896,6 +961,7 @@ void Check_Original_Join(unsigned short port, const std::string &definitions, co
     Pump_Clients({&first, &second}, [&] {
         return SecondJoinClient.HasGameData && FirstJoinClient.Soldiers.size() == 2 && SecondJoinClient.Soldiers.size() == 2;
     });
+    lan.Expect(true, 2);
 
     cPacket movement;
     Write_Movement(movement, FirstControlObject, 0, first_soldier, 8);
@@ -914,6 +980,7 @@ void Check_Original_Join(unsigned short port, const std::string &definitions, co
     Pump_Clients({&first, &second}, [&] {
         return SecondJoinClient.Deleted.count(first_soldier) && SecondJoinClient.Deleted.count(FirstJoinClient.Players.at(1));
     });
+    lan.Expect(true, 1);
 }
 
 } // namespace
@@ -939,7 +1006,7 @@ int main(int argc, char **argv)
         const auto collision_data = Collision_Data();
         Write_Archive(data / "C&C_Test.mix", {{"C&C_TEST.LDD", dynamic_data}, {"C&C_TEST.LSD", static_data},
             {"C&C_TEST.DEP", dependencies}, {"COLLIDERS.W3D", collision_data}});
-        std::ofstream(master) << "[Server]\r\nConfig=settings.ini\r\nGameType=LAN\r\nPort=0\r\n";
+        std::ofstream(master) << "[Server]\r\nConfig=settings.ini\r\nGameType=LAN\r\nPort=0\r\nNickname=FixtureHost\r\n";
         std::ofstream(settings) << "[settings]\nMapName=c&c_test.MIX ; first map\nMaxPlayers=16\n";
 
         const MixArchive archive(data / "C&C_Test.mix");
@@ -1013,13 +1080,15 @@ int main(int argc, char **argv)
 
         std::ofstream(settings, std::ios::app) << "ClientBuildNumber=1234\nbGameTitle=Join fixture\nbMotd=Ready\n"
             "TimeLimitMinutes=23\nIsPassworded=yes\nbPassword=testpass\n";
-        FdsProcess joining(argv[1], fixture.Path, master);
+        LanReceiver lan;
+        FdsProcess joining(argv[1], fixture.Path, master, "--lan-destination", "127.0.0.1");
         try {
-            Check_Original_Join(joining.Wait_For_Port(), definitions, armor);
+            Check_Original_Join(joining.Wait_For_Port(), definitions, armor, lan);
         } catch (const std::exception &error) {
             throw std::runtime_error(std::string(error.what()) + "\n" + joining.Output());
         }
         joining.Stop();
+        lan.Expect(false);
 
         // The first entry claims an offset outside the archive's data section.
         {

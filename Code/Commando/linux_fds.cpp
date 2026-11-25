@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 #include <charconv>
 #include <chrono>
 #include <csignal>
@@ -8,6 +10,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -39,6 +42,7 @@ struct Options {
     fs::path DataDir = ".";
     std::string BindAddress = "127.0.0.1";
     std::optional<unsigned short> Port;
+    std::optional<in_addr> LanDestination;
     bool CheckOnly = false;
     bool Help = false;
 };
@@ -95,7 +99,8 @@ Options Parse_Options(int argc, char **argv)
             options.CheckOnly = true;
             continue;
         }
-        if (option != "--config" && option != "--data-dir" && option != "--bind" && option != "--port") {
+        if (option != "--config" && option != "--data-dir" && option != "--bind" && option != "--port" &&
+            option != "--lan-destination") {
             throw std::runtime_error("Unknown option: " + std::string(option));
         }
         if (++i == argc || std::string_view(argv[i]).empty() || std::string_view(argv[i]).substr(0, 2) == "--") {
@@ -107,8 +112,15 @@ Options Parse_Options(int argc, char **argv)
             options.DataDir = argv[i];
         } else if (option == "--bind") {
             options.BindAddress = argv[i];
-        } else {
+        } else if (option == "--port") {
             options.Port = Read_Port(argv[i], "--port");
+        } else {
+            in_addr destination{};
+            if (inet_pton(AF_INET, argv[i], &destination) != 1 || destination.s_addr == INADDR_ANY ||
+                IN_MULTICAST(ntohl(destination.s_addr))) {
+                throw std::runtime_error("--lan-destination must be a broadcast or unicast IPv4 address");
+            }
+            options.LanDestination = destination;
         }
     }
     return options;
@@ -222,6 +234,7 @@ Settings Load_Settings(const Options &options, const fs::path &data_dir)
 {
     auto ini = Read_Ini(options.Config);
     std::string port;
+    std::string nickname;
     const auto server = ini.find("server");
     if (server != ini.end()) {
         const auto game_type = Fold_Ascii(Setting(server->second, "gametype"));
@@ -229,6 +242,7 @@ Settings Load_Settings(const Options &options, const fs::path &data_dir)
             throw std::runtime_error("Only GameType=LAN is supported by the Linux bootstrap");
         }
         port = Setting(server->second, "port");
+        nickname = Setting(server->second, "nickname");
         const auto config = Setting(server->second, "config");
         if (!config.empty()) {
             const auto path = Find_Child(data_dir, config);
@@ -280,6 +294,9 @@ Settings Load_Settings(const Options &options, const fs::path &data_dir)
             throw std::runtime_error("ClientBuildNumber must be a positive 32-bit integer");
         }
         result.ClientBuild = number;
+        if (!nickname.empty()) {
+            result.Join.Owner = Legacy_Ini_String(nickname, 64, "Nickname");
+        }
         result.Join.Map = result.Maps.front();
         if (result.Join.Map.size() > 27 || Fold_Ascii(fs::path(result.Join.Map).extension().string()) != ".mix") {
             throw std::runtime_error("Client joins require a .mix map name of at most 27 bytes");
@@ -487,7 +504,130 @@ void Unexpected_Join(int)
     throw std::logic_error("Connection was admitted before a game session was ready");
 }
 
-int Run_Headless(const Settings &settings, const std::string &address, const in_addr &bind_address,
+class LanDiscovery {
+public:
+    using Clock = std::chrono::steady_clock;
+
+    LanDiscovery(const HeadlessJoin &join, in_addr bind_address, std::optional<in_addr> destination) : Join(join)
+    {
+        if (destination) {
+            Targets.push_back({bind_address, *destination});
+        } else {
+            Find_Broadcast_Targets(bind_address);
+        }
+        if (Targets.empty()) {
+            return;
+        }
+        cNetUtil::Create_Unbound_Socket(Socket);
+        if (Socket != INVALID_SOCKET && !Select_Source(bind_address, destination)) {
+            cNetUtil::Close_Socket(Socket);
+        }
+        if (Socket == INVALID_SOCKET) {
+            std::cerr << "FDS: could not open the LAN announcement socket\n";
+        } else {
+            std::cout << "LAN announcements on UDP port " << Port << '\n';
+        }
+    }
+
+    LanDiscovery(const LanDiscovery &) = delete;
+    LanDiscovery &operator=(const LanDiscovery &) = delete;
+
+    ~LanDiscovery() { cNetUtil::Close_Socket(Socket); }
+
+    void Tick(Clock::time_point now)
+    {
+        if (Socket != INVALID_SOCKET && now >= NextBroadcast) {
+            Send(true);
+            NextBroadcast = now + std::chrono::seconds(1);
+        }
+    }
+
+    void Withdraw()
+    {
+        if (Sequence != 0) {
+            Send(false);
+        }
+    }
+
+private:
+    struct Target {
+        in_addr Local;
+        in_addr Remote;
+    };
+
+    void Find_Broadcast_Targets(in_addr bind_address)
+    {
+        ifaddrs *list = nullptr;
+        if (getifaddrs(&list) != 0) {
+            std::cerr << "FDS: could not enumerate interfaces for LAN discovery\n";
+            return;
+        }
+        std::unique_ptr<ifaddrs, decltype(&freeifaddrs)> interfaces(list, freeifaddrs);
+        for (auto *entry = interfaces.get(); entry; entry = entry->ifa_next) {
+            constexpr unsigned flags = IFF_UP | IFF_BROADCAST;
+            if ((entry->ifa_flags & flags) != flags || (entry->ifa_flags & IFF_LOOPBACK) ||
+                !entry->ifa_addr || entry->ifa_addr->sa_family != AF_INET || !entry->ifa_broadaddr ||
+                entry->ifa_broadaddr->sa_family != AF_INET) {
+                continue;
+            }
+            const auto local = reinterpret_cast<const sockaddr_in *>(entry->ifa_addr)->sin_addr;
+            if (bind_address.s_addr == INADDR_ANY || bind_address.s_addr == local.s_addr) {
+                const auto remote = reinterpret_cast<const sockaddr_in *>(entry->ifa_broadaddr)->sin_addr;
+                Targets.push_back({local, remote});
+            }
+        }
+    }
+
+    bool Select_Source(in_addr bind_address, std::optional<in_addr> destination)
+    {
+        sockaddr_in local{};
+        cNetUtil::Create_Local_Address(&local, 0);
+        if (bind_address.s_addr != INADDR_ANY) {
+            local.sin_addr = bind_address;
+            return bind(Socket, reinterpret_cast<const sockaddr *>(&local), sizeof(local)) == 0;
+        }
+        if (destination) {
+            const auto remote = Destination(*destination);
+            socklen_t size = sizeof(local);
+            if (connect(Socket, reinterpret_cast<const sockaddr *>(&remote), sizeof(remote)) != 0 ||
+                getsockname(Socket, reinterpret_cast<sockaddr *>(&local), &size) != 0) {
+                return false;
+            }
+            Targets.front().Local = local.sin_addr;
+        }
+        return true;
+    }
+
+    static sockaddr_in Destination(in_addr address)
+    {
+        sockaddr_in remote{};
+        remote.sin_family = AF_INET;
+        remote.sin_port = htons(Port);
+        remote.sin_addr = address;
+        return remote;
+    }
+
+    void Send(bool hosting)
+    {
+        ++Sequence;
+        for (const auto &target : Targets) {
+            cPacket packet;
+            Join.Write_Lan_Announcement(packet, target.Local.s_addr, Sequence, hosting);
+            const auto remote = Destination(target.Remote);
+            sendto(Socket, packet.Get_Data(), packet.Get_Compressed_Size_Bytes(), 0,
+                reinterpret_cast<const sockaddr *>(&remote), sizeof(remote));
+        }
+    }
+
+    static constexpr unsigned short Port = 3373; // cLanChat::LAN_PORT.
+    const HeadlessJoin &Join;
+    std::vector<Target> Targets;
+    SOCKET Socket = INVALID_SOCKET;
+    Clock::time_point NextBroadcast{};
+    uint32 Sequence = 0;
+};
+
+int Run_Headless(const Settings &settings, const Options &options, const in_addr &bind_address,
     const LoadedGame &game)
 {
     if (std::signal(SIGINT, Request_Stop) == SIG_ERR || std::signal(SIGTERM, Request_Stop) == SIG_ERR) {
@@ -499,16 +639,18 @@ int Run_Headless(const Settings &settings, const std::string &address, const in_
     PacketManager.Set_Is_Server(true);
     cConnection server;
     if (!server.Init_As_Server(settings.Port, settings.MaxPlayers, true, ntohl(bind_address.s_addr), false)) {
-        throw std::runtime_error("Cannot bind UDP to " + address + ":" + std::to_string(settings.Port));
+        throw std::runtime_error("Cannot bind UDP to " + options.BindAddress + ":" + std::to_string(settings.Port));
     }
 
     HeadlessPlayerSession session(game.Collision, server);
     auto join_options = settings.Join;
     join_options.Address = bind_address.s_addr;
     std::optional<HeadlessJoin> join;
+    std::optional<LanDiscovery> discovery;
     if (game.Join) {
         server.Set_Bandwidth_Budget_Out(2000000); // Original BANDWIDTH_LANT1.
         join.emplace(server, session, *game.Join, join_options);
+        discovery.emplace(*join, bind_address, options.LanDestination);
         server.Install_Application_Acceptance_Handler([&](cPacket &packet) { return join->Accept(packet); });
         server.Install_Conn_Handler([&](int peer_id) { join->Connected(peer_id); });
     } else {
@@ -532,7 +674,7 @@ int Run_Headless(const Settings &settings, const std::string &address, const in_
         server.Destroy_Connection(peer_id);
         disconnect(peer_id);
     });
-    std::cout << "FDS bootstrap listening on " << address << ':' << server.Get_Local_Port()
+    std::cout << "FDS bootstrap listening on " << options.BindAddress << ':' << server.Get_Local_Port()
               << (join ? " (experimental client joins enabled)" : " (ClientBuildNumber unset; joins refused)")
               << std::endl;
     auto previous = HeadlessSimulation::Clock::now();
@@ -545,7 +687,13 @@ int Run_Headless(const Settings &settings, const std::string &address, const in_
         session.Advance(frame_start - previous);
         previous = frame_start;
         server.Service_Send(true);
+        if (discovery) {
+            discovery->Tick(frame_start);
+        }
         std::this_thread::sleep_until(frame_start + std::chrono::milliseconds(10));
+    }
+    if (discovery) {
+        discovery->Withdraw();
     }
     return 0;
 }
@@ -557,10 +705,12 @@ int main(int argc, char **argv)
     try {
         const Options options = Parse_Options(argc, argv);
         if (options.Help) {
-            std::cout << "Usage: renegade_fds [--config FILE] [--data-dir DIR] [--bind IPV4] [--port PORT] [--check]\n"
+            std::cout << "Usage: renegade_fds [--config FILE] [--data-dir DIR] [--bind IPV4] [--port PORT]\n"
+                         "                    [--lan-destination IPV4] [--check]\n"
                          "  --check       Check configuration and map data without opening a socket.\n"
                          "  --bind IPV4   Listen on this IPv4 address (default: 127.0.0.1).\n"
-                         "  --port PORT   Override the INI port (0 selects a free port).\n";
+                         "  --port PORT   Override the INI port (0 selects a free port).\n"
+                         "  --lan-destination IPV4   Send LAN announcements to this address on UDP port 3373.\n";
             return 0;
         }
         in_addr bind_address{};
@@ -586,7 +736,7 @@ int main(int argc, char **argv)
             }
             return 0;
         }
-        return Run_Headless(settings, options.BindAddress, bind_address, game);
+        return Run_Headless(settings, options, bind_address, game);
     } catch (const std::exception &error) {
         std::cerr << "FDS: " << error.what() << '\n';
         return 1;

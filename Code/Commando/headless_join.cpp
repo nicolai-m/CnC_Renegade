@@ -13,6 +13,8 @@ namespace {
 
 constexpr int HostedGameNumber = 1;
 constexpr unsigned MaxNickname = 64;
+constexpr BYTE LanMessagePosition = 0; // LAN_MESSAGE_POSITION.
+constexpr int CncGameType = 2; // cGameData::GAME_TYPE_CNC.
 
 template<class Char>
 bool Read_String(cPacket &packet, std::basic_string<Char> &output, unsigned limit)
@@ -70,7 +72,8 @@ uint32 Map_CRC(std::string map)
 
 HeadlessJoin::HeadlessJoin(cConnection &connection, HeadlessPlayerSession &session,
     const HeadlessJoinData &data, const HeadlessJoinOptions &options)
-    : Connection(connection), Session(session), Data(data), Options(options), Teams{NextObject--, NextObject--}
+    : Connection(connection), Session(session), Data(data), Options(options), MapCrc(Map_CRC(options.Map)),
+      Teams{NextObject--, NextObject--}
 {
 }
 
@@ -287,13 +290,22 @@ void HeadlessJoin::Send_Team(int recipient, int team)
     Connection.Send_Packet_To_Individual(packet, recipient, SEND_RELIABLE);
 }
 
-void HeadlessJoin::Send_Game_Options(int recipient)
+void HeadlessJoin::Write_Lan_Announcement(cPacket &packet, uint32 address, uint32 sequence, bool hosting) const
 {
-    cPacket packet;
-    Write_Creation(packet, NextObject--, NETCLASSID_GAMEOPTIONSEVENT, true);
-    const auto map_crc = Map_CRC(Options.Map);
-    packet.Add(Options.Address);
-    packet.Add_Wide_Terminated_String(u"FDS");
+    packet.Add(LanMessagePosition);
+    packet.Add_Wide_Terminated_String(Options.Owner.c_str());
+    packet.Add(sequence);
+    packet.Add(hosting);
+    if (hosting) {
+        packet.Add(CncGameType);
+        Write_Game_Info(packet, address);
+    }
+}
+
+void HeadlessJoin::Write_Game_Info(cPacket &packet, uint32 address) const
+{
+    packet.Add(address);
+    packet.Add_Wide_Terminated_String(Options.Owner.c_str());
     packet.Add_Wide_Terminated_String(Options.Title.c_str(), true);
     packet.Add(static_cast<int>(Connection.Get_Local_Port()));
     packet.Add(static_cast<int>(Peers.size()));
@@ -306,9 +318,15 @@ void HeadlessJoin::Send_Game_Options(int recipient)
     packet.Add(!Options.Password.empty());
     packet.Add(false); // Ranked.
     packet.Add(false); // Clan game.
-    packet.Add(map_crc);
+    packet.Add(MapCrc);
     packet.Add(0); // Mod CRC.
+}
 
+void HeadlessJoin::Send_Game_Options(int recipient)
+{
+    cPacket packet;
+    Write_Creation(packet, NextObject--, NETCLASSID_GAMEOPTIONSEVENT, true);
+    Write_Game_Info(packet, Options.Address);
     packet.Add(Options.TimeLimit);
     packet.Add(Options.RadarMode);
     packet.Add(10); // Intermission seconds.
@@ -324,7 +342,7 @@ void HeadlessJoin::Send_Game_Options(int recipient)
     packet.Add(static_cast<float>(Options.TimeLimit * 60));
     packet.Add(HostedGameNumber);
     packet.Add(0); // Mod CRC.
-    packet.Add(map_crc);
+    packet.Add(MapCrc);
     Connection.Send_Packet_To_Individual(packet, recipient, SEND_RELIABLE);
 }
 
