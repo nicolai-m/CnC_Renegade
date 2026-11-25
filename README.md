@@ -112,11 +112,13 @@ automatic reloads use the weapon's reserve.
 The server traces the stock minigunner's rifle and pistol shots against static
 map geometry and soldier collision boxes. Rifles use projectile travel time.
 The pistol resolves the hit immediately, as in the original game. Shield
-absorption and skin multipliers come from `armor.ini`. The server publishes
-health and shield updates and stops movement and firing at zero health.
+absorption and skin multipliers come from `armor.ini`. At zero health the
+server stops accepting the soldier's inputs. After two seconds it deletes
+the old soldier and spawns a new minigunner with the same team and fresh
+health, shield, and starting inventory. The player and round stay active.
 Set `IsFriendlyFirePermitted=yes` in `[Settings]` to enable damage between
 teammates. It defaults to off. Skeletal hit zones, damage to vehicles and
-buildings, combat respawns, and C4 placement and detonation remain open.
+buildings, and C4 placement and detonation remain open.
 
 `TimeLimitMinutes` starts counting down when the server starts the loaded map.
 Clients receive the remaining round time when joining and after loading the
@@ -134,8 +136,9 @@ tiebreaker. Scoring and combat-based victory rules are still being ported.
 The two-client UDP fixture covers login, map readiness, movement replication,
 the remaining time for a late join, spawn inventory, weapon selection visible
 to both peers, firing and reloads, cover, projectile travel, shield and health
-damage, blocked input at zero health, object removal, and LAN announcements
-and withdrawal. The round fixture advances the server clock through a timeout
+damage, blocked input at zero health, respawn with the original player and
+control objects, object removal, and LAN announcements and withdrawal.
+The round fixture advances the server clock through a timeout
 and checks the announced map, its spawn and position encoding, movement after
 a map reload, and the end of the map cycle.
 

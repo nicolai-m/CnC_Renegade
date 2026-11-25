@@ -729,6 +729,9 @@ int Run_Headless(const Settings &settings, const Options &options, const in_addr
             join->Close_Pending();
         }
         session.Advance(frame_start - previous);
+        if (join) {
+            join->Update_Respawns();
+        }
         previous = frame_start;
         server.Service_Send(true);
         if (discovery) {

@@ -25,6 +25,8 @@ public:
     void Introduce_Soldier(int owner_id, int recipient, const HeadlessSoldierPreset &preset);
     void Set_Combat_Rules(const HeadlessArmorTable &armor, bool friendly_fire);
     void Set_Player_Loading(int peer_id, bool loading);
+    bool Soldier_Is_Dead(int peer_id) const;
+    void Remove_Soldier(int peer_id);
     void Remove_Player(int peer_id);
     void Reset_Map(const HeadlessCollision &collision);
     void Receive_Control(cPacket &packet, int peer_id);
@@ -67,6 +69,7 @@ private:
     };
 
     bool Read_Control(cPacket &packet, int peer_id, Peer &peer);
+    static void Clear_Soldier(Peer &peer);
     static void Select_Weapon(Peer &peer, ULONG controls);
     void Advance_Weapon(int player_id, Peer &peer, float seconds, ULONG fire_controls, bool reload);
     void Fire_Bullet(int player_id, const Peer &peer, const HeadlessBulletDefinition &definition);

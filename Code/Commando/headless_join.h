@@ -40,6 +40,7 @@ public:
         const HeadlessJoinOptions &options);
 
     bool Update_Round(Clock::time_point now);
+    void Update_Respawns();
     REFUSAL_CODE Accept(cPacket &packet);
     void Connected(int peer_id);
     void Receive(cPacket &packet, int peer_id);
@@ -58,12 +59,14 @@ private:
         int SoldierObject = 0;
         std::size_t MapIndex = 0; // Map last sent to this player.
         LoadState State = LoadState::Loading;
+        std::optional<Clock::time_point> RespawnAt;
     };
 
     void Receive_Bio(cPacket &packet, int peer_id, Peer &peer);
     void Set_Loading(int peer_id, Peer &peer, bool loading);
     void Create_Player(int peer_id, Peer &peer);
-    void Spawn_Player(int peer_id, Peer &peer);
+    void Spawn_Player(int peer_id, Peer &peer, bool respawning = false);
+    void Delete_Soldier(Peer &peer);
     void Request_Reload(int peer_id, Peer &peer);
     void Begin_Intermission();
     void Restart_Round();

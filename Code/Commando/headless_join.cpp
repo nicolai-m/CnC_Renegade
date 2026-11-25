@@ -6,6 +6,7 @@
 
 #include "crc.h"
 #include "netclassids.h"
+#include "humanstate.h"
 #include "networkobject.h"
 #include "playertype.h"
 
@@ -17,6 +18,8 @@ constexpr int CncGameType = 2; // cGameData::GAME_TYPE_CNC.
 constexpr int TimeExpired = 2; // cGameData::WIN_TYPE_TIME.
 constexpr int UnknownPlayer = -99999; // PLAYER_ID_UNKNOWN.
 constexpr std::chrono::seconds IntermissionDuration{10};
+// Headless soldiers wait out the original corpse interval starting at zero health.
+constexpr std::chrono::duration<float> RespawnDelay{CORPSE_PERSIST_TIME};
 
 template<class Char>
 bool Read_String(cPacket &packet, std::basic_string<Char> &output, unsigned limit)
@@ -97,6 +100,25 @@ bool HeadlessJoin::Update_Round(Clock::time_point now)
     return true;
 }
 
+void HeadlessJoin::Update_Respawns()
+{
+    if (IntermissionEnd) {
+        return;
+    }
+    for (auto &[id, peer] : Peers) {
+        if (peer.State != LoadState::Ready || !Session.Soldier_Is_Dead(id)) {
+            continue;
+        }
+        if (!peer.RespawnAt) {
+            peer.RespawnAt = FrameTime + std::chrono::duration_cast<Clock::duration>(RespawnDelay);
+        } else if (FrameTime >= *peer.RespawnAt) {
+            Delete_Soldier(peer);
+            Session.Remove_Soldier(id);
+            Spawn_Player(id, peer, true);
+        }
+    }
+}
+
 void HeadlessJoin::Begin_Intermission()
 {
     IntermissionEnd = FrameTime + IntermissionDuration;
@@ -121,14 +143,8 @@ void HeadlessJoin::Restart_Round()
     RoundEnd = FrameTime + std::chrono::minutes(Options.TimeLimit);
     ++HostedGameNumber;
     for (auto &[id, peer] : Peers) {
-        if (peer.SoldierObject != 0) {
-            for (const auto &[recipient, other] : Peers) {
-                if (other.PlayerObject != 0) {
-                    Delete_Object(recipient, peer.SoldierObject);
-                }
-            }
-            peer.SoldierObject = 0;
-        }
+        Delete_Soldier(peer);
+        peer.RespawnAt.reset();
     }
     Session.Reset_Map(Maps[MapIndex].Collision);
     Session.Set_Combat_Rules(Maps[MapIndex].Join.Armor, Options.FriendlyFire);
@@ -305,13 +321,14 @@ void HeadlessJoin::Request_Reload(int peer_id, Peer &peer)
     Send_Round_Result(peer_id);
 }
 
-void HeadlessJoin::Spawn_Player(int peer_id, Peer &peer)
+void HeadlessJoin::Spawn_Player(int peer_id, Peer &peer, bool respawning)
 {
     if (!Session.Attach_Player(peer_id, peer.Team, NextObject, Maps[MapIndex].Join.Soldiers[peer.Team])) {
         Closing.insert(peer_id);
         return;
     }
     peer.SoldierObject = NextObject--;
+    peer.RespawnAt.reset();
     const bool joining = peer.PlayerObject == 0;
     if (joining) {
         Create_Player(peer_id, peer);
@@ -325,17 +342,21 @@ void HeadlessJoin::Spawn_Player(int peer_id, Peer &peer)
         if (other.PlayerObject == 0) {
             continue;
         }
-        if (!joining && other.State == LoadState::Ready) {
+        if (!respawning && !joining && other.State == LoadState::Ready) {
             Send_Player(id, peer_id, peer, false);
         }
         if (other.SoldierObject != 0) {
-            Introduce_Soldier(peer_id, id, other);
-            if (id != peer_id) {
+            if (!respawning) {
+                Introduce_Soldier(peer_id, id, other);
+            }
+            if (respawning || id != peer_id) {
                 Introduce_Soldier(id, peer_id, peer);
             }
         }
     }
-    Send_Game_Data(peer_id);
+    if (!respawning) {
+        Send_Game_Data(peer_id);
+    }
 }
 
 void HeadlessJoin::Set_Loading(int peer_id, Peer &peer, bool loading)
@@ -531,6 +552,18 @@ void HeadlessJoin::Delete_Object(int recipient, int object)
         cPacket packet;
         Write_Header(packet, object, 0, true);
         Connection.Send_Packet_To_Individual(packet, recipient, SEND_RELIABLE);
+    }
+}
+
+void HeadlessJoin::Delete_Soldier(Peer &peer)
+{
+    if (peer.SoldierObject != 0) {
+        for (const auto &[recipient, other] : Peers) {
+            if (other.PlayerObject != 0) {
+                Delete_Object(recipient, peer.SoldierObject);
+            }
+        }
+        peer.SoldierObject = 0;
     }
 }
 

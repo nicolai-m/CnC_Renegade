@@ -162,6 +162,27 @@ void HeadlessPlayerSession::Set_Player_Loading(int peer_id, bool loading)
     }
 }
 
+bool HeadlessPlayerSession::Soldier_Is_Dead(int peer_id) const
+{
+    const auto peer = Peers.find(peer_id);
+    return peer != Peers.end() && peer->second.SoldierObject != 0 && peer->second.Health == 0;
+}
+
+void HeadlessPlayerSession::Clear_Soldier(Peer &peer)
+{
+    // The client control object belongs to the connection and survives the body.
+    peer = Peer{0, Vector2(0, 0), Vector3(0, 0, 0), peer.ControlObject};
+    peer.Ready = false;
+}
+
+void HeadlessPlayerSession::Remove_Soldier(int peer_id)
+{
+    Simulation.Remove_Soldier(peer_id);
+    if (const auto peer = Peers.find(peer_id); peer != Peers.end()) {
+        Clear_Soldier(peer->second);
+    }
+}
+
 void HeadlessPlayerSession::Remove_Player(int peer_id)
 {
     Peers.erase(peer_id);
@@ -178,15 +199,7 @@ void HeadlessPlayerSession::Reset_Map(const HeadlessCollision &collision)
     Bullets.clear();
     PublishElapsed = {};
     for (auto &[id, peer] : Peers) {
-        peer.Ready = false;
-        peer.SoldierObject = 0;
-        peer.MoveAxes.Set(0, 0);
-        peer.InputRemaining = {};
-        peer.Viewers.clear();
-        peer.Weapons.clear();
-        peer.WeaponSlot = 0;
-        peer.FireControls = 0;
-        peer.ReloadRequested = false;
+        Clear_Soldier(peer);
     }
 }
 

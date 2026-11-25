@@ -1336,10 +1336,11 @@ void Check_Original_Join(unsigned short port, const std::string &definitions, co
 
     const int second_control_id = FirstControlObject + 100000;
     cPacket sidestep;
-    Write_Movement(sidestep, second_control_id, 2, second_soldier, {0, -8, 0});
+    Write_Movement(sidestep, second_control_id, 2, second_soldier, {0, -8, 0}, 21.0f, 8, 0, secondary);
     second.Send_Packet_To_Individual(sidestep, SERVER_RHOST_ID, SEND_RELIABLE);
     wait(300ms);
     Check(SecondJoinClient.Y.at(second_soldier) <= 1.25f, "The target could not leave cover");
+    Check(SecondJoinClient.Rounds.at(second_soldier) == 233, "The target did not spend ammunition before dying");
     fire(primary, 120, aim_at_second());
     Check(defense(100, 50), "The rifle projectile arrived before its travel time");
     Pump_Clients({&first, &second}, [&] { return defense(82, 14); });
@@ -1362,6 +1363,36 @@ void Check_Original_Join(unsigned short port, const std::string &definitions, co
     Check(SecondJoinClient.Y.at(second_soldier) == dead_position &&
         FirstJoinClient.FireControls.at(second_soldier) == 0 && SecondJoinClient.SelectedWeapon.at(second_soldier) == 600,
         "A defeated soldier could still move, change weapons or fire");
+    Check(SecondJoinClient.Soldiers.at(2) == second_soldier && !SecondJoinClient.Deleted.count(second_soldier),
+        "The server removed the defeated soldier before the respawn delay");
+
+    const auto players = SecondJoinClient.Players;
+    const auto round_time = SecondJoinClient.GameDataTime;
+    const auto respawned = [&](const Join_Client_State &client) {
+        const auto soldier = client.Soldiers.find(2);
+        return client.Deleted.count(second_soldier) && soldier != client.Soldiers.end() && soldier->second != second_soldier;
+    };
+    Pump_Clients({&first, &second}, [&] { return respawned(FirstJoinClient) && respawned(SecondJoinClient); });
+    const int replacement = SecondJoinClient.Soldiers.at(2);
+    const float spawn_y = SecondJoinClient.Y.at(replacement);
+    Check(FirstJoinClient.Soldiers == SecondJoinClient.Soldiers && FirstJoinClient.Players == players &&
+        SecondJoinClient.Players == players && SecondJoinClient.Round == 1 && SecondJoinClient.GameDataTime == round_time,
+        "Replacing a soldier changed players or reloaded the round");
+    Check(std::abs(spawn_y - 2.0f) < 0.1f && SecondJoinClient.Rounds.at(replacement) == 240 &&
+        SecondJoinClient.SelectedWeapon.at(replacement) == 600,
+        "The replacement did not spawn with the same team's original health, position and loadout");
+
+    cPacket stale;
+    Write_Movement(stale, second_control_id, 0, second_soldier, {0, -8, 0});
+    second.Send_Packet_To_Individual(stale, SERVER_RHOST_ID, SEND_UNRELIABLE);
+    wait(300ms);
+    Check(SecondJoinClient.Y.at(replacement) == spawn_y, "Old soldier input reached the replacement");
+    cPacket resumed;
+    Write_Movement(resumed, second_control_id, 0, replacement, {0, -8, 0});
+    second.Send_Packet_To_Individual(resumed, SERVER_RHOST_ID, SEND_UNRELIABLE);
+    Pump_Clients({&first, &second}, [&] {
+        return FirstJoinClient.Y.at(replacement) < spawn_y - 0.4f && SecondJoinClient.Y.at(replacement) < spawn_y - 0.4f;
+    });
 
     const auto select = [&](ControlClass::BooleanControl button, int expected) {
         send_controls(1u << button, 0);
