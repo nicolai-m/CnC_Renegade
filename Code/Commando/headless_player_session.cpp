@@ -20,6 +20,7 @@
 #include "netclassids.h"
 #include "networkobject.h"
 #include "playertype.h"
+#include "sphere.h"
 
 namespace {
 
@@ -42,6 +43,7 @@ constexpr std::size_t MaxActiveBullets = 4096;
 constexpr std::size_t MaxActiveCharges = 4096;
 constexpr int TeamMineLimit = 30; // C4GameObj::Maintain_C4_Limit excludes timed charges.
 constexpr double ProximityCheckInterval = 0.25; // C4GameObj::Think.
+constexpr float ChargeHitRadius = 0.25f; // Approximate the bounding volume of the stock C4 models.
 
 int Building_State(const HeadlessLevel::Building &building, float health)
 {
@@ -68,10 +70,11 @@ HeadlessPlayerSession::HeadlessPlayerSession(const HeadlessCollision &collision,
     Init_Position_Encoders(collision, PositionEncoders);
 }
 
-void HeadlessPlayerSession::Set_Combat_Rules(const HeadlessArmorTable &armor, bool friendly_fire)
+void HeadlessPlayerSession::Set_Combat_Rules(const HeadlessArmorTable &armor, bool friendly_fire, bool repair_buildings)
 {
     Armor = &armor;
     FriendlyFire = friendly_fire;
+    CanRepairBuildings = repair_buildings;
     ArmorEncoder.Init(0, std::max<std::size_t>(1, armor.size()), 1);
 }
 
@@ -118,6 +121,8 @@ bool HeadlessPlayerSession::Attach_Player(int peer_id, int player_type, int sold
     auto &peer = Peers.insert_or_assign(peer_id, Peer{soldier_object_id, forward, target, control}).first->second;
     peer.Health = preset.Health;
     peer.Shield = preset.Shield;
+    peer.HealthMax = std::max(preset.Health, preset.HealthMax);
+    peer.ShieldMax = std::max(preset.Shield, preset.ShieldMax);
     peer.Skin = preset.Skin;
     peer.ShieldType = preset.ShieldType;
     peer.DamagePoints = preset.DamagePoints;
@@ -462,14 +467,15 @@ void HeadlessPlayerSession::Advance_Weapon(int player_id, Peer &peer, float seco
         peer.WeaponAction = WeaponState::Reloading;
         peer.WeaponTimeRemaining = weapon.ReloadSeconds;
     };
-    if (reload && peer.WeaponAction == WeaponState::Ready && weapon.ReserveRounds != 0) {
+    const bool can_reload = weapon.ClipSize > 0 && weapon.ReserveRounds != 0;
+    if (reload && peer.WeaponAction == WeaponState::Ready && can_reload) {
         start_reload();
     }
     while (seconds > 0) {
         if (peer.WeaponAction == WeaponState::Ready) {
-            if (weapon.ClipRounds == 0 && weapon.ReserveRounds != 0) {
+            if (weapon.ClipRounds == 0 && weapon.ReserveRounds != 0 && weapon.ClipSize > 0) {
                 start_reload();
-            } else if (mode && weapon.ClipRounds > 0) {
+            } else if (mode && weapon.ClipRounds != 0) {
                 peer.WeaponAction = WeaponState::Charging;
                 peer.WeaponTimeRemaining = mode->ChargeSeconds;
             } else {
@@ -486,7 +492,9 @@ void HeadlessPlayerSession::Advance_Weapon(int player_id, Peer &peer, float seco
             peer.WeaponAction = WeaponState::Firing;
             peer.WeaponTimeRemaining = mode ? mode->ShotInterval : weapon.PrimaryFire->ShotInterval;
             if (mode) {
-                weapon.ClipRounds = std::max(0, weapon.ClipRounds - mode->RoundCost);
+                if (weapon.ClipRounds > 0) {
+                    weapon.ClipRounds = std::max(0, weapon.ClipRounds - mode->RoundCost);
+                }
                 if (mode->Bullet) {
                     Fire_Bullet(player_id, peer, *mode->Bullet);
                 } else if (mode->Charge) {
@@ -546,13 +554,37 @@ bool HeadlessPlayerSession::Trace_Bullet(const Bullet &bullet, const Vector3 &en
     if (terrain && terrain->StartsInside) {
         return true;
     }
-    const auto target = Cast_Soldiers(LineSegClass(bullet.Position, end), bullet.Attack.ShooterObject,
-        terrain ? terrain->Fraction : 1.0f);
-    if (target) {
-        const auto &soldier = *Simulation.Find_Soldier(target->PeerId);
-        if (FriendlyFire || soldier.PlayerType != bullet.Attack.Team) {
-            Apply_Soldier_Damage(target->PeerId, Peers.at(target->PeerId), bullet.Attack);
+    const LineSegClass ray(bullet.Position, end);
+    const float terrain_fraction = terrain ? terrain->Fraction : 1.0f;
+    const auto target = Cast_Soldiers(ray, bullet.Attack.ShooterObject, terrain_fraction);
+    float charge_fraction = target ? target->Fraction : terrain_fraction;
+    auto charge = Charges.end();
+    for (auto it = Charges.begin(); it != Charges.end(); ++it) {
+        CastResultStruct hit;
+        hit.Fraction = charge_fraction;
+        if (!CollisionMath::Collide(ray, SphereClass(it->Position, ChargeHitRadius), &hit)) {
+            continue;
         }
+        // A mine's approximate hit sphere can extend through the surface it is stuck to.
+        if (collision.Cast_Ray(bullet.Position, it->Position, COLLISION_TYPE_PROJECTILE)) {
+            continue;
+        }
+        charge = it;
+        charge_fraction = hit.Fraction;
+    }
+    if (charge != Charges.end()) {
+        // An attached charge must not shield its host from a shot.
+        const auto host = Peers.find(charge->AttachedPeer);
+        if (host != Peers.end() && host->second.Ready && host->second.SoldierObject == charge->AttachedObject) {
+            Apply_Soldier_Damage(host->first, host->second, bullet.Attack);
+        }
+        if (Apply_Charge_Damage(*charge, bullet.Attack)) {
+            Charges.erase(charge);
+        }
+        return true;
+    }
+    if (target) {
+        Apply_Soldier_Damage(target->PeerId, Peers.at(target->PeerId), bullet.Attack);
         return true;
     }
     if (terrain) {
@@ -591,57 +623,86 @@ void HeadlessPlayerSession::Apply_Building_Damage(std::size_t index, bool mct, c
     }
     const auto &def = Simulation.Map_Collision().Level().Buildings()[index];
     auto &building = Buildings[index];
-    if (building.ObjectId == 0 || building.Health <= 0 || (!FriendlyFire && def.PlayerType == attack.Team)) {
+    if (building.ObjectId == 0 || building.Health <= 0) {
         return;
     }
     const unsigned skin = mct ? def.MCTSkin : building.Skin;
     if (skin >= Armor->size() || attack.Warhead >= (*Armor)[skin].Warheads.size()) {
         return;
     }
-    const float scale = std::max(0.0f, (*Armor)[skin].Warheads[attack.Warhead].Scale);
     // BuildingGameObj::Apply_Damage_Building bypasses shields and uses the component's skin.
-    const float damage = std::min(building.Health, attack.Damage * scale);
-    if (damage > 0) {
+    const float scaled = attack.Damage * (*Armor)[skin].Warheads[attack.Warhead].Scale;
+    if (scaled < 0 ? !CanRepairBuildings : !FriendlyFire && def.PlayerType == attack.Team) {
+        return;
+    }
+    const float damage = std::clamp(scaled, building.Health - def.HealthMax, building.Health);
+    if (damage != 0) {
         building.Health -= damage;
         building.Changed = true;
-        Hits.push_back({0, def.PlayerType, attack.ShooterObject, double(damage) * def.DamagePoints,
-            def.DeathPoints, building.Health == 0});
+        const double points = double(damage) * def.DamagePoints * (damage < 0 ? 0.5 : 1);
+        Hits.push_back({0, def.PlayerType, attack.ShooterObject, points, def.DeathPoints, building.Health == 0, true});
     }
+}
+
+double HeadlessPlayerSession::Apply_Physical_Damage(const Offense &attack, bool damage_allowed, unsigned skin,
+    unsigned shield_type, float health_max, float shield_max, float &health, float &shield) const
+{
+    if (!Armor || skin >= Armor->size() || shield_type >= Armor->size()) {
+        return 0;
+    }
+    const auto &health_rules = (*Armor)[skin].Warheads;
+    const auto &shield_rules = (*Armor)[shield_type].Warheads;
+    if (attack.Warhead >= health_rules.size() || attack.Warhead >= shield_rules.size()) {
+        return 0;
+    }
+    const auto &health_rule = health_rules[attack.Warhead];
+    const auto &shield_rule = shield_rules[attack.Warhead];
+    const double scaled_health = double(attack.Damage) * health_rule.Scale;
+    const double scaled_shield = double(attack.Damage) * shield_rule.Scale;
+    if (scaled_health < 0 || scaled_shield < 0) {
+        // The original repairs health first and awards half the damage rate.
+        if (health < health_max && health_rule.Scale != 0) {
+            const float repaired = static_cast<float>(std::clamp(-scaled_health, 0.0, double(health_max - health)));
+            health += repaired;
+            return -0.5 * repaired;
+        }
+        const float repaired = static_cast<float>(std::clamp(-scaled_shield, 0.0, double(shield_max - shield)));
+        shield += repaired;
+        return -0.5 * repaired;
+    }
+    if (!damage_allowed) {
+        return 0;
+    }
+    double damage = attack.Damage;
+    double shield_damage = 0;
+    if (shield > 0) {
+        const double absorbed = damage * std::clamp(shield_rule.ShieldAbsorption, 0.0f, 1.0f);
+        const double shield_loss = std::min<double>(shield, absorbed * shield_rule.Scale);
+        shield -= static_cast<float>(shield_loss);
+        shield_damage = shield_rule.Scale != 0 ? shield_loss / shield_rule.Scale : 0;
+        damage -= shield_rule.Scale != 0 ? shield_damage : absorbed;
+    }
+    const float health_damage = static_cast<float>(std::clamp(damage * health_rule.Scale, 0.0, double(health)));
+    health -= health_damage;
+    // Shield damage contributes its unscaled amount to the score.
+    return health_damage + shield_damage;
 }
 
 void HeadlessPlayerSession::Apply_Soldier_Damage(int player_id, Peer &peer, const Offense &attack)
 {
-    if (!Armor || peer.Skin >= Armor->size() || peer.ShieldType >= Armor->size()) {
+    if (peer.Health <= 0) {
         return;
     }
-    const auto &skin = (*Armor)[peer.Skin].Warheads;
-    const auto &shield = (*Armor)[peer.ShieldType].Warheads;
-    const auto warhead = attack.Warhead;
-    if (warhead >= skin.size() || warhead >= shield.size()) {
-        return;
-    }
-    double damage = attack.Damage;
-    double shield_damage = 0;
-    const float previous_shield = peer.Shield;
-    if (peer.Shield > 0) {
-        const auto &rule = shield[warhead];
-        const double absorbed = damage * std::clamp(rule.ShieldAbsorption, 0.0f, 1.0f);
-        const double shield_loss = std::min<double>(peer.Shield, absorbed * std::max(0.0f, rule.Scale));
-        peer.Shield -= static_cast<float>(shield_loss);
-        shield_damage = rule.Scale > 0 ? shield_loss / rule.Scale : 0;
-        // DefenseObjectClass sends the unabsorbed fraction and spillover through the skin multiplier.
-        damage = std::max(0.0, damage - (rule.Scale > 0 ? shield_damage : absorbed));
-    }
+    const int team = Simulation.Find_Soldier(player_id)->PlayerType;
     const float previous_health = peer.Health;
-    const float health_damage = static_cast<float>(std::min<double>(peer.Health, damage * std::max(0.0f, skin[warhead].Scale)));
-    peer.Health -= health_damage;
+    const float previous_shield = peer.Shield;
+    const bool damage_allowed = FriendlyFire || team != attack.Team || peer.SoldierObject == attack.ShooterObject;
+    const double points = Apply_Physical_Damage(attack, damage_allowed, peer.Skin, peer.ShieldType,
+        peer.HealthMax, peer.ShieldMax, peer.Health, peer.Shield) * peer.DamagePoints;
     peer.DefenseChanged |= peer.Health != previous_health || peer.Shield != previous_shield;
     const bool fatal = peer.Health == 0;
-    // Windows awards points for scaled health damage and shield damage in unscaled units.
-    const double points = (health_damage + shield_damage) * peer.DamagePoints;
     if (points != 0 || fatal) {
-        Hits.push_back({player_id, Simulation.Find_Soldier(player_id)->PlayerType,
-            attack.ShooterObject, points, peer.DeathPoints, fatal});
+        Hits.push_back({player_id, team, attack.ShooterObject, points, peer.DeathPoints, fatal});
     }
     if (fatal) {
         peer.MoveAxes.Set(0, 0);
@@ -650,6 +711,32 @@ void HeadlessPlayerSession::Apply_Soldier_Damage(int player_id, Peer &peer, cons
         peer.ReloadRequested = false;
         Simulation.Set_Move_Input(player_id, peer.MoveAxes);
     }
+}
+
+bool HeadlessPlayerSession::Apply_Charge_Damage(Charge &charge, const Offense &attack)
+{
+    const auto &def = charge.Definition;
+    const float previous_health = charge.Health;
+    const float previous_shield = charge.Shield;
+    const double points = Apply_Physical_Damage(attack, FriendlyFire || charge.Team != attack.Team,
+        def.Skin, def.ShieldType, def.HealthMax, def.ShieldMax, charge.Health, charge.Shield) * def.DamagePoints;
+    const bool defused = charge.Health <= 0;
+    if (points != 0 || defused) {
+        Hits.push_back({0, charge.Team, attack.ShooterObject, points, def.DeathPoints, defused});
+    }
+    if (defused) {
+        if (def.DefuseEffect != 0) {
+            Send_Explosion(def.DefuseEffect, charge.Position, charge.OwnerObject);
+        }
+        Send_Map_Object_Deletion(charge.ObjectId);
+    } else if (previous_health != charge.Health || previous_shield != charge.Shield) {
+        for (const int recipient : MapViewers) {
+            if (Connection.Get_Remote_Host(recipient)) {
+                Send_Charge(charge, recipient, NetworkObjectClass::BIT_OCCASIONAL);
+            }
+        }
+    }
+    return defused;
 }
 
 std::vector<HeadlessPlayerSession::CombatHit> HeadlessPlayerSession::Take_Combat_Hits()
@@ -697,7 +784,7 @@ void HeadlessPlayerSession::Throw_Charge(int owner, const Peer &peer,
     const float facing = std::atan2(peer.Forward.Y, peer.Forward.X);
     const auto &charge = Charges.emplace_back(Charge{Allocate_Network_Object(), owner, peer.SoldierObject,
         soldier.PlayerType, definition, origin, definition.ThrowSpeed * direction, facing,
-        definition.TriggerTimes[mode], definition.TriggerRanges[mode]});
+        definition.TriggerTimes[mode], definition.TriggerRanges[mode], definition.Health, definition.Shield});
     for (const int recipient : MapViewers) {
         if (Connection.Get_Remote_Host(recipient)) {
             Send_Charge(charge, recipient, NetworkObjectClass::BIT_CREATION);
@@ -820,24 +907,28 @@ void HeadlessPlayerSession::Advance_Charges(double seconds, float movement_secon
     }
 }
 
-void HeadlessPlayerSession::Detonate_Charge(const Charge &charge)
+void HeadlessPlayerSession::Send_Explosion(int definition, const Vector3 &position, int owner)
 {
-    const auto &blast = charge.Definition.Explosion;
-    const auto &collision = Simulation.Map_Collision();
     cPacket event;
     event.Add(Allocate_Network_Object());
     event.Add(static_cast<BYTE>(NetworkObjectClass::BIT_CREATION));
     event.Add(true);
     event.Add(NETCLASSID_SCEXPLOSIONEVENT);
-    event.Add(blast.Id);
-    Write_Position(event, charge.Position);
-    event.Add(charge.OwnerObject);
+    event.Add(definition);
+    Write_Position(event, position);
+    event.Add(owner);
     for (const int recipient : MapViewers) {
         if (Connection.Get_Remote_Host(recipient) && Peers.at(recipient).Ready) {
             Connection.Send_Packet_To_Individual(event, recipient, SEND_RELIABLE);
         }
     }
+}
 
+void HeadlessPlayerSession::Detonate_Charge(const Charge &charge)
+{
+    const auto &blast = charge.Definition.Explosion;
+    const auto &collision = Simulation.Map_Collision();
+    Send_Explosion(blast.Id, charge.Position, charge.OwnerObject);
     for (auto &[id, peer] : Peers) {
         if (!peer.Ready || peer.Health <= 0) {
             continue;
@@ -881,6 +972,15 @@ void HeadlessPlayerSession::Send_Charge(const Charge &charge, int recipient, BYT
         Write_Position(packet, charge.Position);
         packet.Add(charge.Facing);
     }
+    if ((dirty & NetworkObjectClass::BIT_RARE) == NetworkObjectClass::BIT_RARE) {
+        Write_Charge_Rare(packet, charge);
+    }
+    Write_Defense(packet, charge.Health, charge.Shield, charge.Definition.ShieldType);
+    Connection.Send_Packet_To_Individual(packet, recipient, SEND_RELIABLE);
+}
+
+void HeadlessPlayerSession::Write_Charge_Rare(cPacket &packet, const Charge &charge)
+{
     packet.Add_Terminated_String(charge.Definition.Model.c_str(), true); // PhysicalGameObj::Export_Rare.
     packet.Add_Terminated_String("", true); // Animation.
     packet.Add(0); // Current frame.
@@ -912,8 +1012,6 @@ void HeadlessPlayerSession::Send_Charge(const Charge &charge, int recipient, BYT
         }
         packet.Add(false); // No animated static object attachment.
     }
-    Write_Defense(packet, charge.Definition.Health, charge.Definition.Shield, charge.Definition.ShieldType);
-    Connection.Send_Packet_To_Individual(packet, recipient, SEND_RELIABLE);
 }
 
 void HeadlessPlayerSession::Select_Weapon(Peer &peer, ULONG controls)

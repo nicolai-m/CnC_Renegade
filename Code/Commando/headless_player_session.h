@@ -25,6 +25,7 @@ public:
         double DamagePoints;
         float DeathPoints;
         bool Fatal;
+        bool Building = false;
     };
 
     HeadlessPlayerSession(const HeadlessCollision &collision, cConnection &connection);
@@ -38,7 +39,7 @@ public:
     void Introduce_Map_Objects(int recipient);
     bool Base_Is_Destroyed(int team) const;
     void End_Combat();
-    void Set_Combat_Rules(const HeadlessArmorTable &armor, bool friendly_fire);
+    void Set_Combat_Rules(const HeadlessArmorTable &armor, bool friendly_fire, bool repair_buildings = true);
     void Set_Player_Loading(int peer_id, bool loading);
     bool Soldier_Is_Dead(int peer_id) const;
     void Remove_Soldier(int peer_id);
@@ -71,6 +72,8 @@ private:
         float WeaponTimeRemaining = WeaponSwitchSeconds;
         float Health = 0;
         float Shield = 0;
+        float HealthMax = 0;
+        float ShieldMax = 0;
         unsigned Skin = 0;
         unsigned ShieldType = 0;
         float DamagePoints = 0;
@@ -110,6 +113,8 @@ private:
         float Facing;
         double TriggerRemaining;
         float TriggerRange;
+        float Health;
+        float Shield;
         bool Stuck = false;
         std::optional<std::size_t> Building;
         bool StuckMCT = false;
@@ -136,13 +141,18 @@ private:
     std::optional<SoldierIntersection> Cast_Soldiers(const LineSegClass &ray, int ignore_object, float limit) const;
     void Apply_Soldier_Damage(int player_id, Peer &peer, const Offense &attack);
     void Apply_Building_Damage(std::size_t index, bool mct, const Offense &attack);
+    bool Apply_Charge_Damage(Charge &charge, const Offense &attack);
+    double Apply_Physical_Damage(const Offense &attack, bool damage_allowed, unsigned skin, unsigned shield_type,
+        float health_max, float shield_max, float &health, float &shield) const;
     void Advance_Bullets(float seconds);
     void Throw_Charge(int owner, const Peer &peer, const HeadlessChargeDefinition &definition, unsigned mode);
     void Advance_Charges(double seconds, float movement_seconds);
     void Move_Charge(Charge &charge, float seconds);
     bool Charge_Triggers(Charge &charge, const Peer &owner, double seconds) const;
     void Detonate_Charge(const Charge &charge);
+    void Send_Explosion(int definition, const Vector3 &position, int owner);
     void Send_Charge(const Charge &charge, int recipient, BYTE dirty);
+    void Write_Charge_Rare(cPacket &packet, const Charge &charge);
     void Send_Map_Object_Deletion(int object);
     static void Init_Position_Encoders(const HeadlessCollision &collision, std::array<cEncoderTypeEntry, 3> &encoders);
     void Write_Position(cPacket &packet, const Vector3 &position);
@@ -163,6 +173,7 @@ private:
     std::map<int, Peer> Peers;
     const HeadlessArmorTable *Armor = nullptr;
     bool FriendlyFire = false;
+    bool CanRepairBuildings = true;
     cEncoderTypeEntry VitalsEncoder;
     cEncoderTypeEntry ArmorEncoder;
     std::mt19937 SpreadRandom;

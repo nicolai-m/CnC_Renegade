@@ -85,7 +85,7 @@ HeadlessJoin::HeadlessJoin(cConnection &connection, HeadlessPlayerSession &sessi
       FrameTime(Clock::now()), RoundStart(FrameTime), RoundEnd(FrameTime + std::chrono::minutes(options.TimeLimit)),
       Teams{Session.Allocate_Network_Object(), Session.Allocate_Network_Object()}
 {
-    Session.Set_Combat_Rules(Maps[0].Join.Armor, Options.FriendlyFire);
+    Session.Set_Combat_Rules(Maps[0].Join.Armor, Options.FriendlyFire, Options.CanRepairBuildings);
     Session.Initialize_Buildings();
 }
 
@@ -120,7 +120,7 @@ void HeadlessJoin::Update_Combat()
             Record_Hit(hit, changes);
         }
         if (Options.BaseDestructionEndsGame && std::any_of(hits.begin(), hits.end(), [](const auto &hit) {
-                return hit.Fatal && hit.VictimPeer == 0;
+                return hit.Building && hit.Fatal;
             })) {
             const int loser = Session.Base_Is_Destroyed(PLAYERTYPE_GDI) ? PLAYERTYPE_GDI :
                 (Session.Base_Is_Destroyed(PLAYERTYPE_NOD) ? PLAYERTYPE_NOD : -1);
@@ -278,7 +278,7 @@ void HeadlessJoin::Restart_Round()
         peer.RespawnAt.reset();
     }
     Session.Reset_Map(Maps[MapIndex].Collision);
-    Session.Set_Combat_Rules(Maps[MapIndex].Join.Armor, Options.FriendlyFire);
+    Session.Set_Combat_Rules(Maps[MapIndex].Join.Armor, Options.FriendlyFire, Options.CanRepairBuildings);
     Session.Initialize_Buildings();
     for (auto &[id, peer] : Peers) {
         if (peer.State == LoadState::Ready) {
@@ -618,9 +618,12 @@ void HeadlessJoin::Send_Game_Options(int recipient)
     packet.Add(static_cast<int>(IntermissionDuration.count()));
     packet.Add(0); // Minimum qualifying minutes.
     packet.Add(Options.FriendlyFire);
-    for (int i = 0; i < 6; ++i) { // Remaining Tier 2 flags, including three C&C-specific flags.
-        packet.Add(false);
-    }
+    packet.Add(false); // Free weapons.
+    packet.Add(false); // Client trusted.
+    packet.Add(false); // Remix teams.
+    packet.Add(Options.CanRepairBuildings);
+    packet.Add(false); // Driver is always gunner.
+    packet.Add(false); // Spawn weapons.
     packet.Add_Wide_Terminated_String(Options.Motd.c_str(), true);
     // Extra fields from cGameDataCnc::Export_Tier_2_Data.
     packet.Add(Options.BaseDestructionEndsGame);

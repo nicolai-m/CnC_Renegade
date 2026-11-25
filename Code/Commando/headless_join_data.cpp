@@ -96,6 +96,7 @@ struct AmmoDefinition {
     int SprayCount = 1;
     int SoftPierceLimit = 0;
     bool Tracking = false;
+    bool Beam = false;
     int Explosion = 0;
     std::string Model;
     std::array<float, 3> TriggerTimes{};
@@ -115,6 +116,7 @@ struct EquipmentDefinitions {
     std::map<int, HeadlessExplosionDefinition> Explosions;
     std::map<int, float> ProjectileGravity;
     Record TossedCharge;
+    int DefuseEffect = 0;
 };
 
 std::string Model_Name(const std::string &path)
@@ -180,10 +182,14 @@ void Read_Record(BoundedChunkReader &reader, Record &record, uint32 parent, unsi
             reader.Each_Micro([&](uint32 field) {
                 if (field == 0) {
                     record.Soldier.Health = Read_Defense_Value(reader);
+                } else if (field == 1) {
+                    record.Soldier.HealthMax = Read_Defense_Value(reader);
                 } else if (field == 2) {
                     record.SkinSaveId = reader.Value<sint32>();
                 } else if (field == 3) {
                     record.Soldier.Shield = Read_Defense_Value(reader);
+                } else if (field == 4) {
+                    record.Soldier.ShieldMax = Read_Defense_Value(reader);
                 } else if (field == 5) {
                     record.ShieldSaveId = reader.Value<sint32>();
                 } else if (field == 6 || field == 7) {
@@ -284,11 +290,15 @@ void Read_Ammo(BoundedChunkReader &reader, EquipmentDefinitions &equipment)
                 case 39:
                 case 40: ammo.TriggerRanges[field - 38] = reader.Value<float>(); break;
                 case 48: ammo.RateOfFire = reader.Value<float>(); break;
+                case 49: ammo.Beam = reader.Value<uint8>() != 0; break;
                 }
             });
         }
     });
     if (definition_id > 0) {
+        if (Fold_Ascii(name) == "killedc4") {
+            equipment.DefuseEffect = ammo.Explosion;
+        }
         equipment.Ammo[definition_id] = std::move(ammo);
     }
 }
@@ -406,8 +416,10 @@ void Load_Presets(const GameDataFile &source, std::map<int, std::string> &physic
     });
 }
 
+enum class FireStyle { Bullet, C4, RepairBeam };
+
 std::optional<HeadlessFireMode> Get_Fire_Mode(const EquipmentDefinitions &equipment, const HeadlessArmorTable &armor,
-    int id, float charge_seconds, bool c4)
+    int id, float charge_seconds, FireStyle style)
 {
     constexpr int NormalAmmo = 0;
     constexpr int RemoteC4Ammo = 1;
@@ -419,6 +431,7 @@ std::optional<HeadlessFireMode> Get_Fire_Mode(const EquipmentDefinitions &equipm
         return std::nullopt;
     }
     const auto &ammo = def->second;
+    const bool c4 = style == FireStyle::C4;
     if ((c4 ? ammo.Type < RemoteC4Ammo || ammo.Type > ProximityC4Ammo : ammo.Type != NormalAmmo) ||
         ammo.BurstMax != 0 || ammo.RoundCost < 0 ||
         !std::isfinite(ammo.RateOfFire) || ammo.RateOfFire <= 0 || ammo.RateOfFire > MaxShotsPerSecond ||
@@ -455,20 +468,31 @@ std::optional<HeadlessFireMode> Get_Fire_Mode(const EquipmentDefinitions &equipm
             armor.empty() || blast.Warhead >= armor.front().Warheads.size()) {
             return std::nullopt;
         }
+        const auto disarm = equipment.Explosions.find(equipment.DefuseEffect);
+        const int defuse_effect = disarm != equipment.Explosions.end() &&
+            (disarm->second.Damage == 0 || disarm->second.Radius == 0) ? disarm->first : 0;
+        const auto &vitals = tossed.Soldier;
         mode.Charge = HeadlessChargeDefinition{trigger,
             tossed.Soldier.DefinitionId, id, ammo.Model, tossed.ThrowSpeed, projectile->second,
-            ammo.TriggerTimes, ammo.TriggerRanges, tossed.Soldier.Health, tossed.Soldier.Shield,
-            Headless_Armor_Index(armor, tossed.ShieldSaveId), blast};
+            ammo.TriggerTimes, ammo.TriggerRanges, vitals.Health, vitals.Shield,
+            std::max(vitals.HealthMax, vitals.Health), std::max(vitals.ShieldMax, vitals.Shield),
+            Headless_Armor_Index(armor, tossed.SkinSaveId), Headless_Armor_Index(armor, tossed.ShieldSaveId),
+            vitals.DamagePoints, vitals.DeathPoints, defuse_effect, blast};
         return mode;
     }
-    // The minigunner uses single, straight bullets. The other projectile behaviors need their own simulation.
-    if (ammo.Warhead >= 0 && std::isfinite(ammo.Damage) && ammo.Damage > 0 &&
+    // Repair ammunition uses the instant bullet path with a signed damage value.
+    const bool valid_damage = style == FireStyle::RepairBeam ? ammo.Beam && ammo.Damage < 0 && ammo.Speed >= 400 :
+        ammo.Damage > 0;
+    if (ammo.Warhead >= 0 && std::isfinite(ammo.Damage) && valid_damage &&
         std::isfinite(ammo.Range) && ammo.Range > 0 && ammo.Range <= 1000 &&
         std::isfinite(ammo.Speed) && ammo.Speed > 0 &&
         std::isfinite(ammo.Spread) && ammo.Spread >= 0 && ammo.Spread <= 1 &&
         ammo.Gravity == 0 && ammo.SprayCount <= 1 && ammo.SoftPierceLimit <= 1 && !ammo.Tracking && !ammo.Explosion) {
         mode.Bullet = HeadlessBulletDefinition{ammo.Damage, static_cast<unsigned>(ammo.Warhead),
             ammo.Range, ammo.Speed, ammo.Spread};
+    }
+    if (style == FireStyle::RepairBeam && !mode.Bullet) {
+        return std::nullopt;
     }
     return mode;
 }
@@ -496,6 +520,11 @@ void Load_Starting_Weapons(const Record &record, const EquipmentDefinitions &equ
             found = std::prev(inventory.end());
         }
         found->Owned |= grant.GiveWeapon;
+        if (def->second.ClipSize == -1) {
+            found->Clip = -1;
+            found->Inventory = -1;
+            return true;
+        }
         const int clip_size = std::max(0, def->second.ClipSize);
         if (grant.Rounds < 0) {
             if (found->Clip == 0) {
@@ -526,20 +555,23 @@ void Load_Starting_Weapons(const Record &record, const EquipmentDefinitions &equ
         if (weapon.Owned) {
             const auto &def = equipment.Weapons.at(weapon.DefinitionId);
             const float reload = std::isfinite(def.ReloadSeconds) ? std::max(0.0f, def.ReloadSeconds) : 0.0f;
-            HeadlessSpawnWeapon spawn{weapon.DefinitionId, def.KeyNumber, std::max(0, def.ClipSize),
+            HeadlessSpawnWeapon spawn{weapon.DefinitionId, def.KeyNumber, std::max(-1, def.ClipSize),
                 weapon.Clip, weapon.Inventory, reload, {}, {}};
             constexpr int RifleStyle = 2;
+            constexpr int HipStyle = 3;
             constexpr int HandgunStyle = 5;
             constexpr int C4Style = 0;
             const bool c4 = def.Style == C4Style;
-            if (spawn.ClipSize > 0 && (def.Style == RifleStyle || def.Style == HandgunStyle || c4)) {
+            const bool repair = def.Style == HipStyle;
+            if (spawn.ClipSize != 0 && (def.Style == RifleStyle || def.Style == HandgunStyle || repair || c4)) {
+                const auto style = repair ? FireStyle::RepairBeam : (c4 ? FireStyle::C4 : FireStyle::Bullet);
                 const auto ammo = equipment.Ammo.find(def.PrimaryAmmo);
                 if (ammo != equipment.Ammo.end()) {
                     const float charge = ammo->second.ChargeSeconds; // WeaponClass uses primary charge for both triggers.
-                    spawn.PrimaryFire = Get_Fire_Mode(equipment, armor, def.PrimaryAmmo, charge, c4);
+                    spawn.PrimaryFire = Get_Fire_Mode(equipment, armor, def.PrimaryAmmo, charge, style);
                     // C4 uses secondary input for the one-shot weapon-use action.
                     if (spawn.PrimaryFire && !def.CanSnipe && !c4) {
-                        spawn.SecondaryFire = Get_Fire_Mode(equipment, armor, def.SecondaryAmmo, charge, false);
+                        spawn.SecondaryFire = Get_Fire_Mode(equipment, armor, def.SecondaryAmmo, charge, style);
                     }
                 }
             }

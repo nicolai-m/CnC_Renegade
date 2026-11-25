@@ -159,8 +159,17 @@ range in its ammo preset. The stock mine arms immediately and checks for
 opposing soldiers within three meters every quarter second. Remote charges
 and proximity mines share a limit of 30 per team. A new placement at that
 limit disarms the team's oldest mine or remote charge. Purchase terminals,
-vehicle-triggered proximity detection, repair-gun functionality, and
-animated attachments still need to be ported.
+vehicle-triggered proximity detection, vehicle repair, and animated
+attachments still need to be ported.
+
+Engineers and technicians can use their original unlimited-ammunition repair
+gun. The server applies the armor rules in `armor.ini` to its beam, including
+the alternate armor of the Master Control Terminal. The original
+`CanRepairBuildings=no` setting disables building repair in `[Settings]`.
+With repair enabled, the beam restores standing buildings up to their
+original maximum health. Repairs to allies award half the damage points for
+the amount restored. A beam can also disarm enemy C4 and proximity mines.
+The server sends the original harmless disarm effect and removes the charge.
 
 `TimeLimitMinutes` starts counting down when the server starts the loaded map.
 Clients receive the remaining round time when joining and after loading the
@@ -200,6 +209,8 @@ when the owner disconnects.
 The proximity fixture verifies the technician's ammunition grant, arming
 delay, selected trigger radius, late-join replication, and a single detonation
 when the opposing soldier moves into range.
+The repair fixture verifies the unlimited clip, capped repairs, scoring,
+the building repair setting, and disarming remote C4 and proximity mines.
 
 On Linux arm64 and with the Linux amd64 build running under QEMU, graphical EA
 1.038 Windows clients loaded `C&C_Field.mix`, spawned and displayed another

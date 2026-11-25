@@ -326,6 +326,8 @@ Settings Load_Settings(const Options &options, const fs::path &data_dir)
         result.Join.FriendlyFire = !friendly.empty() && std::string_view("yt1").find(friendly.front()) != std::string_view::npos;
         const auto base_win = Fold_Ascii(Setting(rules->second, "basedestructionendsgame"));
         result.Join.BaseDestructionEndsGame = base_win.empty() || std::string_view("nf0").find(base_win.front()) == std::string_view::npos;
+        const auto repair = Fold_Ascii(Setting(rules->second, "canrepairbuildings"));
+        result.Join.CanRepairBuildings = repair.empty() || std::string_view("nf0").find(repair.front()) == std::string_view::npos;
         const auto character = Fold_Ascii(Setting(rules->second, "spawncharacter"));
         if (character == "engineer") {
             result.SpawnCharacter = HeadlessSpawnCharacter::Engineer;

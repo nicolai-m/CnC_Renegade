@@ -39,7 +39,13 @@ struct HeadlessChargeDefinition {
     std::array<float, 3> TriggerRanges;
     float Health;
     float Shield;
+    float HealthMax;
+    float ShieldMax;
+    unsigned Skin;
     unsigned ShieldType;
+    float DamagePoints;
+    float DeathPoints;
+    int DefuseEffect;
     HeadlessExplosionDefinition Explosion;
 };
 
@@ -77,6 +83,8 @@ struct HeadlessSoldierPreset {
     float DamagePoints = 0;
     float DeathPoints = 0;
     float BullseyeHeight = 1.2f;
+    float HealthMax = 0;
+    float ShieldMax = 0;
 };
 
 struct HeadlessDamageRule {

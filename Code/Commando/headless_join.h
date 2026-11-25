@@ -31,6 +31,7 @@ struct HeadlessJoinOptions {
     bool LoopMaps = true;
     bool FriendlyFire = false;
     bool BaseDestructionEndsGame = true;
+    bool CanRepairBuildings = true;
 };
 
 class HeadlessJoin {
