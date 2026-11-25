@@ -83,10 +83,10 @@ HeadlessJoin::HeadlessJoin(cConnection &connection, HeadlessPlayerSession &sessi
     const std::vector<HeadlessMap> &maps, const HeadlessJoinOptions &options)
     : Connection(connection), Session(session), Maps(maps), Options(options), MapCrc(Map_CRC(maps.at(0).Name)),
       FrameTime(Clock::now()), RoundStart(FrameTime), RoundEnd(FrameTime + std::chrono::minutes(options.TimeLimit)),
-      Teams{NextObject--, NextObject--}
+      Teams{Session.Allocate_Network_Object(), Session.Allocate_Network_Object()}
 {
     Session.Set_Combat_Rules(Maps[0].Join.Armor, Options.FriendlyFire);
-    NextObject = Session.Initialize_Buildings(NextObject);
+    Session.Initialize_Buildings();
 }
 
 bool HeadlessJoin::Update_Round(Clock::time_point now)
@@ -200,7 +200,7 @@ void HeadlessJoin::Record_Hit(const HeadlessPlayerSession::CombatHit &hit, Comba
     changes.Players.insert(shooter->first);
     changes.Teams[attacker.Team] |= NetworkObjectClass::BIT_RARE;
     cPacket kill_message;
-    Write_Creation(kill_message, NextObject--, NETCLASSID_PLAYERKILL, true);
+    Write_Creation(kill_message, Session.Allocate_Network_Object(), NETCLASSID_PLAYERKILL, true);
     kill_message.Add(shooter->first);
     kill_message.Add(hit.VictimPeer);
     for (const auto &[recipient, peer] : Peers) {
@@ -245,6 +245,7 @@ void HeadlessJoin::Reset_Combat_Stats()
 
 void HeadlessJoin::Begin_Intermission(int winning_team, int reason)
 {
+    Session.End_Combat();
     LastWinningTeam = winning_team;
     LastWinReason = reason;
     LastRoundSeconds = reason == TimeExpired ? static_cast<uint32>(Options.TimeLimit * 60) :
@@ -278,7 +279,7 @@ void HeadlessJoin::Restart_Round()
     }
     Session.Reset_Map(Maps[MapIndex].Collision);
     Session.Set_Combat_Rules(Maps[MapIndex].Join.Armor, Options.FriendlyFire);
-    NextObject = Session.Initialize_Buildings(NextObject);
+    Session.Initialize_Buildings();
     for (auto &[id, peer] : Peers) {
         if (peer.State == LoadState::Ready) {
             Spawn_Player(id, peer);
@@ -429,7 +430,7 @@ void HeadlessJoin::Receive_Bio(cPacket &packet, int peer_id, Peer &peer)
 
 void HeadlessJoin::Create_Player(int peer_id, Peer &peer)
 {
-    peer.PlayerObject = NextObject--;
+    peer.PlayerObject = Session.Allocate_Network_Object();
     for (const auto &[id, other] : Peers) {
         if (other.PlayerObject != 0) {
             Send_Player(peer_id, id, other, NetworkObjectClass::BIT_CREATION);
@@ -454,11 +455,12 @@ void HeadlessJoin::Request_Reload(int peer_id, Peer &peer)
 
 void HeadlessJoin::Spawn_Player(int peer_id, Peer &peer, bool respawning)
 {
-    if (!Session.Attach_Player(peer_id, peer.Team, NextObject, Maps[MapIndex].Join.Soldiers[peer.Team])) {
+    const int soldier_object = Session.Allocate_Network_Object();
+    if (!Session.Attach_Player(peer_id, peer.Team, soldier_object, Maps[MapIndex].Join.Soldiers[peer.Team])) {
         Closing.insert(peer_id);
         return;
     }
-    peer.SoldierObject = NextObject--;
+    peer.SoldierObject = soldier_object;
     peer.RespawnAt.reset();
     const bool joining = peer.PlayerObject == 0;
     if (joining) {
@@ -486,7 +488,7 @@ void HeadlessJoin::Spawn_Player(int peer_id, Peer &peer, bool respawning)
         }
     }
     if (!respawning) {
-        Session.Introduce_Buildings(peer_id);
+        Session.Introduce_Map_Objects(peer_id);
         Send_Game_Data(peer_id);
     }
 }
@@ -516,7 +518,7 @@ void HeadlessJoin::Set_Loading(int peer_id, Peer &peer, bool loading)
         }
     }
     if (!loading) {
-        Session.Introduce_Buildings(peer_id);
+        Session.Introduce_Map_Objects(peer_id);
         Send_Game_Data(peer_id);
     }
 }
@@ -609,7 +611,7 @@ HeadlessJoin::Clock::duration HeadlessJoin::Time_Remaining() const
 void HeadlessJoin::Send_Game_Options(int recipient)
 {
     cPacket packet;
-    Write_Creation(packet, NextObject--, NETCLASSID_GAMEOPTIONSEVENT, true);
+    Write_Creation(packet, Session.Allocate_Network_Object(), NETCLASSID_GAMEOPTIONSEVENT, true);
     Write_Game_Info(packet, Options.Address);
     packet.Add(Options.TimeLimit);
     packet.Add(Options.RadarMode);
@@ -634,7 +636,7 @@ void HeadlessJoin::Send_Game_Options(int recipient)
 void HeadlessJoin::Send_Game_Data(int recipient)
 {
     cPacket packet;
-    Write_Creation(packet, NextObject--, NETCLASSID_GAMEDATAUPDATEEVENT, true);
+    Write_Creation(packet, Session.Allocate_Network_Object(), NETCLASSID_GAMEDATAUPDATEEVENT, true);
     packet.Add(static_cast<int>(std::chrono::duration_cast<std::chrono::seconds>(Time_Remaining()).count()));
     packet.Add(HostedGameNumber);
     Connection.Send_Packet_To_Individual(packet, recipient, SEND_RELIABLE);
@@ -643,7 +645,7 @@ void HeadlessJoin::Send_Game_Data(int recipient)
 void HeadlessJoin::Send_Round_Result(int recipient)
 {
     cPacket packet;
-    Write_Creation(packet, NextObject--, NETCLASSID_WIN, true);
+    Write_Creation(packet, Session.Allocate_Network_Object(), NETCLASSID_WIN, true);
     packet.Add(LastWinningTeam);
     packet.Add(UnknownPlayer);
     // Clients finishing a previous map after the next round began still need its current round number.

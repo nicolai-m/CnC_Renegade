@@ -14,6 +14,7 @@
 
 class cConnection;
 class cPacket;
+class LineSegClass;
 
 class HeadlessPlayerSession {
 public:
@@ -32,9 +33,11 @@ public:
     // The joining client must know the soldier's network object before the first update.
     bool Attach_Player(int peer_id, int player_type, int soldier_object_id, const HeadlessSoldierPreset &preset);
     void Introduce_Soldier(int owner_id, int recipient, const HeadlessSoldierPreset &preset);
-    int Initialize_Buildings(int next_object);
-    void Introduce_Buildings(int recipient);
+    int Allocate_Network_Object() { return NextObject--; }
+    void Initialize_Buildings();
+    void Introduce_Map_Objects(int recipient);
     bool Base_Is_Destroyed(int team) const;
+    void End_Combat();
     void Set_Combat_Rules(const HeadlessArmorTable &armor, bool friendly_fire);
     void Set_Player_Loading(int peer_id, bool loading);
     bool Soldier_Is_Dead(int peer_id) const;
@@ -71,16 +74,46 @@ private:
         unsigned ShieldType = 0;
         float DamagePoints = 0;
         float DeathPoints = 0;
+        float BullseyeHeight = 0;
         bool DefenseChanged = false;
     };
 
-    struct Bullet {
+    struct Offense {
         int ShooterObject;
         int Team;
-        HeadlessBulletDefinition Definition;
+        float Damage;
+        unsigned Warhead;
+    };
+
+    struct Bullet {
+        Offense Attack;
         Vector3 Position;
         Vector3 Direction;
+        float Speed;
         float RemainingTravel;
+    };
+
+    struct SoldierIntersection {
+        int PeerId;
+        float Fraction;
+    };
+
+    struct Charge {
+        int ObjectId;
+        int OwnerPeer;
+        int OwnerObject;
+        int Team;
+        HeadlessTimedChargeDefinition Definition;
+        Vector3 Position;
+        Vector3 Velocity;
+        float Facing;
+        double FuseRemaining;
+        bool Stuck = false;
+        std::optional<std::size_t> Building;
+        bool StuckMCT = false;
+        int AttachedPeer = 0;
+        int AttachedObject = 0;
+        Vector3 AttachedOffset{0, 0, 0};
     };
 
     struct BuildingState {
@@ -98,9 +131,16 @@ private:
     void Advance_Weapon(int player_id, Peer &peer, float seconds, ULONG fire_controls, bool reload);
     void Fire_Bullet(int player_id, const Peer &peer, const HeadlessBulletDefinition &definition);
     bool Trace_Bullet(const Bullet &bullet, const Vector3 &end);
-    void Apply_Bullet_Damage(int player_id, Peer &peer, const Bullet &bullet);
-    void Apply_Building_Damage(const HeadlessCollision::RayHit &terrain, const Bullet &bullet);
+    std::optional<SoldierIntersection> Cast_Soldiers(const LineSegClass &ray, int ignore_object, float limit) const;
+    void Apply_Soldier_Damage(int player_id, Peer &peer, const Offense &attack);
+    void Apply_Building_Damage(std::size_t index, bool mct, const Offense &attack);
     void Advance_Bullets(float seconds);
+    void Throw_Charge(int owner, const Peer &peer, const HeadlessTimedChargeDefinition &definition, unsigned mode);
+    void Advance_Charges(double seconds, float movement_seconds);
+    void Move_Charge(Charge &charge, float seconds);
+    void Detonate_Charge(const Charge &charge);
+    void Send_Charge(const Charge &charge, int recipient, BYTE dirty);
+    void Send_Map_Object_Deletion(int object);
     static void Init_Position_Encoders(const HeadlessCollision &collision, std::array<cEncoderTypeEntry, 3> &encoders);
     void Write_Position(cPacket &packet, const Vector3 &position);
     void Write_Defense(cPacket &packet, float health, float shield, unsigned shield_type);
@@ -113,6 +153,8 @@ private:
 
     HeadlessSimulation Simulation;
     cConnection &Connection;
+    // Allocate from the high end of the original dynamic object range.
+    int NextObject = 2100000000;
     cEncoderTypeEntry AnalogEncoder;
     std::array<cEncoderTypeEntry, 3> PositionEncoders;
     std::map<int, Peer> Peers;
@@ -122,11 +164,13 @@ private:
     cEncoderTypeEntry ArmorEncoder;
     std::mt19937 SpreadRandom;
     std::vector<Bullet> Bullets;
+    std::vector<Charge> Charges;
     std::vector<CombatHit> Hits;
     std::vector<BuildingState> Buildings;
-    std::set<int> BuildingViewers;
+    std::set<int> MapViewers;
     cEncoderTypeEntry BuildingRadiusEncoder;
     cEncoderTypeEntry BuildingStateEncoder;
+    cEncoderTypeEntry ChargeVelocityEncoder;
     HeadlessSimulation::Clock::duration PublishElapsed{};
 };
 

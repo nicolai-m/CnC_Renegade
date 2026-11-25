@@ -117,8 +117,8 @@ server stops accepting the soldier's inputs. After two seconds it deletes
 the old soldier and spawns a new minigunner with the same team and fresh
 health, shield, and starting inventory. The player and round stay active.
 Set `IsFriendlyFirePermitted=yes` in `[Settings]` to enable damage to allies
-and their buildings. It defaults to off. Skeletal hit zones, vehicle damage,
-and C4 placement and detonation remain open.
+and their buildings. It defaults to off. Skeletal hit zones and vehicle damage
+remain open.
 
 The server records kills and deaths on the player and team objects and sends
 the original kill notification to players in the match. A respawn preserves the
@@ -135,6 +135,16 @@ components with their buildings and applies the armor defined for the target
 component, including the alternate armor of the Master Control Terminal.
 Clients receive the original building health and destruction updates.
 Building damage and destruction award preset points and credits.
+
+The minigunner's timed C4 uses the original weapon, projectile, and explosion
+presets. A throw consumes one charge and starts its fuse. The charge sticks
+to terrain, a building component, or a soldier's collision box. Detonation
+damages nearby soldiers, with reduced damage through cover. A charge stuck to
+a building or its Master Control Terminal damages that building according to
+the armor of the component it hit. Clients receive the charge and the original
+explosion event. A round transition removes any remaining charges.
+Remote and proximity C4, repair-gun defusing, and animated attachments still
+need to be ported.
 
 `TimeLimitMinutes` starts counting down when the server starts the loaded map.
 Clients receive the remaining round time when joining and after loading the
@@ -165,7 +175,9 @@ and checks the timed result and tiebreakers, the announced map, its spawn and
 position encoding, movement after a map reload, and the end of the map cycle.
 The building fixture checks exterior and terminal armor, replicated damage
 and destruction, points and credits, both settings for the base destruction
-rule, and restored buildings in the next round.
+rule, and restored buildings in the next round. The timed C4 case verifies
+ammunition usage, attachment to a terminal, replication for a late join,
+the selected fuse, and a base destruction win after detonation.
 
 On Linux arm64 and with the Linux amd64 build running under QEMU, graphical EA
 1.038 Windows clients loaded `C&C_Field.mix`, spawned and displayed another

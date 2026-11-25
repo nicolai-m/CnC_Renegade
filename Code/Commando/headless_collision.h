@@ -40,7 +40,8 @@ public:
     std::size_t Incomplete_Object_Count() const { return IncompleteObjects; }
 
     // Cast against static W3D geometry, using a mask from coltype.h.
-    std::optional<RayHit> Cast_Ray(const Vector3 &start, const Vector3 &end, unsigned mask) const;
+    std::optional<RayHit> Cast_Ray(const Vector3 &start, const Vector3 &end, unsigned mask,
+        bool skip_permeable_terrain = false) const;
     std::optional<std::size_t> Building_For_Object(std::size_t object) const { return BuildingOwners[object]; }
 
     // Translate a box with its orthonormal basis held fixed, using a mask from coltype.h.

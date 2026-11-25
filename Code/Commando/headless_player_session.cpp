@@ -26,6 +26,7 @@ using namespace std::chrono_literals;
 constexpr auto InputTimeout = 250ms;
 constexpr auto PublishInterval = 50ms;
 constexpr float SoldierEyeHeight = 1.62f;
+constexpr float Gravity = 9.8f;
 // NetworkObjectMgrClass reserves 100,000 client object IDs per peer.
 constexpr int ClientObjectBase = 2110000001;
 constexpr int ClientObjectCount = 100000;
@@ -37,6 +38,7 @@ constexpr ULONG FirePrimary = 1u << (ControlClass::BOOLEAN_WEAPON_FIRE_PRIMARY -
 constexpr ULONG FireSecondary = 1u << (ControlClass::BOOLEAN_WEAPON_FIRE_SECONDARY - ControlClass::BOOLEAN_CONTINUOUS_FIRST);
 constexpr float InstantBulletSpeed = 400.0f; // BulletManager::Create_Bullet.
 constexpr std::size_t MaxActiveBullets = 4096;
+constexpr std::size_t MaxActiveCharges = 4096;
 
 int Building_State(const HeadlessLevel::Building &building, float health)
 {
@@ -59,6 +61,7 @@ HeadlessPlayerSession::HeadlessPlayerSession(const HeadlessCollision &collision,
     ArmorEncoder.Init(0, 1, 1);
     BuildingRadiusEncoder.Init(0, 50, 0.1);
     BuildingStateEncoder.Init(-1, BuildingStateClass::STATE_COUNT, 1);
+    ChargeVelocityEncoder.Init(-90, 90, 0.01); // VehicleGameObj::Set_Precision.
     Init_Position_Encoders(collision, PositionEncoders);
 }
 
@@ -116,6 +119,7 @@ bool HeadlessPlayerSession::Attach_Player(int peer_id, int player_type, int sold
     peer.ShieldType = preset.ShieldType;
     peer.DamagePoints = preset.DamagePoints;
     peer.DeathPoints = preset.DeathPoints;
+    peer.BullseyeHeight = preset.BullseyeHeight;
     peer.Weapons = preset.Weapons;
     const auto starting_weapon = std::find_if(peer.Weapons.begin(), peer.Weapons.end(), [&](const auto &weapon) {
         return weapon.DefinitionId == preset.StartingWeapon;
@@ -198,7 +202,14 @@ void HeadlessPlayerSession::Remove_Player(int peer_id)
 {
     Peers.erase(peer_id);
     Simulation.Remove_Soldier(peer_id);
-    BuildingViewers.erase(peer_id);
+    MapViewers.erase(peer_id);
+    Charges.erase(std::remove_if(Charges.begin(), Charges.end(), [&](const auto &charge) {
+        if (charge.OwnerPeer != peer_id && charge.AttachedPeer != peer_id) {
+            return false;
+        }
+        Send_Map_Object_Deletion(charge.ObjectId);
+        return true;
+    }), Charges.end());
     for (auto &[id, peer] : Peers) {
         peer.Viewers.erase(peer_id);
     }
@@ -206,10 +217,10 @@ void HeadlessPlayerSession::Remove_Player(int peer_id)
 
 void HeadlessPlayerSession::Reset_Map(const HeadlessCollision &collision)
 {
+    End_Combat();
     Clear_Buildings();
     Init_Position_Encoders(collision, PositionEncoders);
     Simulation = HeadlessSimulation(collision);
-    Bullets.clear();
     Hits.clear();
     PublishElapsed = {};
     for (auto &[id, peer] : Peers) {
@@ -217,7 +228,7 @@ void HeadlessPlayerSession::Reset_Map(const HeadlessCollision &collision)
     }
 }
 
-int HeadlessPlayerSession::Initialize_Buildings(int next_object)
+void HeadlessPlayerSession::Initialize_Buildings()
 {
     const auto &definitions = Simulation.Map_Collision().Level().Buildings();
     Buildings.resize(definitions.size());
@@ -226,15 +237,14 @@ int HeadlessPlayerSession::Initialize_Buildings(int next_object)
         if (!Armor || Armor->empty() || def.HealthMax <= 0 || def.MeshPrefix.empty()) {
             continue;
         }
-        Buildings[index] = {next_object--, def.Health, Headless_Armor_Index(*Armor, def.SkinSaveId),
+        Buildings[index] = {Allocate_Network_Object(), def.Health, Headless_Armor_Index(*Armor, def.SkinSaveId),
             Headless_Armor_Index(*Armor, def.ShieldSaveId), Building_State(def, def.Health), false};
     }
-    return next_object;
 }
 
-void HeadlessPlayerSession::Introduce_Buildings(int recipient)
+void HeadlessPlayerSession::Introduce_Map_Objects(int recipient)
 {
-    if (!BuildingViewers.insert(recipient).second) {
+    if (!MapViewers.insert(recipient).second) {
         return;
     }
     const auto &definitions = Simulation.Map_Collision().Level().Buildings();
@@ -248,26 +258,47 @@ void HeadlessPlayerSession::Introduce_Buildings(int recipient)
             Send_Building(index, recipient, NetworkObjectClass::BIT_RARE);
         }
     }
+    for (const auto &charge : Charges) {
+        Send_Charge(charge, recipient, NetworkObjectClass::BIT_CREATION);
+    }
+}
+
+void HeadlessPlayerSession::Send_Map_Object_Deletion(int object)
+{
+    cPacket packet;
+    packet.Add(object);
+    packet.Add(static_cast<BYTE>(0));
+    packet.Add(true);
+    for (const int recipient : MapViewers) {
+        if (Connection.Get_Remote_Host(recipient)) {
+            Connection.Send_Packet_To_Individual(packet, recipient, SEND_RELIABLE);
+        }
+    }
+}
+
+void HeadlessPlayerSession::End_Combat()
+{
+    for (const auto &charge : Charges) {
+        Send_Map_Object_Deletion(charge.ObjectId);
+    }
+    Charges.clear();
+    Bullets.clear();
+    for (auto &[id, peer] : Peers) {
+        if (peer.DefenseChanged) {
+            Publish_Player(id, peer);
+        }
+    }
 }
 
 void HeadlessPlayerSession::Clear_Buildings()
 {
     for (const auto &building : Buildings) {
-        if (building.ObjectId == 0) {
-            continue;
-        }
-        cPacket packet;
-        packet.Add(building.ObjectId);
-        packet.Add(static_cast<BYTE>(0));
-        packet.Add(true);
-        for (const int recipient : BuildingViewers) {
-            if (Connection.Get_Remote_Host(recipient)) {
-                Connection.Send_Packet_To_Individual(packet, recipient, SEND_RELIABLE);
-            }
+        if (building.ObjectId != 0) {
+            Send_Map_Object_Deletion(building.ObjectId);
         }
     }
     Buildings.clear();
-    BuildingViewers.clear();
+    MapViewers.clear();
 }
 
 bool HeadlessPlayerSession::Base_Is_Destroyed(int team) const
@@ -393,6 +424,13 @@ bool HeadlessPlayerSession::Read_Control(cPacket &packet, int peer_id, Peer &pee
         peer.WeaponTimeRemaining = WeaponSwitchSeconds;
         peer.ReloadRequested = false;
     }
+    if (peer.WeaponSlot != 0 && (one_time & (1u << ControlClass::BOOLEAN_WEAPON_USE))) {
+        auto &weapon = peer.Weapons[peer.WeaponSlot - 1];
+        if (weapon.PrimaryFire && weapon.PrimaryFire->TimedCharge) {
+            const auto modes = weapon.PrimaryFire->TimedCharge->FuseSeconds.size();
+            weapon.DetonationMode = (weapon.DetonationMode + 1) % modes;
+        }
+    }
     peer.FireControls = fire_controls;
     peer.ReloadRequested |= (one_time & (1u << ControlClass::BOOLEAN_WEAPON_RELOAD)) != 0;
     return true;
@@ -444,6 +482,8 @@ void HeadlessPlayerSession::Advance_Weapon(int player_id, Peer &peer, float seco
                 weapon.ClipRounds = std::max(0, weapon.ClipRounds - mode->RoundCost);
                 if (mode->Bullet) {
                     Fire_Bullet(player_id, peer, *mode->Bullet);
+                } else if (mode->TimedCharge) {
+                    Throw_Charge(player_id, peer, *mode->TimedCharge, weapon.DetonationMode);
                 }
             }
             continue;
@@ -483,7 +523,8 @@ void HeadlessPlayerSession::Fire_Bullet(int player_id, const Peer &peer, const H
         const auto up = Vector3::Cross_Product(right, direction);
         direction = direction * std::cos(angle) + (right * std::cos(theta) + up * std::sin(theta)) * std::sin(angle);
     }
-    Bullet bullet{peer.SoldierObject, soldier.PlayerType, definition, start, direction, definition.Range * 1.2f};
+    Bullet bullet{{peer.SoldierObject, soldier.PlayerType, definition.Damage, definition.Warhead},
+        start, direction, definition.Speed, definition.Range * 1.2f};
     if (definition.Speed >= InstantBulletSpeed) {
         Trace_Bullet(bullet, start + direction * definition.Range);
     } else if (Bullets.size() < MaxActiveBullets) {
@@ -493,80 +534,86 @@ void HeadlessPlayerSession::Fire_Bullet(int player_id, const Peer &peer, const H
 
 bool HeadlessPlayerSession::Trace_Bullet(const Bullet &bullet, const Vector3 &end)
 {
-    const auto terrain = Simulation.Map_Collision().Cast_Ray(bullet.Position, end, COLLISION_TYPE_PROJECTILE);
+    const auto &collision = Simulation.Map_Collision();
+    const auto terrain = collision.Cast_Ray(bullet.Position, end, COLLISION_TYPE_PROJECTILE);
     if (terrain && terrain->StartsInside) {
         return true;
     }
-    const LineSegClass ray(bullet.Position, end);
+    const auto target = Cast_Soldiers(LineSegClass(bullet.Position, end), bullet.Attack.ShooterObject,
+        terrain ? terrain->Fraction : 1.0f);
+    if (target) {
+        const auto &soldier = *Simulation.Find_Soldier(target->PeerId);
+        if (FriendlyFire || soldier.PlayerType != bullet.Attack.Team) {
+            Apply_Soldier_Damage(target->PeerId, Peers.at(target->PeerId), bullet.Attack);
+        }
+        return true;
+    }
+    if (terrain) {
+        if (const auto owner = collision.Building_For_Object(terrain->ObjectIndex)) {
+            Apply_Building_Damage(*owner, collision.Level().Static_Objects()[terrain->ObjectIndex].MCT, bullet.Attack);
+        }
+    }
+    return terrain.has_value();
+}
+
+std::optional<HeadlessPlayerSession::SoldierIntersection> HeadlessPlayerSession::Cast_Soldiers(
+    const LineSegClass &ray, int ignore_object, float limit) const
+{
     CastResultStruct hit;
-    hit.Fraction = terrain ? terrain->Fraction : 1.0f;
-    auto target = Peers.end();
-    for (auto it = Peers.begin(); it != Peers.end(); ++it) {
-        auto &peer = it->second;
-        if (!peer.Ready || peer.Health <= 0 || peer.SoldierObject == bullet.ShooterObject) {
+    hit.Fraction = limit;
+    std::optional<SoldierIntersection> intersection;
+    for (const auto &[id, peer] : Peers) {
+        if (!peer.Ready || peer.Health <= 0 || peer.SoldierObject == ignore_object) {
             continue;
         }
-        const auto &soldier = *Simulation.Find_Soldier(it->first);
+        const auto &soldier = *Simulation.Find_Soldier(id);
         if (CollisionMath::Collide(ray, HeadlessSimulation::Soldier_Bounds(soldier.Position), &hit)) {
-            target = it;
+            intersection = SoldierIntersection{id, hit.Fraction};
             if (hit.StartBad) {
                 break;
             }
         }
     }
-    if (target != Peers.end()) {
-        const auto &soldier = *Simulation.Find_Soldier(target->first);
-        if (FriendlyFire || soldier.PlayerType != bullet.Team) {
-            Apply_Bullet_Damage(target->first, target->second, bullet);
-        }
-        return true;
-    }
-    if (terrain) {
-        Apply_Building_Damage(*terrain, bullet);
-    }
-    return terrain.has_value();
+    return intersection;
 }
 
-void HeadlessPlayerSession::Apply_Building_Damage(const HeadlessCollision::RayHit &terrain, const Bullet &bullet)
+void HeadlessPlayerSession::Apply_Building_Damage(std::size_t index, bool mct, const Offense &attack)
 {
-    const auto &collision = Simulation.Map_Collision();
-    const auto owner = collision.Building_For_Object(terrain.ObjectIndex);
-    if (!owner || *owner >= Buildings.size()) {
+    if (index >= Buildings.size()) {
         return;
     }
-    const auto &def = collision.Level().Buildings()[*owner];
-    auto &building = Buildings[*owner];
-    if (building.ObjectId == 0 || building.Health <= 0 || (!FriendlyFire && def.PlayerType == bullet.Team)) {
+    const auto &def = Simulation.Map_Collision().Level().Buildings()[index];
+    auto &building = Buildings[index];
+    if (building.ObjectId == 0 || building.Health <= 0 || (!FriendlyFire && def.PlayerType == attack.Team)) {
         return;
     }
-    const auto &part = collision.Level().Static_Objects()[terrain.ObjectIndex];
-    const unsigned skin = part.MCT ? def.MCTSkin : building.Skin;
-    if (skin >= Armor->size() || bullet.Definition.Warhead >= (*Armor)[skin].Warheads.size()) {
+    const unsigned skin = mct ? def.MCTSkin : building.Skin;
+    if (skin >= Armor->size() || attack.Warhead >= (*Armor)[skin].Warheads.size()) {
         return;
     }
-    const float scale = std::max(0.0f, (*Armor)[skin].Warheads[bullet.Definition.Warhead].Scale);
+    const float scale = std::max(0.0f, (*Armor)[skin].Warheads[attack.Warhead].Scale);
     // BuildingGameObj::Apply_Damage_Building bypasses shields and uses the component's skin.
-    const float damage = std::min(building.Health, bullet.Definition.Damage * scale);
+    const float damage = std::min(building.Health, attack.Damage * scale);
     if (damage > 0) {
         building.Health -= damage;
         building.Changed = true;
-        Hits.push_back({0, def.PlayerType, bullet.ShooterObject, double(damage) * def.DamagePoints,
+        Hits.push_back({0, def.PlayerType, attack.ShooterObject, double(damage) * def.DamagePoints,
             def.DeathPoints, building.Health == 0});
     }
 }
 
-void HeadlessPlayerSession::Apply_Bullet_Damage(int player_id, Peer &peer, const Bullet &bullet)
+void HeadlessPlayerSession::Apply_Soldier_Damage(int player_id, Peer &peer, const Offense &attack)
 {
     if (!Armor || peer.Skin >= Armor->size() || peer.ShieldType >= Armor->size()) {
         return;
     }
     const auto &skin = (*Armor)[peer.Skin].Warheads;
     const auto &shield = (*Armor)[peer.ShieldType].Warheads;
-    const auto warhead = bullet.Definition.Warhead;
+    const auto warhead = attack.Warhead;
     if (warhead >= skin.size() || warhead >= shield.size()) {
         return;
     }
-    double damage = bullet.Definition.Damage;
+    double damage = attack.Damage;
     double shield_damage = 0;
     const float previous_shield = peer.Shield;
     if (peer.Shield > 0) {
@@ -587,7 +634,7 @@ void HeadlessPlayerSession::Apply_Bullet_Damage(int player_id, Peer &peer, const
     const double points = (health_damage + shield_damage) * peer.DamagePoints;
     if (points != 0 || fatal) {
         Hits.push_back({player_id, Simulation.Find_Soldier(player_id)->PlayerType,
-            bullet.ShooterObject, points, peer.DeathPoints, fatal});
+            attack.ShooterObject, points, peer.DeathPoints, fatal});
     }
     if (fatal) {
         peer.MoveAxes.Set(0, 0);
@@ -606,7 +653,7 @@ std::vector<HeadlessPlayerSession::CombatHit> HeadlessPlayerSession::Take_Combat
 void HeadlessPlayerSession::Advance_Bullets(float seconds)
 {
     Bullets.erase(std::remove_if(Bullets.begin(), Bullets.end(), [&](Bullet &bullet) {
-        const float travel = std::min(bullet.RemainingTravel, seconds * bullet.Definition.Speed);
+        const float travel = std::min(bullet.RemainingTravel, seconds * bullet.Speed);
         const auto end = bullet.Position + bullet.Direction * travel;
         if (Trace_Bullet(bullet, end)) {
             return true;
@@ -615,6 +662,205 @@ void HeadlessPlayerSession::Advance_Bullets(float seconds)
         bullet.RemainingTravel -= travel;
         return bullet.RemainingTravel <= 0;
     }), Bullets.end());
+}
+
+void HeadlessPlayerSession::Throw_Charge(int owner, const Peer &peer,
+    const HeadlessTimedChargeDefinition &definition, unsigned mode)
+{
+    if (Charges.size() >= MaxActiveCharges) {
+        return;
+    }
+    const auto &soldier = *Simulation.Find_Soldier(owner);
+    const auto origin = soldier.Position + Vector3(0, 0, SoldierEyeHeight);
+    auto direction = peer.Target - origin;
+    if (direction.Length2() < 0.0001f) {
+        direction.Set(peer.Forward.X, peer.Forward.Y, 0);
+    }
+    direction.Normalize();
+    const float facing = std::atan2(peer.Forward.Y, peer.Forward.X);
+    const auto &charge = Charges.emplace_back(Charge{Allocate_Network_Object(), owner, peer.SoldierObject,
+        soldier.PlayerType, definition, origin, definition.ThrowSpeed * direction, facing, definition.FuseSeconds[mode]});
+    for (const int recipient : MapViewers) {
+        if (Connection.Get_Remote_Host(recipient)) {
+            Send_Charge(charge, recipient, NetworkObjectClass::BIT_CREATION);
+        }
+    }
+}
+
+void HeadlessPlayerSession::Move_Charge(Charge &charge, float seconds)
+{
+    const auto &collision = Simulation.Map_Collision();
+    const float acceleration = -Gravity * charge.Definition.GravityScale;
+    const auto end = charge.Position + seconds * charge.Velocity +
+        Vector3(0, 0, 0.5f * acceleration * seconds * seconds);
+    const auto surface = collision.Cast_Ray(charge.Position, end, COLLISION_TYPE_PROJECTILE, true);
+    if (surface && surface->StartsInside) {
+        charge.Position = end;
+        charge.Velocity.Z += acceleration * seconds;
+        return;
+    }
+
+    const LineSegClass ray(charge.Position, end);
+    const auto target = Cast_Soldiers(ray, charge.OwnerObject, surface ? surface->Fraction : 1.0f);
+    if (!surface && !target) {
+        charge.Position = end;
+        charge.Velocity.Z += acceleration * seconds;
+        return;
+    }
+
+    // ProjectileClass stops just short of the contact plane.
+    ray.Compute_Point(0.99f * (target ? target->Fraction : surface->Fraction), &charge.Position);
+    charge.Velocity.Set(0, 0, 0);
+    charge.Stuck = true;
+    if (target) {
+        const auto &peer = Peers.at(target->PeerId);
+        charge.AttachedPeer = target->PeerId;
+        charge.AttachedObject = peer.SoldierObject;
+        const auto delta = charge.Position - Simulation.Find_Soldier(target->PeerId)->Position;
+        const auto &forward = peer.Forward;
+        charge.AttachedOffset.Set(Vector2::Dot_Product(Vector2(delta.X, delta.Y), forward),
+            Vector2::Dot_Product(Vector2(delta.X, delta.Y), Left_Of(forward)), delta.Z);
+    } else {
+        const auto building = collision.Building_For_Object(surface->ObjectIndex);
+        if (building && *building < Buildings.size()) {
+            charge.Building = building;
+            charge.StuckMCT = collision.Level().Static_Objects()[surface->ObjectIndex].MCT;
+        }
+    }
+}
+
+void HeadlessPlayerSession::Advance_Charges(double seconds, float movement_seconds)
+{
+    Charges.erase(std::remove_if(Charges.begin(), Charges.end(), [&](Charge &charge) {
+        const auto owner = Peers.find(charge.OwnerPeer);
+        const auto target = Peers.find(charge.AttachedPeer);
+        if (owner == Peers.end() || (charge.AttachedPeer != 0 &&
+                (target == Peers.end() || target->second.SoldierObject != charge.AttachedObject))) {
+            Send_Map_Object_Deletion(charge.ObjectId);
+            return true;
+        }
+        const bool was_stuck = charge.Stuck;
+        const int previous_owner = charge.OwnerObject;
+        charge.OwnerObject = owner->second.SoldierObject;
+        if (!charge.Stuck) {
+            Move_Charge(charge, static_cast<float>(std::min<double>(movement_seconds, charge.FuseRemaining)));
+        } else if (charge.AttachedPeer != 0) {
+            const auto &forward = target->second.Forward;
+            const auto xy = charge.AttachedOffset.X * forward + charge.AttachedOffset.Y * Left_Of(forward);
+            charge.Position = Simulation.Find_Soldier(charge.AttachedPeer)->Position +
+                Vector3(xy.X, xy.Y, charge.AttachedOffset.Z);
+        }
+        charge.FuseRemaining -= seconds;
+        if (charge.FuseRemaining <= 0) {
+            Detonate_Charge(charge);
+            Send_Map_Object_Deletion(charge.ObjectId);
+            return true;
+        }
+        if (charge.Stuck != was_stuck || charge.OwnerObject != previous_owner) {
+            for (const int recipient : MapViewers) {
+                if (Connection.Get_Remote_Host(recipient)) {
+                    Send_Charge(charge, recipient, NetworkObjectClass::BIT_RARE);
+                }
+            }
+        }
+        return false;
+    }), Charges.end());
+}
+
+void HeadlessPlayerSession::Detonate_Charge(const Charge &charge)
+{
+    const auto &blast = charge.Definition.Explosion;
+    const auto &collision = Simulation.Map_Collision();
+    cPacket event;
+    event.Add(Allocate_Network_Object());
+    event.Add(static_cast<BYTE>(NetworkObjectClass::BIT_CREATION));
+    event.Add(true);
+    event.Add(NETCLASSID_SCEXPLOSIONEVENT);
+    event.Add(blast.Id);
+    Write_Position(event, charge.Position);
+    event.Add(charge.OwnerObject);
+    for (const int recipient : MapViewers) {
+        if (Connection.Get_Remote_Host(recipient) && Peers.at(recipient).Ready) {
+            Connection.Send_Packet_To_Individual(event, recipient, SEND_RELIABLE);
+        }
+    }
+
+    for (auto &[id, peer] : Peers) {
+        if (!peer.Ready || peer.Health <= 0) {
+            continue;
+        }
+        const auto &soldier = *Simulation.Find_Soldier(id);
+        if (soldier.PlayerType == charge.Team && id != charge.OwnerPeer && !FriendlyFire) {
+            continue;
+        }
+        const auto bullseye = soldier.Position + Vector3(0, 0, peer.BullseyeHeight);
+        const float distance = (bullseye - charge.Position).Length();
+        if (blast.Radius <= 0 || (distance > blast.Radius && id != charge.AttachedPeer)) {
+            continue;
+        }
+        float scale = 1.0f;
+        if (id != charge.AttachedPeer) {
+            if (blast.Scaled) {
+                scale = 1.0f - distance / blast.Radius;
+            }
+            const auto cover = collision.Cast_Ray(bullseye, charge.Position, COLLISION_TYPE_PROJECTILE);
+            if (cover && cover->Fraction < 1.0f - 0.00001f) {
+                scale *= 0.25f;
+            }
+        }
+        Apply_Soldier_Damage(id, peer, {charge.OwnerObject, charge.Team, blast.Damage * scale, blast.Warhead});
+    }
+    if (charge.Building) {
+        Apply_Building_Damage(*charge.Building, charge.StuckMCT,
+            {charge.OwnerObject, charge.Team, blast.Damage, blast.Warhead});
+    }
+}
+
+void HeadlessPlayerSession::Send_Charge(const Charge &charge, int recipient, BYTE dirty)
+{
+    cPacket packet;
+    packet.Add(charge.ObjectId);
+    packet.Add(dirty);
+    packet.Add(false);
+    if (dirty == NetworkObjectClass::BIT_CREATION) {
+        packet.Add(NETCLASSID_GAMEOBJ);
+        packet.Add(charge.Definition.ObjectPreset);
+        Write_Position(packet, charge.Position);
+        packet.Add(charge.Facing);
+    }
+    packet.Add_Terminated_String(charge.Definition.Model.c_str(), true); // PhysicalGameObj::Export_Rare.
+    packet.Add_Terminated_String("", true); // Animation.
+    packet.Add(0); // Current frame.
+    packet.Add(0); // Target frame.
+    packet.Add(3); // ANIM_MODE_TARGET.
+    packet.Add(0); // Host object.
+    packet.Add(0); // Host bone.
+    packet.Add(charge.Team);
+    packet.Add(false); // HUD poke indicator.
+    packet.Add(charge.Definition.AmmoPreset);
+    packet.Add(charge.OwnerObject);
+    const auto write_velocity = [&](const Vector3 &value) {
+        for (int axis = 0; axis < 3; ++axis) {
+            ULONG code;
+            ChargeVelocityEncoder.Scale(value[axis], code);
+            packet.Add_Bits(code, ChargeVelocityEncoder.Get_Bit_Precision());
+        }
+    };
+    write_velocity(charge.Velocity);
+    packet.Add(charge.Stuck);
+    if (charge.Stuck) {
+        Write_Position(packet, charge.Position);
+        packet.Add(charge.StuckMCT);
+        packet.Add(charge.AttachedObject != 0);
+        packet.Add(charge.Building ? Buildings[*charge.Building].ObjectId : charge.AttachedObject);
+        if (charge.AttachedObject != 0) {
+            write_velocity(charge.AttachedOffset);
+            packet.Add(0); // Use the soldier's root bone.
+        }
+        packet.Add(false); // No animated static object attachment.
+    }
+    Write_Defense(packet, charge.Definition.Health, charge.Definition.Shield, charge.Definition.ShieldType);
+    Connection.Send_Packet_To_Individual(packet, recipient, SEND_RELIABLE);
 }
 
 void HeadlessPlayerSession::Select_Weapon(Peer &peer, ULONG controls)
@@ -665,7 +911,9 @@ void HeadlessPlayerSession::Advance(HeadlessSimulation::Clock::duration elapsed)
         return;
     }
     const auto weapon_elapsed = std::min(elapsed, std::chrono::duration_cast<Duration>(100ms));
-    Advance_Bullets(std::chrono::duration<float>(weapon_elapsed).count());
+    const float movement_seconds = std::chrono::duration<float>(weapon_elapsed).count();
+    Advance_Bullets(movement_seconds);
+    Advance_Charges(std::chrono::duration<double>(elapsed).count(), movement_seconds);
     for (auto &[id, peer] : Peers) {
         if (peer.Ready && peer.Health > 0) {
             const auto held = std::min(weapon_elapsed, peer.InputRemaining);
@@ -752,7 +1000,7 @@ void HeadlessPlayerSession::Publish_Buildings()
         }
         const int old = building.State;
         building.State = Building_State(definitions[index], building.Health);
-        for (const int recipient : BuildingViewers) {
+        for (const int recipient : MapViewers) {
             if (Connection.Get_Remote_Host(recipient)) {
                 Send_Building(index, recipient, NetworkObjectClass::BIT_OCCASIONAL);
                 if (building.State != old) {

@@ -16,6 +16,7 @@
 #include "renegade_version_files.h"
 #include "saveloadids.h"
 #include "wwpacket.h"
+#include "wwphysids.h"
 
 namespace {
 
@@ -34,6 +35,11 @@ constexpr uint32 WeaponVariables = 1205091654;
 constexpr uint32 WeaponParent = 1205091655;
 constexpr uint32 AmmoVariables = 1206091429;
 constexpr uint32 AmmoParent = 1206091430;
+constexpr uint32 TossedChargeParent = 930991700;
+constexpr uint32 TossedChargeVariables = TossedChargeParent + 1;
+constexpr uint32 MoveablePhysicsVariables = 0x04486001;
+constexpr uint32 ExplosionVariables = 0317001525;
+constexpr uint32 ExplosionParent = ExplosionVariables + 1;
 constexpr uint32 PowerupVariables = 909991657;
 constexpr uint32 TranslateVariables = 0x07141200;
 constexpr float MaxDefense = 2000.0f;
@@ -59,6 +65,8 @@ struct Record {
     int SkinSaveId = 0;
     int ShieldSaveId = 0;
     std::vector<std::string> SpawnPowerups;
+    float ThrowSpeed = 5;
+    float GravityScale = 1;
 };
 
 struct WeaponDefinition {
@@ -88,6 +96,8 @@ struct AmmoDefinition {
     int SoftPierceLimit = 0;
     bool Tracking = false;
     int Explosion = 0;
+    std::string Model;
+    std::array<float, 3> FuseSeconds{};
 };
 
 struct WeaponGrant {
@@ -100,7 +110,16 @@ struct EquipmentDefinitions {
     std::map<int, WeaponDefinition> Weapons;
     std::map<int, AmmoDefinition> Ammo;
     std::map<std::string, WeaponGrant> Powerups;
+    std::map<int, HeadlessExplosionDefinition> Explosions;
+    std::map<int, float> ProjectileGravity;
+    Record TossedCharge;
 };
+
+std::string Model_Name(const std::string &path)
+{
+    const auto basename = path.substr(path.find_last_of("/\\") + 1);
+    return basename.substr(0, basename.find_last_of('.'));
+}
 
 void Read_Identity(BoundedChunkReader &reader, int &definition_id, std::string &name)
 {
@@ -122,7 +141,7 @@ float Read_Defense_Value(BoundedChunkReader &reader)
 
 void Read_Record(BoundedChunkReader &reader, Record &record, uint32 parent, unsigned depth = 0)
 {
-    reader.Require(depth < 20, "Soldier definition is nested too deeply");
+    reader.Require(depth < 20, "Game object definition is nested too deeply");
     reader.Each_Chunk([&](uint32 id) {
         if (id == DefinitionIdentity) {
             Read_Identity(reader, record.Soldier.DefinitionId, record.Name);
@@ -145,10 +164,14 @@ void Read_Record(BoundedChunkReader &reader, Record &record, uint32 parent, unsi
                     record.SpawnPowerups.push_back(Fold_Ascii(reader.Read_String()));
                 }
             });
-        } else if (id == PhysicalVariables && parent == ArmedPhysicalParent) {
+        } else if (id == PhysicalVariables && (parent == ArmedPhysicalParent || parent == TossedChargeParent)) {
             reader.Each_Micro([&](uint32 field) {
                 if (field == 18) {
                     record.PhysicsId = reader.Value<sint32>();
+                } else if (field == 2) {
+                    const auto height = reader.Value<float>();
+                    reader.Require(std::isfinite(height), "Invalid game object bullseye offset");
+                    record.Soldier.BullseyeHeight = height;
                 }
             });
         } else if (id == DefenseVariables) {
@@ -174,10 +197,14 @@ void Read_Record(BoundedChunkReader &reader, Record &record, uint32 parent, unsi
         } else if (id == PhysicsModelVariables) {
             reader.Each_Micro([&](uint32 field) {
                 if (field == 1) {
-                    const auto path = reader.Read_String();
-                    const auto basename = path.substr(path.find_last_of("/\\") + 1);
-                    const auto extension = basename.find_last_of('.');
-                    record.Soldier.Model = basename.substr(0, extension);
+                    record.Soldier.Model = Model_Name(reader.Read_String());
+                }
+            });
+        } else if (id == TossedChargeVariables || id == MoveablePhysicsVariables) {
+            reader.Each_Micro([&](uint32 field) {
+                if (field == 1) {
+                    auto &value = id == TossedChargeVariables ? record.ThrowSpeed : record.GravityScale;
+                    value = reader.Value<float>();
                 }
             });
         } else if (reader.Has_Children()) {
@@ -233,6 +260,7 @@ void Read_Ammo(BoundedChunkReader &reader, EquipmentDefinitions &equipment)
         } else if (id == AmmoVariables) {
             reader.Each_Micro([&](uint32 field) {
                 switch (field) {
+                case 2: ammo.Model = Model_Name(reader.Read_String()); break;
                 case 3: ammo.Warhead = reader.Value<sint32>(); break;
                 case 4: ammo.Damage = reader.Value<float>(); break;
                 case 5: ammo.Range = reader.Value<float>(); break;
@@ -247,13 +275,39 @@ void Read_Ammo(BoundedChunkReader &reader, EquipmentDefinitions &equipment)
                 case 27: ammo.ChargeSeconds = reader.Value<float>(); break;
                 case 31: ammo.RoundCost = reader.Value<sint32>(); break;
                 case 32: ammo.Type = reader.Value<sint32>(); break;
+                case 35:
+                case 36:
+                case 37: ammo.FuseSeconds[field - 35] = reader.Value<float>(); break;
                 case 48: ammo.RateOfFire = reader.Value<float>(); break;
                 }
             });
         }
     });
     if (definition_id > 0) {
-        equipment.Ammo[definition_id] = ammo;
+        equipment.Ammo[definition_id] = std::move(ammo);
+    }
+}
+
+void Read_Explosion(BoundedChunkReader &reader, EquipmentDefinitions &equipment)
+{
+    HeadlessExplosionDefinition explosion;
+    reader.Each_Chunk([&](uint32 id) {
+        if (id == ExplosionParent) {
+            std::string name;
+            reader.In_Chunk(DefinitionIdentity, [&] { Read_Identity(reader, explosion.Id, name); });
+        } else if (id == ExplosionVariables) {
+            reader.Each_Micro([&](uint32 field) {
+                switch (field) {
+                case 3: explosion.Radius = reader.Value<float>(); break;
+                case 4: explosion.Damage = reader.Value<float>(); break;
+                case 5: explosion.Warhead = reader.Value<uint32>(); break;
+                case 6: explosion.Scaled = reader.Value<uint8>() != 0; break;
+                }
+            });
+        }
+    });
+    if (explosion.Id > 0) {
+        equipment.Explosions[explosion.Id] = explosion;
     }
 }
 
@@ -295,6 +349,10 @@ void Load_Presets(const GameDataFile &source, std::map<int, std::string> &physic
                     reader.In_Chunk(FactoryData, [&] { Read_Ammo(reader, equipment); });
                     return;
                 }
+                if (factory == CHUNKID_EXPLOSION_DEF) {
+                    reader.In_Chunk(FactoryData, [&] { Read_Explosion(reader, equipment); });
+                    return;
+                }
                 if (factory == CHUNKID_GAME_OBJECT_DEF_POWERUP) {
                     std::string name;
                     WeaponGrant grant;
@@ -304,13 +362,20 @@ void Load_Presets(const GameDataFile &source, std::map<int, std::string> &physic
                     }
                     return;
                 }
-                if (factory != CHUNKID_GAME_OBJECT_DEF_SOLDIER && factory != HumanPhysicsFactory) {
+                if (factory != CHUNKID_GAME_OBJECT_DEF_SOLDIER && factory != HumanPhysicsFactory &&
+                    factory != CHUNKID_GAME_OBJECT_DEF_C4 && factory != PHYSICS_CHUNKID_PROJECTILEDEF) {
                     return;
                 }
                 Record record;
                 reader.In_Chunk(FactoryData, [&] { Read_Record(reader, record, FactoryData); });
                 if (factory == HumanPhysicsFactory) {
                     physics[record.Soldier.DefinitionId] = std::move(record.Soldier.Model);
+                } else if (factory == PHYSICS_CHUNKID_PROJECTILEDEF) {
+                    equipment.ProjectileGravity[record.Soldier.DefinitionId] = record.GravityScale;
+                } else if (factory == CHUNKID_GAME_OBJECT_DEF_C4) {
+                    if (Fold_Ascii(record.Name) == "tossed c4") {
+                        equipment.TossedCharge = std::move(record);
+                    }
                 } else {
                     const auto name = Fold_Ascii(record.Name);
                     if (name == "cnc_nod_minigunner_0") {
@@ -324,16 +389,18 @@ void Load_Presets(const GameDataFile &source, std::map<int, std::string> &physic
     });
 }
 
-std::optional<HeadlessFireMode> Get_Fire_Mode(const EquipmentDefinitions &equipment, int id, float charge_seconds)
+std::optional<HeadlessFireMode> Get_Fire_Mode(const EquipmentDefinitions &equipment, const HeadlessArmorTable &armor,
+    int id, float charge_seconds, bool timed_charge)
 {
     constexpr int NormalAmmo = 0;
+    constexpr int TimedC4Ammo = 2;
     constexpr float MaxShotsPerSecond = 1000;
     const auto def = equipment.Ammo.find(id);
     if (def == equipment.Ammo.end()) {
         return std::nullopt;
     }
     const auto &ammo = def->second;
-    if (ammo.Type != NormalAmmo || ammo.BurstMax != 0 || ammo.RoundCost < 0 ||
+    if (ammo.Type != (timed_charge ? TimedC4Ammo : NormalAmmo) || ammo.BurstMax != 0 || ammo.RoundCost < 0 ||
         !std::isfinite(ammo.RateOfFire) || ammo.RateOfFire <= 0 || ammo.RateOfFire > MaxShotsPerSecond ||
         !std::isfinite(charge_seconds) || charge_seconds < 0) {
         return std::nullopt;
@@ -343,6 +410,29 @@ std::optional<HeadlessFireMode> Get_Fire_Mode(const EquipmentDefinitions &equipm
         return std::nullopt;
     }
     HeadlessFireMode mode{interval, charge_seconds, ammo.RoundCost, {}};
+    if (timed_charge) {
+        const auto &tossed = equipment.TossedCharge;
+        const auto projectile = equipment.ProjectileGravity.find(tossed.PhysicsId);
+        const auto explosion = equipment.Explosions.find(ammo.Explosion);
+        if (tossed.Soldier.DefinitionId <= 0 || projectile == equipment.ProjectileGravity.end() ||
+            explosion == equipment.Explosions.end() || ammo.Model.empty() || ammo.Model.size() > 255 || ammo.RoundCost <= 0 ||
+            !std::isfinite(tossed.ThrowSpeed) || tossed.ThrowSpeed <= 0 || tossed.ThrowSpeed > 90 ||
+            !std::isfinite(projectile->second) || projectile->second < 0 ||
+            std::any_of(ammo.FuseSeconds.begin(), ammo.FuseSeconds.end(), [](float seconds) {
+                return !std::isfinite(seconds) || seconds <= 0;
+            })) {
+            return std::nullopt;
+        }
+        const auto &blast = explosion->second;
+        if (!std::isfinite(blast.Radius) || blast.Radius < 0 || !std::isfinite(blast.Damage) || blast.Damage <= 0 ||
+            armor.empty() || blast.Warhead >= armor.front().Warheads.size()) {
+            return std::nullopt;
+        }
+        mode.TimedCharge = HeadlessTimedChargeDefinition{tossed.Soldier.DefinitionId, id, ammo.Model, tossed.ThrowSpeed,
+            projectile->second, ammo.FuseSeconds, tossed.Soldier.Health, tossed.Soldier.Shield,
+            Headless_Armor_Index(armor, tossed.ShieldSaveId), blast};
+        return mode;
+    }
     // The minigunner uses single, straight bullets. The other projectile behaviors need their own simulation.
     if (ammo.Warhead >= 0 && std::isfinite(ammo.Damage) && ammo.Damage > 0 &&
         std::isfinite(ammo.Range) && ammo.Range > 0 && ammo.Range <= 1000 &&
@@ -355,7 +445,8 @@ std::optional<HeadlessFireMode> Get_Fire_Mode(const EquipmentDefinitions &equipm
     return mode;
 }
 
-void Load_Starting_Weapons(const Record &record, const EquipmentDefinitions &equipment, HeadlessSoldierPreset &soldier)
+void Load_Starting_Weapons(const Record &record, const EquipmentDefinitions &equipment, const HeadlessArmorTable &armor,
+    HeadlessSoldierPreset &soldier)
 {
     struct LoadedWeapon {
         int DefinitionId;
@@ -411,14 +502,15 @@ void Load_Starting_Weapons(const Record &record, const EquipmentDefinitions &equ
                 weapon.Clip, weapon.Inventory, reload, {}, {}};
             constexpr int RifleStyle = 2;
             constexpr int HandgunStyle = 5;
-            // These stock weapon styles fire bullets. C4, beacons and launchers have separate behavior.
-            if (spawn.ClipSize > 0 && (def.Style == RifleStyle || def.Style == HandgunStyle)) {
+            constexpr int C4Style = 0;
+            const bool timed_charge = def.Style == C4Style;
+            if (spawn.ClipSize > 0 && (def.Style == RifleStyle || def.Style == HandgunStyle || timed_charge)) {
                 const auto ammo = equipment.Ammo.find(def.PrimaryAmmo);
                 if (ammo != equipment.Ammo.end()) {
                     const float charge = ammo->second.ChargeSeconds; // WeaponClass uses primary charge for both triggers.
-                    spawn.PrimaryFire = Get_Fire_Mode(equipment, def.PrimaryAmmo, charge);
+                    spawn.PrimaryFire = Get_Fire_Mode(equipment, armor, def.PrimaryAmmo, charge, timed_charge);
                     if (spawn.PrimaryFire && !def.CanSnipe) {
-                        spawn.SecondaryFire = Get_Fire_Mode(equipment, def.SecondaryAmmo, charge);
+                        spawn.SecondaryFire = Get_Fire_Mode(equipment, armor, def.SecondaryAmmo, charge, timed_charge);
                     }
                 }
             }
@@ -522,7 +614,7 @@ HeadlessJoinData Load_Headless_Join_Data(uint32 client_build, const HeadlessArmo
         result.Soldiers[team].Model = model->second;
         result.Soldiers[team].Skin = Headless_Armor_Index(armor, record.SkinSaveId);
         result.Soldiers[team].ShieldType = Headless_Armor_Index(armor, record.ShieldSaveId);
-        Load_Starting_Weapons(record, equipment, result.Soldiers[team]);
+        Load_Starting_Weapons(record, equipment, armor, result.Soldiers[team]);
     }
     return result;
 }

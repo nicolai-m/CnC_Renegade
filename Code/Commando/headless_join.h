@@ -115,8 +115,6 @@ private:
     std::u16string PendingName;
     std::map<int, Peer> Peers;
     std::set<int> Closing;
-    // Allocate from the high end of the original dynamic object range.
-    int NextObject = 2100000000;
     const std::array<int, 2> Teams;
     std::array<CombatStats, 2> TeamStats;
 };

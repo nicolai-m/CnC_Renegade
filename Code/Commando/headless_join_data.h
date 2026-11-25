@@ -18,11 +18,33 @@ struct HeadlessBulletDefinition {
     float Spread;
 };
 
+struct HeadlessExplosionDefinition {
+    int Id = 0;
+    float Radius = 0;
+    float Damage = 0;
+    unsigned Warhead = 0;
+    bool Scaled = false;
+};
+
+struct HeadlessTimedChargeDefinition {
+    int ObjectPreset;
+    int AmmoPreset;
+    std::string Model;
+    float ThrowSpeed;
+    float GravityScale;
+    std::array<float, 3> FuseSeconds;
+    float Health;
+    float Shield;
+    unsigned ShieldType;
+    HeadlessExplosionDefinition Explosion;
+};
+
 struct HeadlessFireMode {
     float ShotInterval;
     float ChargeSeconds;
     int RoundCost;
     std::optional<HeadlessBulletDefinition> Bullet;
+    std::optional<HeadlessTimedChargeDefinition> TimedCharge;
 };
 
 struct HeadlessSpawnWeapon {
@@ -34,6 +56,7 @@ struct HeadlessSpawnWeapon {
     float ReloadSeconds;
     std::optional<HeadlessFireMode> PrimaryFire;
     std::optional<HeadlessFireMode> SecondaryFire;
+    unsigned DetonationMode = 0;
 
     int Total_Rounds() const;
 };
@@ -49,6 +72,7 @@ struct HeadlessSoldierPreset {
     unsigned Skin = 0;
     float DamagePoints = 0;
     float DeathPoints = 0;
+    float BullseyeHeight = 1.2f;
 };
 
 struct HeadlessDamageRule {

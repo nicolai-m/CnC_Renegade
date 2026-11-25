@@ -55,6 +55,24 @@ bool Finite(const Vector3 &value)
     return std::isfinite(value.X) && std::isfinite(value.Y) && std::isfinite(value.Z);
 }
 
+bool Is_Permeable_Surface(uint32 surface)
+{
+    switch (surface) {
+    case SURFACE_TYPE_FOLIAGE_PERMEABLE:
+    case SURFACE_TYPE_GLASS_PERMEABLE:
+    case SURFACE_TYPE_ICE_PERMEABLE:
+    case SURFACE_TYPE_CLOTH_PERMEABLE:
+    case SURFACE_TYPE_ELECTRICAL_PERMEABLE:
+    case SURFACE_TYPE_FLAMMABLE_PERMEABLE:
+    case SURFACE_TYPE_STEAM_PERMEABLE:
+    case SURFACE_TYPE_WATER_PERMEABLE:
+    case SURFACE_TYPE_TIBERIUM_WATER_PERMEABLE:
+        return true;
+    default:
+        return false;
+    }
+}
+
 struct ModelPart {
     std::string Name;
     uint32 Bone;
@@ -539,12 +557,13 @@ HeadlessCollision HeadlessCollision::Load(HeadlessLevel level, const FindAsset &
 }
 
 std::optional<HeadlessCollision::RayHit> HeadlessCollision::Cast_Ray(const Vector3 &start, const Vector3 &end,
-    unsigned mask) const
+    unsigned mask, bool skip_permeable_terrain) const
 {
     const LineSegClass world_ray(start, end);
     float nearest = 1.0f;
     std::optional<RayHit> hit;
     for (const auto index : Scene.Find_Static_Candidates(start, end)) {
+        const bool skip_permeable = skip_permeable_terrain && !BuildingOwners[index];
         for (const auto &collider : Objects[index]) {
             const auto &shape = *collider.Shape;
             if (!(shape.Mask & mask)) {
@@ -562,6 +581,9 @@ std::optional<HeadlessCollision::RayHit> HeadlessCollision::Cast_Ray(const Vecto
                 result.Reset();
                 result.Fraction = nearest;
                 for (const auto &triangle : shape.Triangles) {
+                    if (skip_permeable && Is_Permeable_Surface(triangle.Surface)) {
+                        continue;
+                    }
                     if (CollisionMath::Collide(ray, shape.Get_Triangle(triangle), &result)) {
                         result.SurfaceType = triangle.Surface;
                     }

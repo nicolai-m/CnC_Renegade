@@ -353,11 +353,13 @@ std::string Definitions()
         return Chunk(0x20501, Chunk(0x00100101, Chunk(0x100, Micro(1, id), false) +
             Chunk(0x055ffe08, Micro(1, model), false)));
     };
-    auto weapon = [](sint32 id, sint32 clip, sint32 reserve, float key, sint32 style) {
+    auto weapon = [](sint32 id, sint32 clip, sint32 reserve, float key, sint32 style,
+                      sint32 primary = 640, sint32 secondary = 641) {
         return Chunk(CHUNKID_WEAPON_DEF, Chunk(0x00100101,
             Chunk(1205091655, Chunk(0x100, Micro(1, id), false)) +
-            Chunk(1205091654, Micro(1, style) + Micro(9, 0.35f) + Micro(27, sint32{640}) +
-                Micro(28, sint32{641}) + Micro(29, clip) + Micro(35, reserve) + Micro(37, key), false)));
+            Chunk(1205091654, Micro(1, style) + Micro(9, 0.35f) + Micro(27, primary) +
+                Micro(28, secondary) + Micro(29, clip) +
+                Micro(35, reserve) + Micro(37, key), false)));
     };
     auto ammo = [](sint32 id, sint32 cost, float speed) {
         return Chunk(CHUNKID_AMMO_DEF, Chunk(0x00100101,
@@ -375,13 +377,28 @@ std::string Definitions()
     };
     const auto terminal = Chunk(0x20c03, Chunk(0x00100101,
         Chunk(0x100, Micro(1, sint32{702}), false) + Chunk(8281442, Micro(4, uint8{1}), false)));
+    const auto thrown_charge = Chunk(CHUNKID_GAME_OBJECT_DEF_C4, Chunk(0x00100101,
+        Chunk(930991700, Chunk(0x100, Micro(1, sint32{621}) + Micro(3, "Tossed C4"), false) +
+            Chunk(909991657, Micro(18, sint32{502}), false) +
+            Chunk(7311607, Micro(0, 100.0f) + Micro(5, sint32{23}), false)) +
+        Chunk(930991701, Micro(1, 10.0f), false)));
+    const auto charge_physics = Chunk(0x20506, Chunk(0x00100101,
+        Chunk(0x100, Micro(1, sint32{502}), false) + Chunk(0x04486001, Micro(1, 1.5f), false)));
+    const auto charge_ammo = Chunk(CHUNKID_AMMO_DEF, Chunk(0x00100101,
+        Chunk(1206091430, Chunk(0x100, Micro(1, sint32{642}), false)) +
+        Chunk(1206091429, Micro(2, "test\\charge.w3d") + Micro(24, sint32{643}) + Micro(31, sint32{1}) +
+            Micro(32, sint32{2}) + Micro(35, 3.0f) + Micro(36, 1.5f) + Micro(37, 6.0f) + Micro(48, 10.0f), false)));
+    const auto charge_explosion = Chunk(CHUNKID_EXPLOSION_DEF, Chunk(0x00100101,
+        Chunk(0317001526, Chunk(0x100, Micro(1, sint32{643}), false)) +
+        Chunk(0317001525, Micro(3, 3.0f) + Micro(4, 45.0f) + Micro(5, uint32{0}) + Micro(6, uint8{0}), false)));
     return Chunk(CHUNKID_SAVELOAD_DEFMGR, Chunk(0x101,
         definition(100, PLAYERTYPE_NOD) + definition(200, PLAYERTYPE_GDI) +
         building(300, "plant") + building(301, "base") + terminal +
         soldier(400, "CnC_Nod_Minigunner_0", 500) + soldier(401, "CnC_GDI_MiniGunner_0", 501) +
         physics(500, "test\\soldier0.w3d") + physics(501, "test\\soldier1.w3d") +
         weapon(600, 40, 200, 2, 2) + weapon(601, 40, 200, 2, 2) + weapon(610, 12, 100, 1, 5) +
-        weapon(620, 1, 0, 7, 0) + ammo(640, 20, 40.0f) + ammo(641, 7, 400.0f) + powerup));
+        weapon(620, 1, 0, 7, 0, 642, 642) + ammo(640, 20, 40.0f) + ammo(641, 7, 400.0f) + powerup +
+        thrown_charge + charge_physics + charge_ammo + charge_explosion));
 }
 
 struct ArchiveEntry {
@@ -747,12 +764,21 @@ struct Join_Client_State {
     std::map<int, int> Buildings; // Preset ID to network object ID.
     std::map<int, Defense> BuildingVitals;
     std::map<int, bool> BuildingDestroyed;
+    struct Charge {
+        int Owner = 0;
+        bool Stuck = false;
+        bool MCT = false;
+        int AttachedObject = 0;
+    };
+    std::map<int, Charge> Charges;
+    std::vector<int> ExplosionOwners;
     std::set<int> Deleted;
     std::optional<float> OptionsTime;
     std::optional<int> GameDataTime;
     int Round = 1;
     uint32 MapCRC = 0;
     bool CycleEnded = false;
+    bool JoiningActiveCombat = false;
     bool BaseDestructionEndsGame = false;
     int LastWinner = -1;
     int LastWinReason = 0;
@@ -919,7 +945,7 @@ void Read_Soldier_Frequent(cPacket &packet, Join_Client_State &client, int objec
         id = Field<int>(packet);
         rounds = Field<int>(packet);
         Check((id == 610 && rounds == -1) || ((id == 600 || id == 601) && rounds >= 0 && rounds <= 240) ||
-            (id == 620 && rounds == 1), "Incorrect equipped weapon or ammo count");
+            (id == 620 && rounds >= 0 && rounds <= 1), "Incorrect equipped weapon or ammo count");
     }
     client.SelectedWeapon[object] = id;
     client.Rounds[object] = rounds;
@@ -954,8 +980,10 @@ void Read_Soldier_Occasional(cPacket &packet, Join_Client_State &client, int obj
         const int id = Field<int>(packet);
         const int rounds = Field<int>(packet);
         if (team >= 0) {
-            Check(id == weapon.DefinitionId && rounds == weapon.Total_Rounds(),
-                "Spawn inventory did not include the armed preset and the scripted weapon grant");
+            const int starting = weapon.Total_Rounds();
+            const bool spent = client.JoiningActiveCombat && rounds >= 0 && rounds <= starting;
+            Check(id == weapon.DefinitionId && (rounds == starting || spent),
+                "Incorrect weapon or ammunition in soldier creation for preset " + std::to_string(id));
         }
     }
     client.Vitals[object] = state;
@@ -978,6 +1006,39 @@ void Read_Building(cPacket &packet, Join_Client_State &client, int object, bool 
     client.BuildingVitals[object] = vitals;
 }
 
+void Read_Charge(cPacket &packet, Join_Client_State &client, int object)
+{
+    char model[32];
+    char animation[32];
+    packet.Get_Terminated_String(model, sizeof(model), true);
+    packet.Get_Terminated_String(animation, sizeof(animation), true);
+    Check(std::string(model) == "charge" && *animation == 0 &&
+        Field<int>(packet) == 0 && Field<int>(packet) == 0 && Field<int>(packet) == 3 &&
+        Field<int>(packet) == 0 && Field<int>(packet) == 0 && Field<int>(packet) == PLAYERTYPE_NOD &&
+        !Field<bool>(packet) && Field<int>(packet) == 642, "Invalid C4 model, team or ammo preset");
+    auto &charge = client.Charges[object];
+    charge.Owner = Field<int>(packet);
+    ULONG code;
+    for (int axis = 0; axis < 3; ++axis) {
+        packet.Get_Bits(code, 15); // Projectile velocity.
+    }
+    charge.Stuck = Field<bool>(packet);
+    if (charge.Stuck) {
+        Read_Join_Position_Y(packet, client.MapCRC);
+        charge.MCT = Field<bool>(packet);
+        Check(!Field<bool>(packet), "C4 unexpectedly attached to a soldier");
+        charge.AttachedObject = Field<int>(packet);
+        Check(!Field<bool>(packet), "C4 unexpectedly attached to an animated static object");
+    }
+    Check(!Field<bool>(packet), "C4 spawned without health");
+    packet.Get_Bits(code, 11);
+    Check(code == 102, "C4 did not use its preset health");
+    packet.Get_Bits(code, 11);
+    Check(code == 0, "Wrong shield strength on C4");
+    packet.Get_Bits(code, 2);
+    Check(code == 2, "Wrong shield index on C4");
+}
+
 void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
 {
     const int object = Field<int>(packet);
@@ -985,6 +1046,7 @@ void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
     const bool deleting = Field<bool>(packet);
     if (dirty == 0 && deleting) {
         client.Deleted.insert(object);
+        client.Charges.erase(object);
         const auto old_soldier = std::find_if(client.Soldiers.begin(), client.Soldiers.end(), [object](const auto &entry) {
             return entry.second == object;
         });
@@ -1000,6 +1062,12 @@ void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
             client.BuildingDestroyed.erase(object);
         }
         Check(packet.Is_Flushed(), "Unexpected data in object deletion");
+        return;
+    }
+    if (client.Charges.count(object)) {
+        Check(!deleting && dirty == NetworkObjectClass::BIT_RARE, "Incorrect C4 state update");
+        Read_Charge(packet, client, object);
+        Check(packet.Is_Flushed(), "Unexpected data in C4 state update");
         return;
     }
     if (client.BuildingVitals.count(object)) {
@@ -1079,6 +1147,13 @@ void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
         break;
     case 1000: { // GameObj with factory data and all update tiers.
         const int preset = Field<int>(packet);
+        if (preset == 621) {
+            Check(!deleting, "C4 deleted on creation");
+            Read_Join_Position_Y(packet, client.MapCRC);
+            Check(std::isfinite(Field<float>(packet)), "Invalid C4 facing");
+            Read_Charge(packet, client, object);
+            break;
+        }
         if (preset == 300 || preset == 301) {
             Check(!deleting && client.Buildings.emplace(preset, object).second, "Invalid building creation");
             Read_Join_Position_Y(packet, client.MapCRC);
@@ -1110,7 +1185,8 @@ void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
         const auto &defense = client.Vitals.at(object);
         Check(!defense.Dead && defense.Health == 102 && defense.Shield == 51, "Incorrect spawn vitals");
         Read_Soldier_Frequent(packet, client, object);
-        Check(client.SelectedWeapon.at(object) == 600 + preset - first_preset, "The primary weapon must start equipped");
+        Check(client.JoiningActiveCombat || client.SelectedWeapon.at(object) == 600 + preset - first_preset,
+            "The primary weapon must start equipped");
         break;
     }
     case 1012: { // cGameDataUpdateEvent.
@@ -1119,6 +1195,12 @@ void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
         Check(remaining > 0 && remaining <= limit && Field<int>(packet) == client.Round && !client.Soldiers.empty(),
             "Incorrect game clock after map load");
         client.GameDataTime = remaining;
+        break;
+    }
+    case 1014: { // cScExplosionEvent.
+        Check(deleting && Field<int>(packet) == 643, "Incorrect explosion definition");
+        Read_Join_Position_Y(packet, client.MapCRC);
+        client.ExplosionOwners.push_back(Field<int>(packet));
         break;
     }
     case 1003: { // cWinEvent.
@@ -1223,13 +1305,17 @@ bool Has_Combat_Counts(const Join_Client_State &client, int killer, int victim, 
         client.KillMessages == std::vector<Counts>{{killer, victim}};
 }
 
-void Check_Building_Combat(const HeadlessCollision &collision, bool ends_game)
+void Check_Building_Combat(const HeadlessCollision &collision, bool ends_game, const HeadlessJoinData *charge_data = nullptr)
 {
     FirstJoinClient = {};
     SecondJoinClient = {};
+    LateJoinClient = {};
     HeadlessJoinData data{42, 1, 2, {{17, {{0.5f, 0}}}, {23, {{2, 0}}}},
         {{{400, "soldier0", 100, 50, 1, Fixture_Weapons(0), 600},
           {401, "soldier1", 100, 50, 1, Fixture_Weapons(1), 601}}}};
+    if (charge_data) {
+        data = *charge_data;
+    }
     data.Soldiers[PLAYERTYPE_NOD].Weapons[1].PrimaryFire->Bullet = HeadlessBulletDefinition{30, 0, 20, 400, 0};
     const std::vector<HeadlessMap> maps{{"C&C_Test.mix", collision, data}};
     HeadlessJoinOptions options;
@@ -1258,8 +1344,9 @@ void Check_Building_Combat(const HeadlessCollision &collision, bool ends_game)
 
     cConnection first;
     cConnection second;
+    cConnection late;
     const auto pump = [&](const auto &ready) {
-        Pump_Clients({&first, &second}, [&] {
+        Pump_Clients({&first, &second, &late}, [&] {
             server.Service_Read();
             server.Service_Send(true);
             return ready();
@@ -1283,20 +1370,23 @@ void Check_Building_Combat(const HeadlessCollision &collision, bool ends_game)
     const auto health_code = [](float health) { return static_cast<ULONG>(std::round(health * 2047 / 2000)); };
     Check(FirstJoinClient.BuildingVitals.at(plant).Health == health_code(30) &&
         FirstJoinClient.BuildingVitals.at(terminal).Health == health_code(80), "Incorrect initial building health");
-    const auto advance = [&] {
-        for (int tick = 0; tick < 12; ++tick) {
+    const auto advance = [&](int ticks = 12) {
+        for (int tick = 0; tick < ticks; ++tick) {
             session.Advance(100ms);
             join.Update_Combat();
         }
     };
     advance();
     Check(join.Update_Round(round_time), "Round clock stopped before building combat");
-    const auto fire = [&](int owner, const Vector3 &aim, int object, float health, float points, bool round_ends = false) {
+    const auto controls = [&](int owner, const Vector3 &aim, ULONG buttons, ULONG trigger) {
         const int before = received;
-        cPacket controls;
-        Write_Movement(controls, FirstControlObject, owner, soldier, aim, 21.0f, 8, 0, 1, false);
-        first.Send_Packet_To_Individual(controls, SERVER_RHOST_ID, owner ? SEND_RELIABLE : SEND_UNRELIABLE);
+        cPacket packet;
+        Write_Movement(packet, FirstControlObject, owner, soldier, aim, 21.0f, 8, buttons, trigger, false);
+        first.Send_Packet_To_Individual(packet, SERVER_RHOST_ID, owner ? SEND_RELIABLE : SEND_UNRELIABLE);
         pump([&] { return received > before; });
+    };
+    const auto fire = [&](int owner, const Vector3 &aim, int object, float health, float points, bool round_ends = false) {
+        controls(owner, aim, 0, 1);
         advance();
         const auto updated = [&](const Join_Client_State &client) {
             return client.BuildingVitals.at(object).Health == health_code(health) &&
@@ -1307,8 +1397,52 @@ void Check_Building_Combat(const HeadlessCollision &collision, bool ends_game)
     };
     fire(1, {8, 0, 1.62f}, plant, 15, 15);
     fire(0, {8, 0, 1.62f}, plant, 0, 40);
-    fire(0, {0, -8, 1.62f}, terminal, 20, 100);
-    fire(0, {0, -8, 1.62f}, terminal, 0, 130, ends_game);
+    if (!charge_data) {
+        fire(0, {0, -8, 1.62f}, terminal, 20, 100);
+        fire(0, {0, -8, 1.62f}, terminal, 0, 130, ends_game);
+    } else {
+        const Vector3 aim(0, -8, 1.62f);
+        controls(0, aim, (1u << ControlClass::BOOLEAN_SELECT_WEAPON_7) |
+            (1u << ControlClass::BOOLEAN_WEAPON_USE), 0);
+        advance();
+        pump([&] { return FirstJoinClient.SelectedWeapon.at(soldier) == 620 &&
+            SecondJoinClient.SelectedWeapon.at(soldier) == 620; });
+        controls(0, aim, 0, 1);
+        advance(3);
+        pump([&] { return FirstJoinClient.Charges.size() == 1 && SecondJoinClient.Charges.size() == 1; });
+        const int charge = FirstJoinClient.Charges.begin()->first;
+        pump([&] { return FirstJoinClient.Charges.at(charge).Stuck && SecondJoinClient.Charges.at(charge).Stuck &&
+            FirstJoinClient.Rounds.at(soldier) == 0 && SecondJoinClient.Rounds.at(soldier) == 0; });
+
+        LateJoinClient.JoiningActiveCombat = true;
+        Connect_Join_Client(late, u"Late", u"testpass", JoinKey, Receive_Late_Join);
+        pump([&] { return LateJoinClient.OptionsTime.has_value(); });
+        Send_Bio(late, u"Late", PLAYERTYPE_NOD, 1, "C&C_Test.mix");
+        pump([&] { return LateJoinClient.GameDataTime && LateJoinClient.Charges.count(charge); });
+        for (const auto *client : {&FirstJoinClient, &SecondJoinClient, &LateJoinClient}) {
+            const auto &state = client->Charges.at(charge);
+            Check(state.Owner == soldier && state.MCT && state.AttachedObject == terminal,
+                "C4 did not stick to the terminal for all clients");
+        }
+        advance(11);
+        pump([&] { return true; });
+        Check(FirstJoinClient.ExplosionOwners.empty() && SecondJoinClient.ExplosionOwners.empty() &&
+            LateJoinClient.ExplosionOwners.empty() && FirstJoinClient.BuildingVitals.at(terminal).Health == health_code(80),
+            "C4 exploded before its selected fuse expired");
+        advance(3);
+        pump([&] {
+            return FirstJoinClient.Round == 2 && SecondJoinClient.Round == 2 && LateJoinClient.Round == 2;
+        });
+        for (const auto *client : {&FirstJoinClient, &SecondJoinClient, &LateJoinClient}) {
+            Check(client->ExplosionOwners == std::vector<int>{soldier} && client->Deleted.count(charge) &&
+                client->Charges.empty() && client->BuildingDestroyed.at(terminal) &&
+                client->Vitals.at(soldier).Health == health_code(78) &&
+                client->Vitals.at(client->Soldiers.at(3)).Health == health_code(100),
+                "C4 damage, owner attribution, team protection or deletion did not reach all clients");
+            Check(client->PlayerScores.at(player) == 130 && client->PlayerCredits.at(player) == 130,
+                "C4 building damage did not award damage and destruction points");
+        }
+    }
 
     for (const auto *client : {&FirstJoinClient, &SecondJoinClient}) {
         Check(client->TeamScores.at(PLAYERTYPE_NOD) == (ends_game ? 5130 : 130) &&
@@ -1843,6 +1977,10 @@ int main(int argc, char **argv)
             buildings_collision.Level().Static_Objects()[4].MCT, "Building parts were not associated with their owners");
         Check_Building_Combat(buildings_collision, true);
         Check_Building_Combat(buildings_collision, false);
+        const HeadlessArmorTable charge_armor{{17, {{0.5f, 0}}}, {23, {{2, 0}}}};
+        const auto charge_join_data = Load_Headless_Join_Data(838, charge_armor, core.Find("strings.tdb").value(),
+            core.Find("objects.ddb").value(), std::nullopt, [](const std::string &) { return std::nullopt; });
+        Check_Building_Combat(buildings_collision, true, &charge_join_data);
         Write_Archive(data / "C&C_Next.mix", {{"C&C_NEXT.LDD", Dynamic_Data(1.2f)},
             {"C&C_NEXT.LSD", Static_Data(2, 60)}, {"C&C_NEXT.DEP", dependencies}, {"COLLIDERS.W3D", collision_data}});
         const MixArchive next_archive(data / "C&C_Next.mix");
