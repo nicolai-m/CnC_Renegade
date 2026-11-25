@@ -9,6 +9,7 @@
 #include "connect.h"
 #include "control.h"
 #include "headless_collision.h"
+#include "headless_join_data.h"
 #include "humanstate.h"
 #include "netclassids.h"
 #include "networkobject.h"
@@ -65,20 +66,81 @@ bool HeadlessPlayerSession::Attach_Player(int peer_id, int player_type, int sold
     const auto &soldier = *Simulation.Find_Soldier(peer_id);
     const Vector2 forward(std::cos(soldier.SpawnHeading), std::sin(soldier.SpawnHeading));
     const auto target = soldier.Position + Vector3(forward.X, forward.Y, SoldierEyeHeight);
-    Peers.emplace(peer_id, Peer{soldier_object_id, forward, target});
+    auto &peer = Peers.emplace(peer_id, Peer{soldier_object_id, forward, target}).first->second;
+    peer.Viewers.insert(peer_id);
     return true;
+}
+
+void HeadlessPlayerSession::Introduce_Soldier(int owner_id, int recipient, const HeadlessSoldierPreset &preset,
+    unsigned armor_types)
+{
+    const auto &soldier = *Simulation.Find_Soldier(owner_id);
+    auto &peer = Peers.at(owner_id);
+    cPacket packet;
+    packet.Add(peer.SoldierObject);
+    packet.Add(static_cast<BYTE>(NetworkObjectClass::BIT_CREATION));
+    packet.Add(false);
+    packet.Add(NETCLASSID_GAMEOBJ);
+    packet.Add(preset.DefinitionId); // NetworkGameObjectFactoryClass::Prep_Packet.
+    Write_Position(packet, soldier.Position);
+    packet.Add(soldier.SpawnHeading);
+    packet.Add(owner_id); // SmartGameObj::Export_Creation.
+
+    packet.Add_Terminated_String(preset.Model.c_str());
+    packet.Add_Terminated_String("", true); // Animation.
+    packet.Add(0); // Current frame.
+    packet.Add(0); // Target frame.
+    packet.Add(3); // ANIM_MODE_TARGET.
+    packet.Add(0); // Host object.
+    packet.Add(0); // Host bone.
+    packet.Add(soldier.PlayerType);
+    packet.Add(false); // HUD poke indicator.
+    packet.Add(preset.DefinitionId); // SoldierGameObj::Export_Rare.
+
+    packet.Add(false); // Health is nonzero.
+    cEncoderTypeEntry vitals;
+    vitals.Init(0, 2000, 1);
+    cEncoderTypeEntry armor;
+    armor.Init(0, armor_types, 1);
+    ULONG code;
+    vitals.Scale(preset.Health, code);
+    packet.Add_Bits(code, vitals.Get_Bit_Precision());
+    vitals.Scale(preset.Shield, code);
+    packet.Add_Bits(code, vitals.Get_Bit_Precision());
+    armor.Scale(preset.ShieldType, code);
+    packet.Add_Bits(code, armor.Get_Bit_Precision());
+    packet.Add(0); // Weapon list size.
+    Write_Frequent(packet, owner_id, peer);
+    Connection.Send_Packet_To_Individual(packet, recipient, SEND_RELIABLE);
+    peer.Viewers.insert(recipient);
+}
+
+void HeadlessPlayerSession::Set_Player_Loading(int peer_id, bool loading)
+{
+    if (const auto found = Peers.find(peer_id); found != Peers.end()) {
+        auto &peer = found->second;
+        peer.Ready = !loading;
+        if (loading) {
+            peer.MoveAxes.Set(0, 0);
+            peer.InputRemaining = {};
+            Simulation.Set_Move_Input(peer_id, peer.MoveAxes);
+        }
+    }
 }
 
 void HeadlessPlayerSession::Remove_Player(int peer_id)
 {
     Peers.erase(peer_id);
     Simulation.Remove_Soldier(peer_id);
+    for (auto &[id, peer] : Peers) {
+        peer.Viewers.erase(peer_id);
+    }
 }
 
 void HeadlessPlayerSession::Receive_Control(cPacket &packet, int peer_id)
 {
     const auto peer = Peers.find(peer_id);
-    if (peer != Peers.end()) {
+    if (peer != Peers.end() && peer->second.Ready) {
         Read_Control(packet, peer_id, peer->second);
     }
     packet.Flush();
@@ -96,9 +158,8 @@ bool HeadlessPlayerSession::Read_Control(cPacket &packet, int peer_id, Peer &pee
     packet.Get(dirty);
     packet.Get(deleting);
 
-    const auto first_object = ClientObjectBase + (peer_id - 1) * ClientObjectCount;
     const bool creating = dirty == NetworkObjectClass::BIT_CREATION;
-    if (deleting || object_id < first_object || object_id >= first_object + ClientObjectCount ||
+    if (deleting || !Client_Owns_Object_Id(peer_id, object_id) ||
         (creating ? (peer.ControlObject != 0 || packet.Get_Type() != PACKETTYPE_RELIABLE) :
             (dirty != NetworkObjectClass::BIT_FREQUENT || object_id != peer.ControlObject))) {
         return false;
@@ -177,6 +238,15 @@ bool HeadlessPlayerSession::Read_Control(cPacket &packet, int peer_id, Peer &pee
     return true;
 }
 
+bool HeadlessPlayerSession::Client_Owns_Object_Id(int peer_id, int object_id)
+{
+    if (peer_id <= SERVER_RHOST_ID || peer_id > cConnection::MAX_PEER_ID) {
+        return false;
+    }
+    const auto first = ClientObjectBase + (peer_id - 1) * ClientObjectCount;
+    return object_id >= first && object_id < first + ClientObjectCount;
+}
+
 void HeadlessPlayerSession::Advance(HeadlessSimulation::Clock::duration elapsed)
 {
     using Duration = HeadlessSimulation::Clock::duration;
@@ -212,13 +282,9 @@ void HeadlessPlayerSession::Write_Position(cPacket &packet, const Vector3 &posit
     }
 }
 
-void HeadlessPlayerSession::Publish_Player(int peer_id, const Peer &peer)
+void HeadlessPlayerSession::Write_Frequent(cPacket &packet, int peer_id, const Peer &peer)
 {
     const auto &soldier = *Simulation.Find_Soldier(peer_id);
-    cPacket packet;
-    packet.Add(peer.SoldierObject);
-    packet.Add(static_cast<BYTE>(NetworkObjectClass::BIT_FREQUENT));
-    packet.Add(false); // Delete pending.
     packet.Add(false); // In vehicle.
     packet.Add(false); // Holding a weapon.
     Write_Position(packet, soldier.Position);
@@ -247,5 +313,22 @@ void HeadlessPlayerSession::Publish_Player(int peer_id, const Peer &peer)
         AnalogEncoder.Scale(value, bits);
         packet.Add_Bits(bits, AnalogEncoder.Get_Bit_Precision());
     }
-    Connection.Send_Packet_To_Individual(packet, peer_id, SEND_UNRELIABLE);
+}
+
+void HeadlessPlayerSession::Publish_Player(int peer_id, const Peer &peer)
+{
+    if (!peer.Ready) {
+        return;
+    }
+    cPacket packet;
+    packet.Add(peer.SoldierObject);
+    packet.Add(static_cast<BYTE>(NetworkObjectClass::BIT_FREQUENT));
+    packet.Add(false);
+    Write_Frequent(packet, peer_id, peer);
+    for (const int recipient : peer.Viewers) {
+        const auto viewer = Peers.find(recipient);
+        if (viewer != Peers.end() && viewer->second.Ready && Connection.Get_Remote_Host(recipient)) {
+            Connection.Send_Packet_To_Individual(packet, recipient, SEND_UNRELIABLE);
+        }
+    }
 }

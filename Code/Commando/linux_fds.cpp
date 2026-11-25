@@ -6,8 +6,10 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -20,6 +22,7 @@
 #include "coltype.h"
 #include "connect.h"
 #include "headless_collision.h"
+#include "headless_join.h"
 #include "headless_player_session.h"
 #include "headless_simulation.h"
 #include "mixarchive.h"
@@ -114,13 +117,8 @@ Options Parse_Options(int argc, char **argv)
 using IniSection = std::map<std::string, std::string>;
 using IniFile = std::map<std::string, IniSection>;
 
-IniFile Read_Ini(const fs::path &path)
+IniFile Read_Ini(std::istream &input, const std::string &name)
 {
-    std::ifstream input(path, std::ios::binary);
-    if (!input) {
-        throw std::runtime_error("Cannot read configuration: " + path.string());
-    }
-
     IniFile result;
     IniSection *section = nullptr;
     std::string line;
@@ -148,9 +146,18 @@ IniFile Read_Ini(const fs::path &path)
         }
     }
     if (input.bad()) {
-        throw std::runtime_error("Error reading configuration: " + path.string());
+        throw std::runtime_error("Error reading configuration: " + name);
     }
     return result;
+}
+
+IniFile Read_Ini(const fs::path &path)
+{
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        throw std::runtime_error("Cannot read configuration: " + path.string());
+    }
+    return Read_Ini(input, path.string());
 }
 
 std::string Setting(const IniSection &section, const std::string &key)
@@ -195,7 +202,21 @@ struct Settings {
     std::vector<std::string> Maps;
     int MaxPlayers = 16;
     unsigned short Port = 4848;
+    std::optional<uint32> ClientBuild;
+    HeadlessJoinOptions Join;
 };
+
+std::u16string Legacy_Ini_String(const std::string &value, std::size_t limit, const char *field)
+{
+    if (value.size() > limit || value.find('\0') != std::string::npos) {
+        throw std::runtime_error(std::string("Invalid ") + field + " length");
+    }
+    std::u16string result;
+    for (const unsigned char c : value) {
+        result.push_back(c);
+    }
+    return result;
+}
 
 Settings Load_Settings(const Options &options, const fs::path &data_dir)
 {
@@ -252,6 +273,38 @@ Settings Load_Settings(const Options &options, const fs::path &data_dir)
     if (result.Maps.empty()) {
         throw std::runtime_error("Select a map using MapName or MapName00 in [Settings]");
     }
+    if (const auto build = Setting(rules->second, "clientbuildnumber"); !build.empty()) {
+        uint32 number;
+        const auto read = std::from_chars(build.data(), build.data() + build.size(), number);
+        if (read.ec != std::errc{} || read.ptr != build.data() + build.size() || number == 0) {
+            throw std::runtime_error("ClientBuildNumber must be a positive 32-bit integer");
+        }
+        result.ClientBuild = number;
+        result.Join.Map = result.Maps.front();
+        if (result.Join.Map.size() > 27 || Fold_Ascii(fs::path(result.Join.Map).extension().string()) != ".mix") {
+            throw std::runtime_error("Client joins require a .mix map name of at most 27 bytes");
+        }
+        if (const auto title = Setting(rules->second, "bgametitle"); !title.empty()) {
+            result.Join.Title = Legacy_Ini_String(title, 63, "bGameTitle");
+        }
+        result.Join.Motd = Legacy_Ini_String(Setting(rules->second, "bmotd"), 99, "bMotd");
+        if (const auto limit = Setting(rules->second, "timelimitminutes"); !limit.empty()) {
+            result.Join.TimeLimit = Read_Integer(limit, 0, std::numeric_limits<int>::max() / 60, "TimeLimitMinutes");
+        }
+        if (const auto radar = Setting(rules->second, "radarmode"); !radar.empty()) {
+            result.Join.RadarMode = Read_Integer(radar, 0, 2, "RadarMode");
+        }
+        const auto passworded = Fold_Ascii(Setting(rules->second, "ispassworded"));
+        if (passworded == "yes" || passworded == "true" || passworded == "1") {
+            const auto password = Setting(rules->second, "bpassword");
+            if (password.empty() || !Setting(rules->second, "wpassword").empty()) {
+                throw std::runtime_error("Passworded sessions require bPassword and an empty wPassword");
+            }
+            result.Join.Password = Legacy_Ini_String(password, 64, "bPassword");
+        } else if (!passworded.empty() && passworded != "no" && passworded != "false" && passworded != "0") {
+            throw std::runtime_error("Invalid IsPassworded value");
+        }
+    }
     return result;
 }
 
@@ -299,7 +352,25 @@ void Check_Chunks(const GameDataFile &data, const std::string &name)
     }
 }
 
-HeadlessCollision Load_Game_Data(const fs::path &directory, const Settings &settings)
+unsigned Count_Armor_Types(const GameDataFile &armor)
+{
+    auto file = armor.Open();
+    std::string text(armor.Length, '\0');
+    if (file->Read(text.data(), armor.Length) != armor.Length) {
+        throw std::runtime_error("Cannot read armor.ini");
+    }
+    std::istringstream input(text);
+    const auto ini = Read_Ini(input, "armor.ini");
+    const auto types = ini.find("armor_types");
+    return types == ini.end() ? 0 : static_cast<unsigned>(types->second.size());
+}
+
+struct LoadedGame {
+    HeadlessCollision Collision;
+    std::optional<HeadlessJoinData> Join;
+};
+
+LoadedGame Load_Game_Data(const fs::path &directory, const Settings &settings)
 {
     std::vector<MixArchive> core;
     for (const char *name : {"Always2.dat", "Always.dbs", "Always.dat"}) {
@@ -308,14 +379,17 @@ HeadlessCollision Load_Game_Data(const fs::path &directory, const Settings &sett
         }
     }
     const auto definitions = Find_Asset(directory, core, "objects.ddb");
-    Check_Chunks(Find_Asset(directory, core, "strings.tdb"), "strings.tdb");
-    auto armor = Find_Asset(directory, core, "armor.ini").Open();
+    const auto strings = Find_Asset(directory, core, "strings.tdb");
+    Check_Chunks(strings, "strings.tdb");
+    const auto armor_data = Find_Asset(directory, core, "armor.ini");
+    auto armor = armor_data.Open();
     char first_byte;
     if (armor->Read(&first_byte, 1) != 1) {
         throw std::runtime_error("Cannot read armor.ini");
     }
 
     std::optional<HeadlessCollision> collision;
+    std::optional<HeadlessJoinData> join;
     for (const auto &map : settings.Maps) {
         const auto map_path = Find_Child(directory, map);
         if (!map_path) {
@@ -332,18 +406,24 @@ HeadlessCollision Load_Game_Data(const fs::path &directory, const Settings &sett
         const auto static_data = Find_Asset(directory, map_archives, stem + ".lsd");
         const auto dynamic_data = Find_Asset(directory, map_archives, stem + ".ldd");
         if (!collision) {
-            auto level = HeadlessLevel::Load(static_data, dynamic_data, definitions,
-                Find_Optional_Asset(directory, map_archives, stem + ".ddb"));
+            const auto map_definitions = Find_Optional_Asset(directory, map_archives, stem + ".ddb");
+            auto level = HeadlessLevel::Load(static_data, dynamic_data, definitions, map_definitions);
             collision = HeadlessCollision::Load(std::move(level), [&](const std::string &name) {
                 auto asset = Find_Optional_Asset(directory, core, name);
                 return asset ? asset : Find_Optional_Asset(directory, map_archives, name);
             }, Find_Optional_Asset(directory, map_archives, stem + ".dep"));
+            if (settings.ClientBuild) {
+                join = Load_Headless_Join_Data(*settings.ClientBuild, Count_Armor_Types(armor_data), strings,
+                    definitions, map_definitions, [&](const std::string &name) {
+                        return Find_Optional_Asset(directory, core, name);
+                    });
+            }
         } else {
             Check_Chunks(static_data, stem + ".lsd");
             Check_Chunks(dynamic_data, stem + ".ldd");
         }
     }
-    return std::move(*collision);
+    return LoadedGame{std::move(*collision), std::move(join)};
 }
 
 void Report_Static_Collision(const HeadlessCollision &collision)
@@ -408,7 +488,7 @@ void Unexpected_Join(int)
 }
 
 int Run_Headless(const Settings &settings, const std::string &address, const in_addr &bind_address,
-    const HeadlessCollision &collision)
+    const LoadedGame &game)
 {
     if (std::signal(SIGINT, Request_Stop) == SIG_ERR || std::signal(SIGTERM, Request_Stop) == SIG_ERR) {
         throw std::runtime_error("Cannot install shutdown handlers");
@@ -418,22 +498,50 @@ int Run_Headless(const Settings &settings, const std::string &address, const in_
     }
     PacketManager.Set_Is_Server(true);
     cConnection server;
-    server.Install_Application_Acceptance_Handler(Refuse_Join_While_Bootstrapping);
-    server.Install_Conn_Handler(Unexpected_Join);
     if (!server.Init_As_Server(settings.Port, settings.MaxPlayers, true, ntohl(bind_address.s_addr), false)) {
         throw std::runtime_error("Cannot bind UDP to " + address + ":" + std::to_string(settings.Port));
     }
 
-    HeadlessPlayerSession session(collision, server);
-    server.Install_Server_Packet_Handler([&](cPacket &packet, int peer_id) { session.Receive_Control(packet, peer_id); });
-    server.Install_Server_Broken_Connection_Handler([&](int peer_id) { session.Remove_Player(peer_id); });
-    server.Install_Eviction_Handler([&](int peer_id) { session.Remove_Player(peer_id); });
+    HeadlessPlayerSession session(game.Collision, server);
+    auto join_options = settings.Join;
+    join_options.Address = bind_address.s_addr;
+    std::optional<HeadlessJoin> join;
+    if (game.Join) {
+        server.Set_Bandwidth_Budget_Out(2000000); // Original BANDWIDTH_LANT1.
+        join.emplace(server, session, *game.Join, join_options);
+        server.Install_Application_Acceptance_Handler([&](cPacket &packet) { return join->Accept(packet); });
+        server.Install_Conn_Handler([&](int peer_id) { join->Connected(peer_id); });
+    } else {
+        server.Install_Application_Acceptance_Handler(Refuse_Join_While_Bootstrapping);
+        server.Install_Conn_Handler(Unexpected_Join);
+    }
+    server.Install_Server_Packet_Handler([&](cPacket &packet, int peer_id) {
+        if (join) {
+            join->Receive(packet, peer_id);
+        } else {
+            packet.Flush();
+        }
+    });
+    const auto disconnect = [&](int peer_id) {
+        if (join) {
+            join->Disconnected(peer_id);
+        }
+    };
+    server.Install_Server_Broken_Connection_Handler(disconnect);
+    server.Install_Eviction_Handler([&](int peer_id) {
+        server.Destroy_Connection(peer_id);
+        disconnect(peer_id);
+    });
     std::cout << "FDS bootstrap listening on " << address << ':' << server.Get_Local_Port()
-              << " (game session pending; joins refused)" << std::endl;
+              << (join ? " (experimental client joins enabled)" : " (ClientBuildNumber unset; joins refused)")
+              << std::endl;
     auto previous = HeadlessSimulation::Clock::now();
     while (!stop_requested) {
         const auto frame_start = HeadlessSimulation::Clock::now();
         server.Service_Read();
+        if (join) {
+            join->Close_Pending();
+        }
         session.Advance(frame_start - previous);
         previous = frame_start;
         server.Service_Send(true);
@@ -461,7 +569,8 @@ int main(int argc, char **argv)
         }
         const auto directory = Resolve_Data_Directory(options.DataDir);
         const Settings settings = Load_Settings(options, directory);
-        const auto collision = Load_Game_Data(directory, settings);
+        const auto game = Load_Game_Data(directory, settings);
+        const auto &collision = game.Collision;
         const auto &level = collision.Level();
         std::cout << "Validated game data for " << settings.Maps.size() << " map(s); first map: "
                   << settings.Maps.front() << '\n'
@@ -472,9 +581,12 @@ int main(int argc, char **argv)
         Report_Static_Collision(collision);
         if (options.CheckOnly) {
             Report_Soldier_Spawns(collision);
+            if (game.Join) {
+                std::cout << "Client version key: " << game.Join->VersionKey << '\n';
+            }
             return 0;
         }
-        return Run_Headless(settings, options.BindAddress, bind_address, collision);
+        return Run_Headless(settings, options.BindAddress, bind_address, game);
     } catch (const std::exception &error) {
         std::cerr << "FDS: " << error.what() << '\n';
         return 1;

@@ -44,6 +44,8 @@ target_include_directories(renegade_packet PUBLIC
 
 add_library(renegade_level STATIC
     Code/Commando/headless_collision.cpp
+    Code/Commando/headless_join.cpp
+    Code/Commando/headless_join_data.cpp
     Code/Commando/headless_level.cpp
     Code/Commando/headless_player_session.cpp
     Code/Commando/headless_simulation.cpp

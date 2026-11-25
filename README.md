@@ -83,12 +83,19 @@ Soldiers use the debug-sized collision box, a fixed movement speed of 4 m/s,
 gravity, and sliding against static geometry. With `--check`, the server also
 reports whether it can place a grounded soldier for each team.
 
-The player session reads original `CClientControl` movement samples and sends
-the owning peer frequent soldier updates with server position and movement
-state. The UDP integration test attaches a soldier explicitly and exercises
-movement, collision, and update delivery. The bootstrap refuses joins while
-the original client login, map loading, and initial game object creation are
-being ported.
+Add `ClientBuildNumber` to the server's `[Settings]` to enable experimental
+direct UDP joins. Use the build number shown by the client and matching game
+data. The server computes the original version key from the build number,
+`strings.tdb`, and the compatibility file list. With `--check`, it prints the
+computed key. Without `ClientBuildNumber`, the bootstrap refuses joins.
+
+The join sends the original teams and game options and waits for the client's
+post-load biography before creating its player and soldier objects. Connected
+peers receive position and movement updates for the soldiers known to them.
+The two-client UDP fixture covers login, map readiness, movement replication,
+and object removal when a player leaves. Testing with the graphical Windows
+client is pending. The experimental session covers movement on the initial
+map. Weapons, match rules, map rotation, and server discovery are still pending.
 
 
 ### Level Edit (Public Release)

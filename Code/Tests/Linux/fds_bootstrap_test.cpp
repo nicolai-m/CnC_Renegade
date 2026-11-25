@@ -14,6 +14,8 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <map>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -312,8 +314,20 @@ std::string Definitions()
             Chunk(1013991542, Chunk(0x100, Micro(1, id), false)) +
             Chunk(1013991543, Micro(3, team) + Micro(9, uint8{0}) + Micro(15, uint8{1}), false)));
     };
+    auto soldier = [](sint32 id, const char (&name)[21], sint32 physics) {
+        const auto identity = Chunk(0x100, Micro(1, id) + Micro(3, name), false);
+        const auto defense = Chunk(7311607, Micro(0, 100.0f) + Micro(3, 50.0f) + Micro(5, uint32{1}), false);
+        const auto physical = Chunk(418001829, Chunk(909991657, Micro(18, physics), false));
+        return Chunk(CHUNKID_GAME_OBJECT_DEF_SOLDIER, Chunk(0x00100101, identity + defense + physical));
+    };
+    auto physics = [](sint32 id, const char (&model)[18]) {
+        return Chunk(0x20501, Chunk(0x00100101, Chunk(0x100, Micro(1, id), false) +
+            Chunk(0x055ffe08, Micro(1, model), false)));
+    };
     return Chunk(CHUNKID_SAVELOAD_DEFMGR, Chunk(0x101,
-        definition(100, PLAYERTYPE_NOD) + definition(200, PLAYERTYPE_GDI)));
+        definition(100, PLAYERTYPE_NOD) + definition(200, PLAYERTYPE_GDI) +
+        soldier(400, "CnC_Nod_Minigunner_0", 500) + soldier(401, "CnC_GDI_MiniGunner_0", 501) +
+        physics(500, "test\\soldier0.w3d") + physics(501, "test\\soldier1.w3d")));
 }
 
 struct ArchiveEntry {
@@ -650,6 +664,255 @@ void Check_Player_Transport(const HeadlessCollision &collision)
         "Falling off the floor did not publish airborne state and downward velocity");
 }
 
+template<class T> T Field(cPacket &packet)
+{
+    T value;
+    return packet.Get(value);
+}
+
+struct Join_Client_State {
+    std::set<int> Teams;
+    std::map<int, int> Players; // Peer ID to network object ID.
+    std::map<int, int> Soldiers;
+    std::map<int, float> Y;
+    std::set<int> Deleted;
+    bool HasOptions = false;
+    bool HasGameData = false;
+};
+
+Join_Client_State FirstJoinClient;
+Join_Client_State SecondJoinClient;
+unsigned short JoinPort;
+uint32 JoinKey;
+const uint32 TestMapCRC = CRC::String("C&C_TEST.MIX");
+
+void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
+{
+    const int object = Field<int>(packet);
+    const auto dirty = Field<BYTE>(packet);
+    const bool deleting = Field<bool>(packet);
+    if (dirty == 0 && deleting) {
+        client.Deleted.insert(object);
+        Check(packet.Is_Flushed(), "Unexpected data in object deletion");
+        return;
+    }
+    if (dirty == 1) {
+        Check(!deleting && !Field<bool>(packet) && !Field<bool>(packet), "Unexpected soldier update flags");
+        ULONG position;
+        packet.Get_Bits(position, 16);
+        client.Y[object] = -21.0f + static_cast<float>(position & 0xffu) * (42.0f / 255.0f);
+        packet.Flush();
+        return;
+    }
+    Check(dirty == 15, "Unexpected object update in the join sequence");
+    switch (Field<int>(packet)) {
+    case 1010: // cTeam.
+        Check(!deleting && client.Teams.insert(Field<int>(packet)).second &&
+            Field<int>(packet) == 0 && Field<int>(packet) == 0 && Field<float>(packet) == 0,
+            "Incorrect team creation");
+        break;
+    case 1008: { // cGameOptionsEvent.
+        Check(client.Teams == std::set<int>{PLAYERTYPE_NOD, PLAYERTYPE_GDI}, "Teams must arrive before game options");
+        Check(Field<uint32>(packet) == htonl(INADDR_LOOPBACK), "Wrong address in game options");
+        WCHAR owner[64];
+        WCHAR title[64];
+        packet.Get_Wide_Terminated_String(owner, 64);
+        packet.Get_Wide_Terminated_String(title, 64);
+        Check(std::u16string(owner) == u"FDS" && std::u16string(title) == u"Join fixture" &&
+            Field<int>(packet) == JoinPort, "Game options did not describe this server");
+        (void)Field<int>(packet); // Connected player count.
+        Check(Field<int>(packet) == 16 && Field<uint32>(packet) == JoinKey &&
+            Field<uint32>(packet) != 0 && Field<uint32>(packet) != 0, "Wrong version or capacity in game options");
+        Check(Field<bool>(packet) && !Field<bool>(packet) && Field<bool>(packet) &&
+            !Field<bool>(packet) && !Field<bool>(packet), "Incorrect game option flags");
+        Check(Field<uint32>(packet) == TestMapCRC && Field<uint32>(packet) == 0, "Wrong map in game options");
+        Check(Field<int>(packet) == 23 && Field<int>(packet) == 1 &&
+            Field<int>(packet) == 10 && Field<int>(packet) == 0, "Wrong second-tier game settings");
+        ULONG flags;
+        packet.Get_Bits(flags, 7);
+        WCHAR motd[100];
+        packet.Get_Wide_Terminated_String(motd, 100, true);
+        Check(std::u16string(motd) == u"Ready" && Field<float>(packet) == 1380.0f &&
+            Field<int>(packet) == 1 && Field<uint32>(packet) == 0 && Field<uint32>(packet) == TestMapCRC,
+            "The original game options packet had an incorrect footer");
+        client.HasOptions = true;
+        break;
+    }
+    case 1011: { // cPlayer.
+        Check(!deleting, "The player object was immediately deleted");
+        WCHAR name[64];
+        packet.Get_Wide_Terminated_String(name, 64);
+        const int id = Field<int>(packet);
+        Check(client.Players.emplace(id, object).second &&
+            (std::u16string(name) == u"First" || std::u16string(name) == u"Second"), "Incorrect player creation");
+        Check(Field<int>(packet) == 0, "Unexpected ladder points");
+        const int team = Field<int>(packet);
+        Check((team == PLAYERTYPE_GDI || team == PLAYERTYPE_NOD) && Field<int>(packet) == 100 &&
+            Field<int>(packet) == 0 && Field<bool>(packet) && !Field<bool>(packet) && Field<bool>(packet),
+            "Incorrect player state on join");
+        ULONG ranking;
+        packet.Get_Bits(ranking, 32);
+        packet.Get_Bits(ranking, 32);
+        for (int i = 0; i < 4; ++i) {
+            Check(Field<uint32>(packet) == 0, "Unexpected player statistics");
+        }
+        break;
+    }
+    case 1000: { // Soldier GameObj with factory data and all update tiers.
+        const int preset = Field<int>(packet);
+        ULONG position;
+        packet.Get_Bits(position, 24);
+        const float facing = Field<float>(packet);
+        const int owner = Field<int>(packet);
+        Check(facing == 0 && client.Players.count(owner) == 1 && client.Soldiers.emplace(owner, object).second,
+            "A soldier must follow the owning player object");
+        char model[32];
+        char animation[32];
+        packet.Get_Terminated_String(model, sizeof(model));
+        packet.Get_Terminated_String(animation, sizeof(animation), true);
+        Check((preset == 400 || preset == 401) && std::string(model) == (preset == 400 ? "soldier0" : "soldier1") &&
+            *animation == 0, "The soldier did not use the preset from objects.ddb");
+        Check(Field<int>(packet) == 0 && Field<int>(packet) == 0 && Field<int>(packet) == 3 &&
+            Field<int>(packet) == 0 && Field<int>(packet) == 0 && Field<int>(packet) == preset - 400 &&
+            !Field<bool>(packet) && Field<int>(packet) == preset && !Field<bool>(packet),
+            "Incorrect soldier rare fields");
+        ULONG defense;
+        packet.Get_Bits(defense, 11);
+        Check(defense == 102, "Wrong initial health");
+        packet.Get_Bits(defense, 11);
+        Check(defense == 51, "Wrong initial shield");
+        packet.Get_Bits(defense, 2);
+        Check(defense == 2 && Field<int>(packet) == 0 && !Field<bool>(packet) && !Field<bool>(packet),
+            "Wrong shield type or initial weapons");
+        packet.Flush();
+        break;
+    }
+    case 1012: // cGameDataUpdateEvent.
+        Check(Field<int>(packet) == 1380 && Field<int>(packet) == 1 && !client.Soldiers.empty(),
+            "Incorrect game clock after map load");
+        client.HasGameData = true;
+        break;
+    default:
+        throw std::runtime_error("Unexpected class in original join sequence");
+    }
+    Check(packet.Is_Flushed(), "An initial object did not match the original packet layout");
+}
+
+void Receive_First_Join(cPacket &packet) { Receive_Join_Packet(packet, FirstJoinClient); }
+void Receive_Second_Join(cPacket &packet) { Receive_Join_Packet(packet, SecondJoinClient); }
+
+template<class CheckReady>
+void Pump_Clients(std::initializer_list<cConnection *> connections, CheckReady ready)
+{
+    const auto deadline = std::chrono::steady_clock::now() + 3s;
+    do {
+        for (auto *connection : connections) {
+            connection->Service_Read();
+            connection->Service_Send(true);
+        }
+        if (ready()) {
+            return;
+        }
+        std::this_thread::sleep_for(2ms);
+    } while (std::chrono::steady_clock::now() < deadline);
+    throw std::runtime_error("Timed out waiting for the original FDS join sequence");
+}
+
+void Connect_Join_Client(cConnection &client, const WCHAR *name, const WCHAR *password, uint32 key,
+    Client_Packet_Handler handler)
+{
+    client.Init_As_Client(htonl(INADDR_LOOPBACK), JoinPort);
+    client.Set_Bandwidth_Budget_Out(TestBandwidth);
+    client.Install_Accept_Handler([] {});
+    client.Install_Refusal_Handler(Refused);
+    client.Install_Client_Packet_Handler(handler);
+    cPacket request;
+    request.Add_Wide_Terminated_String(name);
+    request.Add_Wide_Terminated_String(password, true);
+    request.Add(key);
+    request.Add(TestBandwidth);
+    client.Connect_Cs(request);
+}
+
+void Send_Bio(cConnection &client, const WCHAR *name, int team, int id_offset, const char *map)
+{
+    const int owner = client.Get_Local_Id();
+    cPacket packet;
+    packet.Add(FirstControlObject + (owner - 1) * 100000 + id_offset);
+    packet.Add(static_cast<BYTE>(15));
+    packet.Add(false);
+    packet.Add(1026); // NETCLASSID_BIOEVENT.
+    packet.Add(owner);
+    packet.Add_Wide_Terminated_String(name);
+    packet.Add(team);
+    packet.Add(0u); // Clan ID.
+    packet.Add_Terminated_String(map);
+    client.Send_Packet_To_Individual(packet, SERVER_RHOST_ID, SEND_RELIABLE);
+}
+
+void Check_Original_Join(unsigned short port, const std::string &definitions, const std::string &armor)
+{
+    Check(cNetUtil::Protocol_Init(false), "IPv4 unavailable for the join test");
+    JoinPort = port;
+    const std::string version = "RENEGADE 1234 strings.tdb 145 ";
+    auto ddb_crc = CRC::Memory(reinterpret_cast<const unsigned char *>(definitions.data()), definitions.size());
+    const auto data_crc = CRC::Memory(reinterpret_cast<const unsigned char *>(armor.data()), armor.size(), ddb_crc);
+    JoinKey = static_cast<uint32>(CRCEngine()(version.data(), version.size())) ^ data_crc;
+
+    auto refuse = [&](const WCHAR *name, const WCHAR *password, uint32 key, REFUSAL_CODE expected) {
+        cConnection client;
+        refusal = REFUSAL_CLIENT_ACCEPTED;
+        Connect_Join_Client(client, name, password, key, Receive_First_Join);
+        Pump_Clients({&client}, [&] { return client.Is_Destroy(); });
+        Check(refusal == expected && !client.Is_Established(), "Wrong refusal code for a join request");
+    };
+    refuse(u"WrongKey", u"testpass", JoinKey ^ 1, REFUSAL_VERSION_MISMATCH);
+    refuse(u"WrongPassword", u"wrong", JoinKey, REFUSAL_BAD_PASSWORD);
+
+    cConnection first;
+    Connect_Join_Client(first, u"First", u"testpass", JoinKey, Receive_First_Join);
+    Pump_Clients({&first}, [&] { return FirstJoinClient.HasOptions; });
+    Check(first.Is_Established() && FirstJoinClient.Players.empty(), "Player objects arrived before map load");
+    refuse(u"first", u"testpass", JoinKey, REFUSAL_PLAYER_EXISTS);
+
+    cPacket control;
+    Write_Movement(control, FirstControlObject, 1, -1, 0);
+    first.Send_Packet_To_Individual(control, SERVER_RHOST_ID, SEND_RELIABLE);
+    Send_Bio(first, u"First", PLAYERTYPE_GDI, 1, "Wrong.mix");
+    const auto deadline = std::chrono::steady_clock::now() + 50ms;
+    Pump_Clients({&first}, [&] { return std::chrono::steady_clock::now() >= deadline; });
+    Check(FirstJoinClient.Players.empty(), "A bio from a different map spawned a soldier");
+    Send_Bio(first, u"First", PLAYERTYPE_GDI, 2, "C&C_Test.mix");
+    Pump_Clients({&first}, [&] { return FirstJoinClient.HasGameData; });
+    const int first_soldier = FirstJoinClient.Soldiers.at(1);
+
+    cConnection second;
+    Connect_Join_Client(second, u"Second", u"testpass", JoinKey, Receive_Second_Join);
+    Pump_Clients({&first, &second}, [&] { return SecondJoinClient.HasOptions; });
+    Send_Bio(second, u"Second", PLAYERTYPE_NOD, 1, "C&C_Test.mix");
+    Pump_Clients({&first, &second}, [&] {
+        return SecondJoinClient.HasGameData && FirstJoinClient.Soldiers.size() == 2 && SecondJoinClient.Soldiers.size() == 2;
+    });
+
+    cPacket movement;
+    Write_Movement(movement, FirstControlObject, 0, first_soldier, 8);
+    first.Send_Packet_To_Individual(movement, SERVER_RHOST_ID, SEND_UNRELIABLE);
+    Pump_Clients({&first, &second}, [&] {
+        return FirstJoinClient.Y[first_soldier] > 2.25f && SecondJoinClient.Y[first_soldier] > 2.25f;
+    });
+
+    cPacket goodbye;
+    goodbye.Add(FirstControlObject + 3);
+    goodbye.Add(static_cast<BYTE>(15));
+    goodbye.Add(false);
+    goodbye.Add(1025); // NETCLASSID_CLIENTGOODBYEEVENT.
+    goodbye.Add(1);
+    first.Send_Packet_To_Individual(goodbye, SERVER_RHOST_ID, SEND_RELIABLE);
+    Pump_Clients({&first, &second}, [&] {
+        return SecondJoinClient.Deleted.count(first_soldier) && SecondJoinClient.Deleted.count(FirstJoinClient.Players.at(1));
+    });
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -662,11 +925,13 @@ int main(int argc, char **argv)
         const auto settings = data / "Settings.ini";
         const auto master = fixture.Path / "server.ini";
 
-        const std::string chunk("\x01\0\0\0\x01\0\0\0\x55", 9);
         const auto static_data = Static_Data();
         const auto dynamic_data = Dynamic_Data();
-        Write_Archive(data / "always.dbs", {{"STRINGS.TDB", chunk}, {"OBJECTS.DDB", Definitions()}});
-        std::ofstream(data / "ARMOR.ini") << "[Armor]\n";
+        const auto definitions = Definitions();
+        const auto translations = Chunk(0x90000, Chunk(0x07141200, Micro(1, uint32{145}), false));
+        const std::string armor = "[Armor_Types]\n0=None\n1=Soldier\n";
+        Write_Archive(data / "always.dbs", {{"STRINGS.TDB", translations}, {"OBJECTS.DDB", definitions}});
+        std::ofstream(data / "ARMOR.ini") << armor;
         const auto dependencies = Chunk(0x04020527, Micro(1, "D:\\levels\\COLLIDERS.W3D"), false);
         const auto collision_data = Collision_Data();
         Write_Archive(data / "C&C_Test.mix", {{"C&C_TEST.LDD", dynamic_data}, {"C&C_TEST.LSD", static_data},
@@ -742,6 +1007,16 @@ int main(int argc, char **argv)
         Check(occupied.Wait() == 1 && occupied.Output().find("Cannot bind UDP") != std::string::npos,
             "FDS must report an occupied port instead of silently choosing another");
         server.Stop();
+
+        std::ofstream(settings, std::ios::app) << "ClientBuildNumber=1234\nbGameTitle=Join fixture\nbMotd=Ready\n"
+            "TimeLimitMinutes=23\nIsPassworded=yes\nbPassword=testpass\n";
+        FdsProcess joining(argv[1], fixture.Path, master);
+        try {
+            Check_Original_Join(joining.Wait_For_Port(), definitions, armor);
+        } catch (const std::exception &error) {
+            throw std::runtime_error(std::string(error.what()) + "\n" + joining.Output());
+        }
+        joining.Stop();
 
         // The first entry claims an offset outside the archive's data section.
         {

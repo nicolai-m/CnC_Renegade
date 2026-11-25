@@ -88,14 +88,15 @@ using Server_Broken_Connection_Handler = std::function<void(int)>;
 using Eviction_Handler = std::function<void(int)>;
 using Conn_Handler = std::function<void(int)>;
 using Server_Packet_Handler = std::function<void(cPacket &, int)>;
+using Application_Acceptance_Handler = std::function<REFUSAL_CODE(cPacket &)>;
 #else
 typedef void (*Server_Broken_Connection_Handler)(int broken_rhost_id);
 typedef void (*Eviction_Handler)(int evicted_rhost_id);
 typedef void (*Conn_Handler)(int new_rhost_id);
 typedef void (*Server_Packet_Handler)(cPacket & packet, int rhost_id);
+typedef REFUSAL_CODE (*Application_Acceptance_Handler)(cPacket & packet);
 #endif
 typedef void (*Client_Broken_Connection_Handler)(void);
-typedef REFUSAL_CODE (*Application_Acceptance_Handler)(cPacket & packet);
 typedef void (*Client_Packet_Handler)(cPacket & packet);
 
 extern char * Addr_As_String(sockaddr_in *addr);
