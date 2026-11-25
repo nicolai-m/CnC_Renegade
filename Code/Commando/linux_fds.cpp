@@ -224,6 +224,7 @@ struct Settings {
     int MaxPlayers = 16;
     unsigned short Port = 4848;
     std::optional<uint32> ClientBuild;
+    HeadlessSpawnCharacter SpawnCharacter = HeadlessSpawnCharacter::Minigunner;
     HeadlessJoinOptions Join;
 };
 
@@ -325,6 +326,12 @@ Settings Load_Settings(const Options &options, const fs::path &data_dir)
         result.Join.FriendlyFire = !friendly.empty() && std::string_view("yt1").find(friendly.front()) != std::string_view::npos;
         const auto base_win = Fold_Ascii(Setting(rules->second, "basedestructionendsgame"));
         result.Join.BaseDestructionEndsGame = base_win.empty() || std::string_view("nf0").find(base_win.front()) == std::string_view::npos;
+        const auto character = Fold_Ascii(Setting(rules->second, "spawncharacter"));
+        if (character == "engineer") {
+            result.SpawnCharacter = HeadlessSpawnCharacter::Engineer;
+        } else if (!character.empty() && character != "minigunner") {
+            throw std::runtime_error("SpawnCharacter must be Minigunner or Engineer");
+        }
         const auto loop = Fold_Ascii(Setting(rules->second, "domapsloop"));
         if (!loop.empty() && std::string_view("nf0").find(loop.front()) != std::string_view::npos) {
             result.Join.LoopMaps = false;
@@ -476,7 +483,7 @@ std::vector<HeadlessMap> Load_Game_Data(const fs::path &directory, const Setting
             HeadlessJoinData join;
             if (settings.ClientBuild) {
                 join = Load_Headless_Join_Data(*settings.ClientBuild, armor_table, strings, definitions,
-                    map_definitions, find_core);
+                    map_definitions, find_core, settings.SpawnCharacter);
             }
             maps.push_back({map, std::move(collision), std::move(join)});
         } catch (const std::runtime_error &error) {

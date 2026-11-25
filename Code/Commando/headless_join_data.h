@@ -26,7 +26,10 @@ struct HeadlessExplosionDefinition {
     bool Scaled = false;
 };
 
-struct HeadlessTimedChargeDefinition {
+enum class HeadlessChargeTrigger { Remote, Timed };
+
+struct HeadlessChargeDefinition {
+    HeadlessChargeTrigger Trigger;
     int ObjectPreset;
     int AmmoPreset;
     std::string Model;
@@ -44,7 +47,7 @@ struct HeadlessFireMode {
     float ChargeSeconds;
     int RoundCost;
     std::optional<HeadlessBulletDefinition> Bullet;
-    std::optional<HeadlessTimedChargeDefinition> TimedCharge;
+    std::optional<HeadlessChargeDefinition> Charge;
 };
 
 struct HeadlessSpawnWeapon {
@@ -96,8 +99,11 @@ struct HeadlessJoinData {
     std::array<HeadlessSoldierPreset, 2> Soldiers; // Nod, GDI.
 };
 
+enum class HeadlessSpawnCharacter { Minigunner, Engineer };
+
 HeadlessJoinData Load_Headless_Join_Data(std::uint32_t client_build, const HeadlessArmorTable &armor,
     const GameDataFile &strings, const GameDataFile &definitions, const std::optional<GameDataFile> &map_definitions,
-    const HeadlessCollision::FindAsset &find_core_asset);
+    const HeadlessCollision::FindAsset &find_core_asset,
+    HeadlessSpawnCharacter character = HeadlessSpawnCharacter::Minigunner);
 
 #endif // HEADLESS_JOIN_DATA_H

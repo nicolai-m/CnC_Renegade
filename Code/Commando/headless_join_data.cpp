@@ -335,8 +335,9 @@ void Read_Powerup(BoundedChunkReader &reader, WeaponGrant &grant, std::string &n
 }
 
 void Load_Presets(const GameDataFile &source, std::map<int, std::string> &physics, std::array<Record, 2> &soldiers,
-    EquipmentDefinitions &equipment)
+    EquipmentDefinitions &equipment, HeadlessSpawnCharacter character)
 {
+    const bool engineer = character == HeadlessSpawnCharacter::Engineer;
     BoundedChunkReader reader(source);
     reader.In_Chunk(CHUNKID_SAVELOAD_DEFMGR, [&] {
         reader.In_Chunk(DefinitionObjects, [&] {
@@ -378,9 +379,9 @@ void Load_Presets(const GameDataFile &source, std::map<int, std::string> &physic
                     }
                 } else {
                     const auto name = Fold_Ascii(record.Name);
-                    if (name == "cnc_nod_minigunner_0") {
+                    if (name == (engineer ? "cnc_nod_engineer_0" : "cnc_nod_minigunner_0")) {
                         soldiers[PLAYERTYPE_NOD] = std::move(record);
-                    } else if (name == "cnc_gdi_minigunner_0") {
+                    } else if (name == (engineer ? "cnc_gdi_engineer_0" : "cnc_gdi_minigunner_0")) {
                         soldiers[PLAYERTYPE_GDI] = std::move(record);
                     }
                 }
@@ -390,9 +391,10 @@ void Load_Presets(const GameDataFile &source, std::map<int, std::string> &physic
 }
 
 std::optional<HeadlessFireMode> Get_Fire_Mode(const EquipmentDefinitions &equipment, const HeadlessArmorTable &armor,
-    int id, float charge_seconds, bool timed_charge)
+    int id, float charge_seconds, bool c4)
 {
     constexpr int NormalAmmo = 0;
+    constexpr int RemoteC4Ammo = 1;
     constexpr int TimedC4Ammo = 2;
     constexpr float MaxShotsPerSecond = 1000;
     const auto def = equipment.Ammo.find(id);
@@ -400,7 +402,8 @@ std::optional<HeadlessFireMode> Get_Fire_Mode(const EquipmentDefinitions &equipm
         return std::nullopt;
     }
     const auto &ammo = def->second;
-    if (ammo.Type != (timed_charge ? TimedC4Ammo : NormalAmmo) || ammo.BurstMax != 0 || ammo.RoundCost < 0 ||
+    if ((c4 ? ammo.Type != RemoteC4Ammo && ammo.Type != TimedC4Ammo : ammo.Type != NormalAmmo) ||
+        ammo.BurstMax != 0 || ammo.RoundCost < 0 ||
         !std::isfinite(ammo.RateOfFire) || ammo.RateOfFire <= 0 || ammo.RateOfFire > MaxShotsPerSecond ||
         !std::isfinite(charge_seconds) || charge_seconds < 0) {
         return std::nullopt;
@@ -410,7 +413,8 @@ std::optional<HeadlessFireMode> Get_Fire_Mode(const EquipmentDefinitions &equipm
         return std::nullopt;
     }
     HeadlessFireMode mode{interval, charge_seconds, ammo.RoundCost, {}};
-    if (timed_charge) {
+    if (c4) {
+        const bool timed = ammo.Type == TimedC4Ammo;
         const auto &tossed = equipment.TossedCharge;
         const auto projectile = equipment.ProjectileGravity.find(tossed.PhysicsId);
         const auto explosion = equipment.Explosions.find(ammo.Explosion);
@@ -418,9 +422,9 @@ std::optional<HeadlessFireMode> Get_Fire_Mode(const EquipmentDefinitions &equipm
             explosion == equipment.Explosions.end() || ammo.Model.empty() || ammo.Model.size() > 255 || ammo.RoundCost <= 0 ||
             !std::isfinite(tossed.ThrowSpeed) || tossed.ThrowSpeed <= 0 || tossed.ThrowSpeed > 90 ||
             !std::isfinite(projectile->second) || projectile->second < 0 ||
-            std::any_of(ammo.FuseSeconds.begin(), ammo.FuseSeconds.end(), [](float seconds) {
+            (timed && std::any_of(ammo.FuseSeconds.begin(), ammo.FuseSeconds.end(), [](float seconds) {
                 return !std::isfinite(seconds) || seconds <= 0;
-            })) {
+            }))) {
             return std::nullopt;
         }
         const auto &blast = explosion->second;
@@ -428,8 +432,9 @@ std::optional<HeadlessFireMode> Get_Fire_Mode(const EquipmentDefinitions &equipm
             armor.empty() || blast.Warhead >= armor.front().Warheads.size()) {
             return std::nullopt;
         }
-        mode.TimedCharge = HeadlessTimedChargeDefinition{tossed.Soldier.DefinitionId, id, ammo.Model, tossed.ThrowSpeed,
-            projectile->second, ammo.FuseSeconds, tossed.Soldier.Health, tossed.Soldier.Shield,
+        mode.Charge = HeadlessChargeDefinition{timed ? HeadlessChargeTrigger::Timed : HeadlessChargeTrigger::Remote,
+            tossed.Soldier.DefinitionId, id, ammo.Model, tossed.ThrowSpeed, projectile->second,
+            ammo.FuseSeconds, tossed.Soldier.Health, tossed.Soldier.Shield,
             Headless_Armor_Index(armor, tossed.ShieldSaveId), blast};
         return mode;
     }
@@ -503,14 +508,15 @@ void Load_Starting_Weapons(const Record &record, const EquipmentDefinitions &equ
             constexpr int RifleStyle = 2;
             constexpr int HandgunStyle = 5;
             constexpr int C4Style = 0;
-            const bool timed_charge = def.Style == C4Style;
-            if (spawn.ClipSize > 0 && (def.Style == RifleStyle || def.Style == HandgunStyle || timed_charge)) {
+            const bool c4 = def.Style == C4Style;
+            if (spawn.ClipSize > 0 && (def.Style == RifleStyle || def.Style == HandgunStyle || c4)) {
                 const auto ammo = equipment.Ammo.find(def.PrimaryAmmo);
                 if (ammo != equipment.Ammo.end()) {
                     const float charge = ammo->second.ChargeSeconds; // WeaponClass uses primary charge for both triggers.
-                    spawn.PrimaryFire = Get_Fire_Mode(equipment, armor, def.PrimaryAmmo, charge, timed_charge);
-                    if (spawn.PrimaryFire && !def.CanSnipe) {
-                        spawn.SecondaryFire = Get_Fire_Mode(equipment, armor, def.SecondaryAmmo, charge, timed_charge);
+                    spawn.PrimaryFire = Get_Fire_Mode(equipment, armor, def.PrimaryAmmo, charge, c4);
+                    // C4 uses secondary input for the one-shot weapon-use action.
+                    if (spawn.PrimaryFire && !def.CanSnipe && !c4) {
+                        spawn.SecondaryFire = Get_Fire_Mode(equipment, armor, def.SecondaryAmmo, charge, false);
                     }
                 }
             }
@@ -585,7 +591,7 @@ unsigned Headless_Armor_Index(const HeadlessArmorTable &armor, int save_id)
 
 HeadlessJoinData Load_Headless_Join_Data(uint32 client_build, const HeadlessArmorTable &armor,
     const GameDataFile &strings, const GameDataFile &definitions, const std::optional<GameDataFile> &map_definitions,
-    const HeadlessCollision::FindAsset &find_core_asset)
+    const HeadlessCollision::FindAsset &find_core_asset, HeadlessSpawnCharacter character)
 {
     HeadlessJoinData result;
     const auto exe = "RENEGADE " + std::to_string(client_build);
@@ -598,9 +604,9 @@ HeadlessJoinData Load_Headless_Join_Data(uint32 client_build, const HeadlessArmo
     std::array<Record, 2> soldiers;
     std::map<int, std::string> physics;
     EquipmentDefinitions equipment;
-    Load_Presets(definitions, physics, soldiers, equipment);
+    Load_Presets(definitions, physics, soldiers, equipment, character);
     if (map_definitions) {
-        Load_Presets(*map_definitions, physics, soldiers, equipment);
+        Load_Presets(*map_definitions, physics, soldiers, equipment, character);
     }
     for (std::size_t team = 0; team < soldiers.size(); ++team) {
         const auto &record = soldiers[team];
@@ -608,7 +614,8 @@ HeadlessJoinData Load_Headless_Join_Data(uint32 client_build, const HeadlessArmo
         if (record.Soldier.DefinitionId <= 0 || record.Soldier.Health <= 0 ||
             armor.empty() ||
             model == physics.end() || model->second.empty()) {
-            throw std::runtime_error("Missing or invalid Nod/GDI minigunner preset");
+            throw std::runtime_error(character == HeadlessSpawnCharacter::Engineer ?
+                "Missing or invalid Nod/GDI engineer preset" : "Missing or invalid Nod/GDI minigunner preset");
         }
         result.Soldiers[team] = record.Soldier;
         result.Soldiers[team].Model = model->second;

@@ -101,7 +101,7 @@ The join sends the original teams and game options and waits for the client's
 post-load biography before creating its player and soldier objects. Connected
 peers receive position and movement updates for the soldiers known to them.
 
-The minigunner starts with the weapons and ammunition in its original preset
+Soldiers start with the weapons and ammunition in their original presets
 and the weapon grants from `M00_GrantPowerup_Created`. The server sends the
 inventory on spawn and synchronizes weapon selection, including number keys,
 cycling, and holstering. For the stock rifles and pistol, the server tracks
@@ -114,7 +114,7 @@ map geometry and soldier collision boxes. Rifles use projectile travel time.
 The pistol resolves the hit immediately, as in the original game. Shield
 absorption and skin multipliers come from `armor.ini`. At zero health the
 server stops accepting the soldier's inputs. After two seconds it deletes
-the old soldier and spawns a new minigunner with the same team and fresh
+the old soldier and respawns the configured soldier class with the same team and fresh
 health, shield, and starting inventory. The player and round stay active.
 Set `IsFriendlyFirePermitted=yes` in `[Settings]` to enable damage to allies
 and their buildings. It defaults to off. Skeletal hit zones and vehicle damage
@@ -136,15 +136,23 @@ component, including the alternate armor of the Master Control Terminal.
 Clients receive the original building health and destruction updates.
 Building damage and destruction award preset points and credits.
 
-The minigunner's timed C4 uses the original weapon, projectile, and explosion
-presets. A throw consumes one charge and starts its fuse. The charge sticks
+Timed and remote C4 use the original weapon, projectile, and explosion
+presets. A throw consumes one charge. The charge sticks
 to terrain, a building component, or a soldier's collision box. Detonation
 damages nearby soldiers, with reduced damage through cover. A charge stuck to
 a building or its Master Control Terminal damages that building according to
 the armor of the component it hit. Clients receive the charge and the original
 explosion event. A round transition removes any remaining charges.
-Remote and proximity C4, repair-gun defusing, and animated attachments still
-need to be ported.
+
+Set `SpawnCharacter=Engineer` in `[Settings]` to spawn both teams with
+their original engineer loadouts, including two remote charges. The default
+`SpawnCharacter=Minigunner` uses the original minigunner loadouts. Select
+remote C4 and use primary fire to throw a charge. With C4 equipped, secondary
+fire detonates all remote charges belonging to that soldier. Remote charges
+have no fuse and are disarmed when the owner disconnects or their soldier
+is removed. The oldest remote charge is disarmed when its team exceeds 30.
+Purchase terminals, proximity C4, repair-gun functionality, and animated
+attachments still need to be ported.
 
 `TimeLimitMinutes` starts counting down when the server starts the loaded map.
 Clients receive the remaining round time when joining and after loading the
@@ -178,6 +186,9 @@ and destruction, points and credits, both settings for the base destruction
 rule, and restored buildings in the next round. The timed C4 case verifies
 ammunition usage, attachment to a terminal, replication for a late join,
 the selected fuse, and a base destruction win after detonation.
+The remote C4 case covers the engineer loadout, both charges surviving
+until their owner triggers them, visibility for a late join, and disarming
+when the owner disconnects.
 
 On Linux arm64 and with the Linux amd64 build running under QEMU, graphical EA
 1.038 Windows clients loaded `C&C_Field.mix`, spawned and displayed another

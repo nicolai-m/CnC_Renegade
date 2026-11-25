@@ -39,6 +39,7 @@ constexpr ULONG FireSecondary = 1u << (ControlClass::BOOLEAN_WEAPON_FIRE_SECONDA
 constexpr float InstantBulletSpeed = 400.0f; // BulletManager::Create_Bullet.
 constexpr std::size_t MaxActiveBullets = 4096;
 constexpr std::size_t MaxActiveCharges = 4096;
+constexpr int TeamRemoteChargeLimit = 30; // C4GameObj::Maintain_C4_Limit.
 
 int Building_State(const HeadlessLevel::Building &building, float health)
 {
@@ -172,6 +173,7 @@ void HeadlessPlayerSession::Set_Player_Loading(int peer_id, bool loading)
             peer.InputRemaining = {};
             peer.FireControls = 0;
             peer.ReloadRequested = false;
+            peer.DetonateRemoteCharges = false;
             Simulation.Set_Move_Input(peer_id, peer.MoveAxes);
         }
     }
@@ -426,9 +428,12 @@ bool HeadlessPlayerSession::Read_Control(cPacket &packet, int peer_id, Peer &pee
     }
     if (peer.WeaponSlot != 0 && (one_time & (1u << ControlClass::BOOLEAN_WEAPON_USE))) {
         auto &weapon = peer.Weapons[peer.WeaponSlot - 1];
-        if (weapon.PrimaryFire && weapon.PrimaryFire->TimedCharge) {
-            const auto modes = weapon.PrimaryFire->TimedCharge->FuseSeconds.size();
-            weapon.DetonationMode = (weapon.DetonationMode + 1) % modes;
+        if (weapon.PrimaryFire && weapon.PrimaryFire->Charge) {
+            const auto &charge = *weapon.PrimaryFire->Charge;
+            peer.DetonateRemoteCharges = true;
+            if (charge.Trigger == HeadlessChargeTrigger::Timed) {
+                weapon.DetonationMode = (weapon.DetonationMode + 1) % charge.FuseSeconds.size();
+            }
         }
     }
     peer.FireControls = fire_controls;
@@ -482,8 +487,8 @@ void HeadlessPlayerSession::Advance_Weapon(int player_id, Peer &peer, float seco
                 weapon.ClipRounds = std::max(0, weapon.ClipRounds - mode->RoundCost);
                 if (mode->Bullet) {
                     Fire_Bullet(player_id, peer, *mode->Bullet);
-                } else if (mode->TimedCharge) {
-                    Throw_Charge(player_id, peer, *mode->TimedCharge, weapon.DetonationMode);
+                } else if (mode->Charge) {
+                    Throw_Charge(player_id, peer, *mode->Charge, weapon.DetonationMode);
                 }
             }
             continue;
@@ -665,12 +670,25 @@ void HeadlessPlayerSession::Advance_Bullets(float seconds)
 }
 
 void HeadlessPlayerSession::Throw_Charge(int owner, const Peer &peer,
-    const HeadlessTimedChargeDefinition &definition, unsigned mode)
+    const HeadlessChargeDefinition &definition, unsigned mode)
 {
     if (Charges.size() >= MaxActiveCharges) {
         return;
     }
     const auto &soldier = *Simulation.Find_Soldier(owner);
+    std::optional<double> fuse;
+    if (definition.Trigger == HeadlessChargeTrigger::Timed) {
+        fuse = definition.FuseSeconds[mode];
+    } else {
+        const auto same_team_remote = [&](const auto &charge) {
+            return charge.Team == soldier.PlayerType && charge.Definition.Trigger == HeadlessChargeTrigger::Remote;
+        };
+        if (std::count_if(Charges.begin(), Charges.end(), same_team_remote) >= TeamRemoteChargeLimit) {
+            const auto oldest = std::find_if(Charges.begin(), Charges.end(), same_team_remote);
+            Send_Map_Object_Deletion(oldest->ObjectId);
+            Charges.erase(oldest);
+        }
+    }
     const auto origin = soldier.Position + Vector3(0, 0, SoldierEyeHeight);
     auto direction = peer.Target - origin;
     if (direction.Length2() < 0.0001f) {
@@ -679,7 +697,7 @@ void HeadlessPlayerSession::Throw_Charge(int owner, const Peer &peer,
     direction.Normalize();
     const float facing = std::atan2(peer.Forward.Y, peer.Forward.X);
     const auto &charge = Charges.emplace_back(Charge{Allocate_Network_Object(), owner, peer.SoldierObject,
-        soldier.PlayerType, definition, origin, definition.ThrowSpeed * direction, facing, definition.FuseSeconds[mode]});
+        soldier.PlayerType, definition, origin, definition.ThrowSpeed * direction, facing, fuse});
     for (const int recipient : MapViewers) {
         if (Connection.Get_Remote_Host(recipient)) {
             Send_Charge(charge, recipient, NetworkObjectClass::BIT_CREATION);
@@ -731,10 +749,14 @@ void HeadlessPlayerSession::Move_Charge(Charge &charge, float seconds)
 
 void HeadlessPlayerSession::Advance_Charges(double seconds, float movement_seconds)
 {
+    const auto &bounds = Simulation.Map_Collision().Level().World_Bounds();
+    const float world_floor = bounds.Center.Z - bounds.Extent.Z - 1;
     Charges.erase(std::remove_if(Charges.begin(), Charges.end(), [&](Charge &charge) {
         const auto owner = Peers.find(charge.OwnerPeer);
         const auto target = Peers.find(charge.AttachedPeer);
-        if (owner == Peers.end() || (charge.AttachedPeer != 0 &&
+        const bool remote = charge.Definition.Trigger == HeadlessChargeTrigger::Remote;
+        if (owner == Peers.end() || (remote && owner->second.SoldierObject != charge.OwnerObject) ||
+            (charge.AttachedPeer != 0 &&
                 (target == Peers.end() || target->second.SoldierObject != charge.AttachedObject))) {
             Send_Map_Object_Deletion(charge.ObjectId);
             return true;
@@ -743,15 +765,24 @@ void HeadlessPlayerSession::Advance_Charges(double seconds, float movement_secon
         const int previous_owner = charge.OwnerObject;
         charge.OwnerObject = owner->second.SoldierObject;
         if (!charge.Stuck) {
-            Move_Charge(charge, static_cast<float>(std::min<double>(movement_seconds, charge.FuseRemaining)));
+            const double flight_time = std::min<double>(movement_seconds, charge.FuseRemaining.value_or(movement_seconds));
+            Move_Charge(charge, static_cast<float>(flight_time));
+            if (charge.Position.Z < world_floor) {
+                Send_Map_Object_Deletion(charge.ObjectId);
+                return true;
+            }
         } else if (charge.AttachedPeer != 0) {
             const auto &forward = target->second.Forward;
             const auto xy = charge.AttachedOffset.X * forward + charge.AttachedOffset.Y * Left_Of(forward);
             charge.Position = Simulation.Find_Soldier(charge.AttachedPeer)->Position +
                 Vector3(xy.X, xy.Y, charge.AttachedOffset.Z);
         }
-        charge.FuseRemaining -= seconds;
-        if (charge.FuseRemaining <= 0) {
+        bool detonate = remote && owner->second.DetonateRemoteCharges;
+        if (charge.FuseRemaining) {
+            *charge.FuseRemaining -= seconds;
+            detonate = *charge.FuseRemaining <= 0;
+        }
+        if (detonate) {
             Detonate_Charge(charge);
             Send_Map_Object_Deletion(charge.ObjectId);
             return true;
@@ -765,6 +796,9 @@ void HeadlessPlayerSession::Advance_Charges(double seconds, float movement_secon
         }
         return false;
     }), Charges.end());
+    for (auto &[id, peer] : Peers) {
+        peer.DetonateRemoteCharges = false;
+    }
 }
 
 void HeadlessPlayerSession::Detonate_Charge(const Charge &charge)

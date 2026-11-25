@@ -66,6 +66,7 @@ private:
         int WeaponSlot = 0; // Slot zero is holstered, as in WeaponBagClass.
         ULONG FireControls = 0;
         bool ReloadRequested = false;
+        bool DetonateRemoteCharges = false;
         WeaponState WeaponAction = WeaponState::Switching;
         float WeaponTimeRemaining = WeaponSwitchSeconds;
         float Health = 0;
@@ -103,11 +104,11 @@ private:
         int OwnerPeer;
         int OwnerObject;
         int Team;
-        HeadlessTimedChargeDefinition Definition;
+        HeadlessChargeDefinition Definition;
         Vector3 Position;
         Vector3 Velocity;
         float Facing;
-        double FuseRemaining;
+        std::optional<double> FuseRemaining;
         bool Stuck = false;
         std::optional<std::size_t> Building;
         bool StuckMCT = false;
@@ -135,7 +136,7 @@ private:
     void Apply_Soldier_Damage(int player_id, Peer &peer, const Offense &attack);
     void Apply_Building_Damage(std::size_t index, bool mct, const Offense &attack);
     void Advance_Bullets(float seconds);
-    void Throw_Charge(int owner, const Peer &peer, const HeadlessTimedChargeDefinition &definition, unsigned mode);
+    void Throw_Charge(int owner, const Peer &peer, const HeadlessChargeDefinition &definition, unsigned mode);
     void Advance_Charges(double seconds, float movement_seconds);
     void Move_Charge(Charge &charge, float seconds);
     void Detonate_Charge(const Charge &charge);
