@@ -180,7 +180,7 @@ void HeadlessPlayerSession::Set_Player_Loading(int peer_id, bool loading)
         auto &peer = found->second;
         peer.Ready = !loading;
         if (loading) {
-            Release_Driver(peer_id, peer);
+            Release_Driver(peer);
             peer.MoveAxes.Set(0, 0);
             peer.InputRemaining = {};
             peer.FireControls = 0;
@@ -207,7 +207,7 @@ void HeadlessPlayerSession::Clear_Soldier(Peer &peer)
 void HeadlessPlayerSession::Remove_Soldier(int peer_id)
 {
     if (const auto peer = Peers.find(peer_id); peer != Peers.end()) {
-        Release_Driver(peer_id, peer->second);
+        Release_Driver(peer->second);
         Clear_Soldier(peer->second);
     }
     Simulation.Remove_Soldier(peer_id);
@@ -306,7 +306,7 @@ void HeadlessPlayerSession::End_Combat()
     Charges.clear();
     Bullets.clear();
     for (auto &[id, peer] : Peers) {
-        Release_Driver(id, peer);
+        Release_Driver(peer);
         if (peer.DefenseChanged) {
             Publish_Player(id, peer);
         }
@@ -436,6 +436,10 @@ bool HeadlessPlayerSession::Read_Control(cPacket &packet, int peer_id, Peer &pee
         return true;
     }
     if (peer.Vehicle) {
+        Simulation.Set_Drive_Input(*peer.Vehicle,
+            Vector2(analog[ControlClass::ANALOG_MOVE_FORWARD], analog[ControlClass::ANALOG_TURN_LEFT]));
+        peer.Target = Simulation.Vehicle_State(*peer.Vehicle).Transform.Get_Translation() + relative_target;
+        peer.InputRemaining = InputTimeout;
         return true;
     }
     Vector2 forward(relative_target.X, relative_target.Y);
@@ -475,8 +479,7 @@ bool HeadlessPlayerSession::Read_Control(cPacket &packet, int peer_id, Peer &pee
 bool HeadlessPlayerSession::Use_Vehicle(int peer_id, Peer &peer)
 {
     if (peer.Vehicle) {
-        Release_Driver(peer_id, peer);
-        return true;
+        return Release_Driver(peer, true);
     }
 
     const auto &collision = Simulation.Map_Collision();
@@ -488,31 +491,24 @@ bool HeadlessPlayerSession::Use_Vehicle(int peer_id, Peer &peer)
     for (std::size_t index = 0; index < Vehicles.size(); ++index) {
         auto &vehicle = Vehicles[index];
         const auto &definition = definitions[index];
-        if (definition.Seats == 0 || vehicle.DriverObject != -1 || definition.Health == 0 ||
+        const auto &state = Simulation.Vehicle_State(index);
+        if (definition.Seats == 0 || state.Driver != 0 || definition.Health == 0 ||
             definition.Entrances.empty() || definition.Exits.empty()) {
             continue;
         }
         Vector3 local;
-        Matrix3D::Inverse_Transform_Vector(definition.Transform, soldier.Position, &local);
+        Matrix3D::Inverse_Transform_Vector(state.Transform, soldier.Position, &local);
         const bool in_zone = std::any_of(definition.Entrances.begin(), definition.Entrances.end(), [&](const auto &box) {
             Vector3 offset;
             Matrix3::Transpose_Rotate_Vector(box.Basis, local - box.Center, &offset);
             return std::abs(offset.X) <= box.Extent.X && std::abs(offset.Y) <= box.Extent.Y &&
                 std::abs(offset.Z) <= box.Extent.Z;
         });
-        const auto position = definition.Transform.Get_Translation();
+        const auto position = state.Transform.Get_Translation();
         if (!in_zone || collision.Cast_Ray(position, soldier.Position, COLLISION_TYPE_PHYSICAL)) {
             continue;
         }
-        // Parked vehicles must have a walkable exit before accepting a driver.
-        std::optional<Vector3> exit;
-        for (const auto &offset : definition.Exits) {
-            const auto candidate = definition.Transform * offset;
-            exit = Simulation.Find_Stand_Position(candidate + Vector3(0, 0, 0.5f), 2.0f);
-            if (exit) {
-                break;
-            }
-        }
+        const auto exit = Simulation.Find_Vehicle_Exit(index);
         if (!exit) {
             continue;
         }
@@ -523,35 +519,41 @@ bool HeadlessPlayerSession::Use_Vehicle(int peer_id, Peer &peer)
         peer.ReloadRequested = false;
         peer.DetonateRemoteCharges = false;
         peer.InputRemaining = {};
-        vehicle.DriverObject = peer.SoldierObject;
         vehicle.PlayerType = soldier.PlayerType;
-        Simulation.Set_Soldier_Vehicle_State(peer_id, position, true);
-        Broadcast_Vehicle(index);
+        peer.Target = position + state.Transform.Get_X_Vector();
+        Simulation.Set_Vehicle_Driver(index, peer_id, position);
+        Broadcast_Vehicle(index, NetworkObjectClass::BIT_RARE);
         return true;
     }
     return false;
 }
 
-void HeadlessPlayerSession::Release_Driver(int peer_id, Peer &peer)
+bool HeadlessPlayerSession::Release_Driver(Peer &peer, bool require_exit)
 {
     if (!peer.Vehicle) {
-        return;
+        return false;
     }
     const auto index = *peer.Vehicle;
-    auto &vehicle = Vehicles[index];
-    vehicle.DriverObject = -1;
-    vehicle.PlayerType = PLAYERTYPE_NEUTRAL;
+    const auto exit = Simulation.Find_Vehicle_Exit(index);
+    if (require_exit && !exit) {
+        return false;
+    }
+    const auto feet = exit.value_or(peer.VehicleExit);
+    Vehicles[index].PlayerType = PLAYERTYPE_NEUTRAL;
     peer.Vehicle.reset();
-    peer.Target = peer.VehicleExit + Vector3(peer.Forward.X, peer.Forward.Y, SoldierEyeHeight);
-    Simulation.Set_Soldier_Vehicle_State(peer_id, peer.VehicleExit, false);
-    Broadcast_Vehicle(index);
+    peer.InputRemaining = {};
+    peer.Target = feet + Vector3(peer.Forward.X, peer.Forward.Y, SoldierEyeHeight);
+    Simulation.Set_Vehicle_Driver(index, 0, feet);
+    Broadcast_Vehicle(index, NetworkObjectClass::BIT_RARE);
+    return true;
 }
 
-void HeadlessPlayerSession::Broadcast_Vehicle(std::size_t index)
+void HeadlessPlayerSession::Broadcast_Vehicle(std::size_t index, BYTE dirty)
 {
     for (const int recipient : MapViewers) {
-        if (Connection.Get_Remote_Host(recipient)) {
-            Send_Vehicle(index, recipient, NetworkObjectClass::BIT_RARE);
+        if ((dirty != NetworkObjectClass::BIT_FREQUENT || Peers.at(recipient).Ready) &&
+            Connection.Get_Remote_Host(recipient)) {
+            Send_Vehicle(index, recipient, dirty);
         }
     }
 }
@@ -1189,7 +1191,11 @@ void HeadlessPlayerSession::Advance(HeadlessSimulation::Clock::duration elapsed)
             if (peer.InputRemaining == Duration::zero()) {
                 peer.MoveAxes.Set(0, 0);
                 peer.FireControls = 0;
-                Simulation.Set_Move_Input(id, peer.MoveAxes);
+                if (peer.Vehicle) {
+                    Simulation.Set_Drive_Input(*peer.Vehicle, Vector2(0, 0));
+                } else {
+                    Simulation.Set_Move_Input(id, peer.MoveAxes);
+                }
             }
         }
     }
@@ -1198,6 +1204,11 @@ void HeadlessPlayerSession::Advance(HeadlessSimulation::Clock::duration elapsed)
     PublishElapsed += std::min(elapsed, std::chrono::duration_cast<Duration>(PublishInterval));
     if (PublishElapsed >= PublishInterval) {
         PublishElapsed -= PublishInterval;
+        for (std::size_t index = 0; index < Vehicles.size(); ++index) {
+            if (Simulation.Vehicle_State(index).Driver != 0) {
+                Broadcast_Vehicle(index, NetworkObjectClass::BIT_FREQUENT);
+            }
+        }
         for (auto &[id, peer] : Peers) {
             Publish_Player(id, peer);
         }
@@ -1230,7 +1241,8 @@ void HeadlessPlayerSession::Send_Vehicle(std::size_t index, int recipient, BYTE 
 {
     const auto &vehicle = Vehicles[index];
     const auto &definition = Simulation.Map_Collision().Level().Vehicles()[index];
-    const auto position = definition.Transform.Get_Translation();
+    const auto &state = Simulation.Vehicle_State(index);
+    const auto position = state.Transform.Get_Translation();
     cPacket packet;
     packet.Add(vehicle.ObjectId);
     packet.Add(dirty);
@@ -1239,31 +1251,36 @@ void HeadlessPlayerSession::Send_Vehicle(std::size_t index, int recipient, BYTE 
         packet.Add(NETCLASSID_GAMEOBJ);
         packet.Add(definition.DefinitionId);
         Write_Position(packet, position);
-        packet.Add(definition.Transform.Get_Z_Rotation());
+        packet.Add(state.Transform.Get_Z_Rotation());
         packet.Add(ServerControlOwner);
         packet.Add(0); // VehicleGameObj lock owner.
     }
-    packet.Add_Terminated_String(definition.Model.c_str(), true);
-    packet.Add_Terminated_String("", true); // Animation.
-    packet.Add(0); // Current frame.
-    packet.Add(0); // Target frame.
-    packet.Add(3); // ANIM_MODE_TARGET.
-    packet.Add(0); // Host object.
-    packet.Add(0); // Host bone.
-    packet.Add(vehicle.PlayerType);
-    packet.Add(false); // HUD poke indicator.
-    packet.Add(false); // Hidden.
-    for (int seat = 0; seat < definition.Seats; ++seat) {
-        packet.Add(seat == 0 ? vehicle.DriverObject : -1);
+    const auto *driver = state.Driver != 0 ? &Peers.at(state.Driver) : nullptr;
+    if ((dirty & NetworkObjectClass::BIT_RARE) == NetworkObjectClass::BIT_RARE) {
+        packet.Add_Terminated_String(definition.Model.c_str(), true);
+        packet.Add_Terminated_String("", true); // Animation.
+        packet.Add(0); // Current frame.
+        packet.Add(0); // Target frame.
+        packet.Add(3); // ANIM_MODE_TARGET.
+        packet.Add(0); // Host object.
+        packet.Add(0); // Host bone.
+        packet.Add(vehicle.PlayerType);
+        packet.Add(false); // HUD poke indicator.
+        packet.Add(false); // Hidden.
+        for (int seat = 0; seat < definition.Seats; ++seat) {
+            packet.Add(seat == 0 && driver ? driver->SoldierObject : -1);
+        }
+        packet.Add(false); // Vehicle delivered by a factory.
     }
-    packet.Add(false); // Vehicle delivered by a factory.
-    const auto shield_type = Armor ? Headless_Armor_Index(*Armor, definition.ShieldSaveId) : 0;
-    Write_Defense(packet, definition.Health, definition.Shield, shield_type);
+    if ((dirty & NetworkObjectClass::BIT_OCCASIONAL) == NetworkObjectClass::BIT_OCCASIONAL) {
+        const auto shield_type = Armor ? Headless_Armor_Index(*Armor, definition.ShieldSaveId) : 0;
+        Write_Defense(packet, definition.Health, definition.Shield, shield_type);
+    }
     packet.Add(0); // Total rounds in the vehicle weapon.
     if (definition.UsesVehiclePhysics) {
-        packet.Add(false); // Engine state.
+        packet.Add(driver != nullptr);
         Write_Position(packet, position);
-        const auto rotation = Build_Quaternion(definition.Transform);
+        const auto rotation = Build_Quaternion(state.Transform);
         const auto write_scaled = [&](cEncoderTypeEntry &encoder, float component) {
             ULONG bits;
             encoder.Scale(component, bits);
@@ -1273,15 +1290,17 @@ void HeadlessPlayerSession::Send_Vehicle(std::size_t index, int recipient, BYTE 
             write_scaled(VehicleRotationEncoder, rotation[axis]);
         }
         for (int axis = 0; axis < 3; ++axis) {
-            write_scaled(VelocityEncoder, 0);
+            write_scaled(VelocityEncoder, state.Velocity[axis]);
         }
-        for (int axis = 0; axis < 3; ++axis) {
-            write_scaled(VehicleAngularVelocityEncoder, 0);
-        }
+        write_scaled(VehicleAngularVelocityEncoder, 0);
+        write_scaled(VehicleAngularVelocityEncoder, 0);
+        write_scaled(VehicleAngularVelocityEncoder, state.YawRate);
     }
     packet.Add(false); // DriverIsGunner override.
-    Write_Smart_Frequent(packet, position + definition.Transform.Get_X_Vector(), 0, Vector2(0, 0));
-    Connection.Send_Packet_To_Individual(packet, recipient, SEND_RELIABLE);
+    const auto target = driver ? driver->Target : position + state.Transform.Get_X_Vector();
+    Write_Smart_Frequent(packet, target, 0, Vector2(state.Input.X, 0), state.Input.Y);
+    Connection.Send_Packet_To_Individual(packet, recipient,
+        dirty == NetworkObjectClass::BIT_FREQUENT ? SEND_UNRELIABLE : SEND_RELIABLE);
 }
 
 void HeadlessPlayerSession::Send_Building(std::size_t index, int recipient, BYTE dirty)
@@ -1348,7 +1367,8 @@ void HeadlessPlayerSession::Write_Frequent(cPacket &packet, int peer_id, const P
     const auto &soldier = *Simulation.Find_Soldier(peer_id);
     packet.Add(peer.Vehicle.has_value());
     if (peer.Vehicle) {
-        Write_Smart_Frequent(packet, peer.Target, 0, Vector2(0, 0));
+        const auto &drive = Simulation.Vehicle_State(*peer.Vehicle).Input;
+        Write_Smart_Frequent(packet, peer.Target, 0, Vector2(drive.X, 0), drive.Y);
         return;
     }
     packet.Add(peer.WeaponSlot != 0);
@@ -1384,12 +1404,12 @@ void HeadlessPlayerSession::Write_Frequent(cPacket &packet, int peer_id, const P
 }
 
 void HeadlessPlayerSession::Write_Smart_Frequent(cPacket &packet, const Vector3 &target, ULONG controls,
-    const Vector2 &move)
+    const Vector2 &move, float turn)
 {
     packet.Add(false); // Attached to a host bone.
     Write_Position(packet, target);
     packet.Add_Bits(controls, ControlClass::NUM_BOOLEAN_CONTINUOUS);
-    const float analog[] = {move.X, move.Y, 0, 0};
+    const float analog[] = {move.X, move.Y, 0, turn};
     for (const auto value : analog) {
         ULONG bits;
         AnalogEncoder.Scale(value, bits);

@@ -38,6 +38,7 @@ public:
     const HeadlessLevel &Level() const { return Scene; }
     std::size_t Collider_Count() const { return ColliderCount; }
     std::size_t Incomplete_Object_Count() const { return IncompleteObjects; }
+    const OBBoxClass &Vehicle_Hull(std::size_t index) const { return VehicleHulls[index]; }
 
     // Cast against static W3D geometry, using a mask from coltype.h.
     std::optional<RayHit> Cast_Ray(const Vector3 &start, const Vector3 &end, unsigned mask,
@@ -66,6 +67,7 @@ private:
     HeadlessLevel Scene;
     std::vector<std::vector<Collider>> Objects;
     std::vector<std::optional<std::size_t>> BuildingOwners;
+    std::vector<OBBoxClass> VehicleHulls;
     std::size_t ColliderCount = 0;
     std::size_t IncompleteObjects = 0;
 };

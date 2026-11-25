@@ -173,11 +173,17 @@ The server sends the original harmless disarm effect and removes the charge.
 
 Linux loads the ground vehicles and stationary turrets placed directly in a
 map's saved scene and sends them to clients. Use the action key at a ground
-vehicle's original entry zone to take the driver seat. Use it again to leave
-at an unobstructed exit. A later client receives the occupied seat, and the
-server clears it if the driver disconnects. Vehicles stay parked in this
-version. Driving, passenger seats, vehicle weapons, and AI turret behavior
-still need to be ported.
+vehicle's original entry zone to take the driver seat. The server processes
+acceleration, reverse and steering from the original controls at 50 Hz.
+Vehicles follow the ground and stop at static obstacles using the collision
+box from their W3D model. The server brakes when driving input expires and
+uses the vehicle's current position and heading to find a clear exit. It
+replicates the current pose and seat to clients, including late joins, and
+clears the seat if the driver disconnects.
+
+The driving model uses simplified traction and ground contact. Suspension,
+collisions between moving objects, passenger seats, vehicle weapons, and AI
+turret behavior still need to be ported.
 
 `TimeLimitMinutes` starts counting down when the server starts the loaded map.
 Clients receive the remaining round time when joining and after loading the
@@ -220,8 +226,9 @@ when the opposing soldier moves into range.
 The repair fixture verifies the unlimited clip, capped repairs, scoring,
 the building repair setting, and disarming remote C4 and proximity mines.
 The vehicle fixture checks the legacy save pointer and packet layout, entry
-range, exclusive driver occupancy, late joins, exit placement, disconnects,
-and vehicle removal on map reset.
+range, exclusive driver occupancy, acceleration, reverse and steering,
+collision with a vehicle-only wall, braking when input expires, current pose
+on late joins, exit placement after driving, disconnects, and map reset.
 
 On Linux arm64 and with the Linux amd64 build running under QEMU, graphical EA
 1.038 Windows clients loaded `C&C_Field.mix`, spawned and displayed another

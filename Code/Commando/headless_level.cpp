@@ -633,6 +633,7 @@ void HeadlessLevel::Load_Dynamic(const GameDataFile &data, const GameDataFile &d
             vehicle.Transform = part->second.Transform;
             vehicle.Seats = definition->second.Seats;
             vehicle.UsesVehiclePhysics = definition->second.Kind != VehicleDefinition::Turret;
+            vehicle.Tracked = definition->second.Kind == VehicleDefinition::Tank;
             if (vehicle.UsesVehiclePhysics) {
                 vehicle.Entrances = definition->second.Entrances;
                 vehicle.Exits = definition->second.Exits;

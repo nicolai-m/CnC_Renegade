@@ -438,6 +438,57 @@ struct HeadlessCollision::Loader {
         }
     }
 
+    const std::vector<Matrix3D> *Find_Pose(const std::string &name)
+    {
+        if (name.empty()) {
+            return nullptr;
+        }
+        if (Hierarchies.find(name) == Hierarchies.end()) {
+            Load_File(name + ".w3d");
+            if (Hierarchies.find(name) == Hierarchies.end()) {
+                Load_Dependencies();
+            }
+        }
+        const auto found = Hierarchies.find(name);
+        return found == Hierarchies.end() ? nullptr : &found->second;
+    }
+
+    OBBoxClass Find_Vehicle_Hull(const std::string &name)
+    {
+        // RigidBodyClass uses the WorldBox from the highest LOD, with a unit-box fallback.
+        const OBBoxClass fallback(Vector3(0, 0, 0), Vector3(1, 1, 1));
+        Load_File(name + ".w3d");
+        if (Models.find(name) == Models.end()) {
+            Load_Dependencies();
+        }
+        const auto model = Models.find(name);
+        if (model == Models.end()) {
+            return fallback;
+        }
+        const auto world_box = name + ".worldbox";
+        for (const auto &part : model->second.Parts) {
+            if (part.Name != world_box &&
+                !(part.Name.size() == world_box.size() + 1 && part.Name.compare(0, world_box.size(), world_box) == 0)) {
+                continue;
+            }
+            const auto box = Models.find(part.Name);
+            if (box == Models.end() || !box->second.Shape || box->second.Shape->Kind != Geometry::Type::OrientedBox) {
+                continue;
+            }
+            const auto &bounds = box->second.Shape->Bounds;
+            const OBBoxClass local(bounds.Center, bounds.Extent);
+            if (part.Bone == 0) {
+                return local;
+            }
+            if (const auto *pose = Find_Pose(model->second.Hierarchy); pose && part.Bone < pose->size()) {
+                OBBoxClass hull;
+                OBBoxClass::Transform((*pose)[part.Bone], local, &hull);
+                return hull;
+            }
+        }
+        return fallback;
+    }
+
     bool Add_Model(const std::string &name, const Matrix3D &transform, std::vector<Collider> &colliders)
     {
         // A W3D can reference another HLOD, including a broken cyclic reference.
@@ -469,19 +520,7 @@ struct HeadlessCollision::Loader {
             return true;
         }
 
-        const std::vector<Matrix3D> *pose = nullptr;
-        if (!model.Hierarchy.empty()) {
-            if (Hierarchies.find(model.Hierarchy) == Hierarchies.end()) {
-                Load_File(model.Hierarchy + ".w3d");
-                if (Hierarchies.find(model.Hierarchy) == Hierarchies.end()) {
-                    Load_Dependencies();
-                }
-            }
-            const auto hierarchy = Hierarchies.find(model.Hierarchy);
-            if (hierarchy != Hierarchies.end()) {
-                pose = &hierarchy->second;
-            }
-        }
+        const auto *pose = Find_Pose(model.Hierarchy);
         Ancestors.push_back(name);
         bool complete = true;
         for (const auto &part : model.Parts) {
@@ -552,6 +591,12 @@ HeadlessCollision HeadlessCollision::Load(HeadlessLevel level, const FindAsset &
                 collision.BuildingOwners[i] = j;
             }
         }
+    }
+    const auto &vehicles = collision.Scene.Vehicles();
+    collision.VehicleHulls.reserve(vehicles.size());
+    for (const auto &vehicle : vehicles) {
+        collision.VehicleHulls.push_back(vehicle.UsesVehiclePhysics ? loader.Find_Vehicle_Hull(Fold_Name(vehicle.Model)) :
+            OBBoxClass(Vector3(0, 0, 0), Vector3(1, 1, 1)));
     }
     return collision;
 }

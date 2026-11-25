@@ -137,13 +137,12 @@ private:
     struct VehicleState {
         int ObjectId;
         int PlayerType;
-        int DriverObject = -1;
     };
 
     bool Read_Control(cPacket &packet, int peer_id, Peer &peer);
     bool Use_Vehicle(int peer_id, Peer &peer);
-    void Release_Driver(int peer_id, Peer &peer);
-    void Broadcast_Vehicle(std::size_t index);
+    bool Release_Driver(Peer &peer, bool require_exit = false);
+    void Broadcast_Vehicle(std::size_t index, BYTE dirty);
     void Send_Vehicle(std::size_t index, int recipient, BYTE dirty);
     static void Clear_Soldier(Peer &peer);
     static void Select_Weapon(Peer &peer, ULONG controls);
@@ -171,7 +170,8 @@ private:
     void Write_Defense(cPacket &packet, float health, float shield, unsigned shield_type);
     void Write_Occasional(cPacket &packet, const Peer &peer);
     void Write_Frequent(cPacket &packet, int peer_id, const Peer &peer);
-    void Write_Smart_Frequent(cPacket &packet, const Vector3 &target, ULONG controls, const Vector2 &move);
+    void Write_Smart_Frequent(cPacket &packet, const Vector3 &target, ULONG controls, const Vector2 &move,
+        float turn = 0);
     void Publish_Player(int peer_id, Peer &peer);
     void Send_Building(std::size_t index, int recipient, BYTE dirty);
     void Publish_Buildings();

@@ -55,6 +55,7 @@ public:
         int PlayerType = 0;
         int Seats = 0;
         bool UsesVehiclePhysics = false;
+        bool Tracked = false;
         float Health = 0;
         float Shield = 0;
         int ShieldSaveId = 0;

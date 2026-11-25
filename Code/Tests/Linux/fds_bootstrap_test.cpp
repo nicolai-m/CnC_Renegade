@@ -125,7 +125,7 @@ std::string Static_Data(uint32 last_link = 2, float world_extent = 20, bool with
         Chunk(CHUNKID_WWPHYS_BEGIN + 1, Chunk(0x06090609, Chunk(0x770100, objects)));
 }
 
-std::string Collision_Data(uint32 last_vertex = 2)
+std::string Collision_Data(uint32 last_vertex = 2, bool with_vehicle = false)
 {
     W3dMeshHeader3Struct mesh{};
     mesh.Attributes = W3D_MESH_FLAG_COLLISION_TYPE_PHYSICAL | W3D_MESH_FLAG_COLLISION_TYPE_PROJECTILE;
@@ -178,6 +178,22 @@ std::string Collision_Data(uint32 last_vertex = 2)
         return Chunk(id, Chunk(W3D_CHUNK_HLOD_SUB_OBJECT_ARRAY_HEADER,
             Bytes(W3dHLodArrayHeaderStruct{count, 0}), false) + objects);
     };
+    auto aggregates = part("testmesh.camera", 1) + part("testmesh.smoke", 1) +
+        part("testmesh.wall", 0) + part("testmesh.bulletwall", 0);
+    std::string vehicle_geometry;
+    if (with_vehicle) {
+        W3dHLodHeaderStruct car{};
+        car.LodCount = 1;
+        std::strcpy(car.Name, "TEST_CAR");
+        vehicle_geometry = box("testmesh.road", W3D_BOX_ATTRIBUTE_ALIGNED | W3D_MESH_FLAG_COLLISION_TYPE_PHYSICAL,
+            {0, 0, -0.5f}, {3.5f, 4.0f, 0.5f}) +
+            box("testmesh.vehicle_wall", W3D_BOX_ATTRIBUTE_ALIGNED | W3D_MESH_FLAG_COLLISION_TYPE_VEHICLE,
+                {1.4f, 2, 0.9f}, {0.1f, 1.2f, 0.9f}) +
+            box("TEST_CAR.WORLDBOX", W3D_BOX_ATTRIBUTE_ORIENTED, {0, 0, 0.2f}, {0.55f, 0.28f, 0.45f}) +
+            Chunk(W3D_CHUNK_HLOD, Chunk(W3D_CHUNK_HLOD_HEADER, Bytes(car), false) +
+                parts(W3D_CHUNK_HLOD_LOD_ARRAY, 1, part("TEST_CAR.WORLDBOX", 0)));
+        aggregates += part("testmesh.road", 0) + part("testmesh.vehicle_wall", 0);
+    }
 
     return Chunk(W3D_CHUNK_MESH, Chunk(W3D_CHUNK_MESH_HEADER3, Bytes(mesh), false) +
             Chunk(W3D_CHUNK_VERTICES, Bytes(vertices), false) +
@@ -205,8 +221,7 @@ std::string Collision_Data(uint32 last_vertex = 2)
         Chunk(W3D_CHUNK_HLOD, Chunk(W3D_CHUNK_HLOD_HEADER, Bytes(hlod), false) +
             parts(W3D_CHUNK_HLOD_LOD_ARRAY, 1, part("testmesh.low", 0)) +
             parts(W3D_CHUNK_HLOD_LOD_ARRAY, 2, part("testmesh.terrain", 0) + part("legacy", 1)) +
-            parts(W3D_CHUNK_HLOD_AGGREGATE_ARRAY, 4, part("testmesh.camera", 1) + part("testmesh.smoke", 1) +
-                part("testmesh.wall", 0) + part("testmesh.bulletwall", 0)));
+            parts(W3D_CHUNK_HLOD_AGGREGATE_ARRAY, with_vehicle ? 6 : 4, aggregates)) + vehicle_geometry;
 }
 
 std::string Dynamic_Data(float spawn_y = 2, bool with_buildings = false, float gdi_spawn_x = 6,
@@ -643,7 +658,7 @@ void Receive_Movement_Snapshot(cPacket &packet)
 
 void Write_Movement(cPacket &packet, int control_object, int owner, int soldier, const Vector3 &target,
     float position_extent = 21.0f, unsigned position_bits = 8, ULONG buttons = 0,
-    ULONG continuous = 0, bool moving = true)
+    ULONG continuous = 0, bool moving = true, ULONG turn = 128, bool reverse = false)
 {
     packet.Add(control_object);
     packet.Add(static_cast<BYTE>(owner ? 15 : 1));
@@ -658,10 +673,10 @@ void Write_Movement(cPacket &packet, int control_object, int owner, int soldier,
     }
     packet.Add_Bits(buttons, ControlClass::NUM_BOOLEAN_ONE_TIME);
     packet.Add_Bits(continuous, ControlClass::NUM_BOOLEAN_CONTINUOUS);
-    packet.Add_Bits(moving ? 255 : 128, 8); // Forward input.
+    packet.Add_Bits(moving ? (reverse ? 0 : 255) : 128, 8); // Forward input.
     packet.Add_Bits(128, 8); // Neutral strafe.
     packet.Add_Bits(128, 8); // Neutral vertical input.
-    packet.Add_Bits(128, 8); // Neutral turning input.
+    packet.Add_Bits(turn, 8);
     packet.Add(false); // Sniping.
     packet.Add(true); // Optional checksum follows.
     packet.Add(12345);
@@ -822,6 +837,14 @@ struct Join_Client_State {
     std::map<int, Defense> BuildingVitals;
     std::map<int, bool> BuildingDestroyed;
     std::map<int, int> VehicleDriver;
+    struct VehicleFrame {
+        Vector3 Position;
+        Vector3 Velocity;
+        float Yaw;
+        float YawRate;
+        bool Engine;
+    };
+    std::map<int, VehicleFrame> VehicleFrames;
     std::set<int> SeatedSoldiers;
     struct Charge {
         int Owner = 0;
@@ -979,16 +1002,22 @@ void Read_Player(cPacket &packet, Join_Client_State &client, int object, bool cr
     Read_Player_Counts(packet, client, object);
 }
 
-float Read_Join_Position_Y(cPacket &packet, uint32 map_crc)
+Vector3 Read_Join_Position(cPacket &packet, uint32 map_crc)
 {
     const unsigned bits = map_crc == NextMapCRC ? 10 : 8;
     const float extent = map_crc == NextMapCRC ? 61.0f : 21.0f;
-    ULONG coordinate;
-    packet.Get_Bits(coordinate, bits); // X.
-    packet.Get_Bits(coordinate, bits);
-    const auto y = -extent + static_cast<float>(coordinate) * (2 * extent / ((1u << bits) - 1));
-    packet.Get_Bits(coordinate, bits); // Z.
-    return y;
+    Vector3 position;
+    for (int axis = 0; axis < 3; ++axis) {
+        ULONG coordinate;
+        packet.Get_Bits(coordinate, bits);
+        position[axis] = -extent + static_cast<float>(coordinate) * (2 * extent / ((1u << bits) - 1));
+    }
+    return position;
+}
+
+float Read_Join_Position_Y(cPacket &packet, uint32 map_crc)
+{
+    return Read_Join_Position(packet, map_crc).Y;
 }
 
 std::vector<HeadlessSpawnWeapon> Fixture_Weapons(int team, int charge = 620, bool repair_fixture = false)
@@ -1013,7 +1042,7 @@ void Read_Soldier_Frequent(cPacket &packet, Join_Client_State &client, int objec
         ULONG controls, analog;
         packet.Get_Bits(controls, ControlClass::NUM_BOOLEAN_CONTINUOUS);
         packet.Get_Bits(analog, 32);
-        Check(controls == 0 && analog == 0x80808080u, "Mounted soldier exported infantry controls");
+        Check(controls == 0 && (analog & 0x00ffff00u) == 0x00808000u, "Mounted soldier exported infantry controls");
         return;
     }
     client.SeatedSoldiers.erase(object);
@@ -1045,6 +1074,41 @@ void Read_Soldier_Frequent(cPacket &packet, Join_Client_State &client, int objec
     packet.Get_Bits(bits, 32); // Analog controls.
 }
 
+void Read_Vehicle_Frequent(cPacket &packet, Join_Client_State &client, int object)
+{
+    Check(Field<int>(packet) == 0, "Vehicle weapons unexpectedly active");
+    Join_Client_State::VehicleFrame frame{};
+    frame.Engine = Field<bool>(packet);
+    frame.Position = Read_Join_Position(packet, client.MapCRC);
+    const auto scaled = [&](unsigned precision, float range) {
+        ULONG bits;
+        packet.Get_Bits(bits, precision);
+        return range * (2.0f * bits / ((1u << precision) - 1) - 1.0f);
+    };
+    const float qx = scaled(12, 1);
+    const float qy = scaled(12, 1);
+    const float qz = scaled(12, 1);
+    const float qw = scaled(12, 1);
+    Check(std::abs(qx) < 0.001f && std::abs(qy) < 0.001f &&
+        std::abs(qz * qz + qw * qw - 1) < 0.002f, "Unexpected vehicle orientation");
+    frame.Yaw = 2.0f * std::atan2(qz, qw);
+    for (int axis = 0; axis < 3; ++axis) {
+        frame.Velocity[axis] = scaled(15, 90);
+    }
+    const float roll_rate = scaled(12, 20);
+    const float pitch_rate = scaled(12, 20);
+    Check(std::abs(roll_rate) < 0.01f && std::abs(pitch_rate) < 0.01f, "Unexpected vehicle pitch or roll");
+    frame.YawRate = scaled(12, 20);
+    client.VehicleFrames[object] = frame;
+    Check(!Field<bool>(packet) && !Field<bool>(packet), "Unexpected vehicle gunner override or host bone");
+    Read_Join_Position(packet, client.MapCRC);
+    ULONG bits;
+    packet.Get_Bits(bits, ControlClass::NUM_BOOLEAN_CONTINUOUS);
+    Check(bits == 0, "Unexpected vehicle weapon controls");
+    packet.Get_Bits(bits, 32);
+    Check((bits & 0x00ffff00u) == 0x00808000u, "Unexpected vehicle strafe or lift");
+}
+
 void Read_Vehicle(cPacket &packet, Join_Client_State &client, int object)
 {
     char model[32];
@@ -1069,27 +1133,8 @@ void Read_Vehicle(cPacket &packet, Join_Client_State &client, int object)
     packet.Get_Bits(shield, 11);
     packet.Get_Bits(armor, 2);
     Check(health == 128 && shield == 51 && armor == client.ShieldArmorCode, "Wrong vehicle defense state");
-    Check(Field<int>(packet) == 0 && !Field<bool>(packet), "Unexpected vehicle weapon or engine state");
-    Check(std::abs(Read_Join_Position_Y(packet, client.MapCRC) - 2.0f) <= 0.11f, "Wrong vehicle position");
-    ULONG bits;
-    for (int axis = 0; axis < 4; ++axis) {
-        packet.Get_Bits(bits, 12); // Quaternion.
-        Check(bits == (axis == 3 ? 4095u : 2048u), "Wrong vehicle orientation");
-    }
-    for (int axis = 0; axis < 3; ++axis) {
-        packet.Get_Bits(bits, 15);
-        Check(bits == 16384u, "Parked vehicle has linear velocity");
-    }
-    for (int axis = 0; axis < 3; ++axis) {
-        packet.Get_Bits(bits, 12);
-        Check(bits == 2048u, "Parked vehicle has angular velocity");
-    }
-    Check(!Field<bool>(packet) && !Field<bool>(packet), "Unexpected vehicle gunner override or host bone");
-    Read_Join_Position_Y(packet, client.MapCRC);
-    packet.Get_Bits(bits, ControlClass::NUM_BOOLEAN_CONTINUOUS);
-    Check(bits == 0, "Unexpected vehicle controls");
-    packet.Get_Bits(bits, 32);
-    Check(bits == 0x80808080u, "Unexpected vehicle analog axes");
+    Read_Vehicle_Frequent(packet, client, object);
+    Check(client.VehicleFrames.at(object).Engine == (driver != -1), "Engine state disagrees with driver occupancy");
 }
 
 void Read_Soldier_Occasional(cPacket &packet, Join_Client_State &client, int object, int team = -1, int charge = 620)
@@ -1182,6 +1227,7 @@ void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
         client.Deleted.insert(object);
         client.Charges.erase(object);
         client.VehicleDriver.erase(object);
+        client.VehicleFrames.erase(object);
         client.SeatedSoldiers.erase(object);
         Check(std::none_of(client.VehicleDriver.begin(), client.VehicleDriver.end(), [=](const auto &vehicle) {
             return vehicle.second == object;
@@ -1221,8 +1267,13 @@ void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
         return;
     }
     if (client.VehicleDriver.count(object)) {
-        Check(!deleting && dirty == NetworkObjectClass::BIT_RARE, "Incorrect vehicle state update");
-        Read_Vehicle(packet, client, object);
+        Check(!deleting && (dirty == NetworkObjectClass::BIT_RARE || dirty == NetworkObjectClass::BIT_FREQUENT),
+            "Incorrect vehicle state update");
+        if (dirty == NetworkObjectClass::BIT_RARE) {
+            Read_Vehicle(packet, client, object);
+        } else {
+            Read_Vehicle_Frequent(packet, client, object);
+        }
         Check(packet.Is_Flushed(), "Unexpected data in vehicle state update");
         return;
     }
@@ -1299,10 +1350,14 @@ void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
         const int preset = Field<int>(packet);
         if (preset == 310) {
             Check(!deleting && !client.VehicleDriver.count(object), "Invalid vehicle creation");
-            Read_Join_Position_Y(packet, client.MapCRC);
-            Check(Field<float>(packet) == 0.0f && Field<int>(packet) == -99999 && Field<int>(packet) == 0,
+            const auto position = Read_Join_Position(packet, client.MapCRC);
+            const float yaw = Field<float>(packet);
+            Check(Field<int>(packet) == -99999 && Field<int>(packet) == 0,
                 "Vehicle creation must carry facing, server ownership and the lock owner");
             Read_Vehicle(packet, client, object);
+            const auto &state = client.VehicleFrames.at(object);
+            Check(state.Position == position && std::abs(state.Yaw - yaw) < 0.002f,
+                "Vehicle creation does not match its current pose");
             break;
         }
         if (preset == 621) {
@@ -1459,8 +1514,10 @@ void Send_Loading(cConnection &client, int id_offset, bool loading)
     client.Send_Packet_To_Individual(packet, SERVER_RHOST_ID, SEND_RELIABLE);
 }
 
-void Check_Vehicle_Seats(const HeadlessCollision &collision, const HeadlessJoinData &data)
+void Check_Vehicle_Driving(const HeadlessCollision &collision, const HeadlessJoinData &data)
 {
+    Check(collision.Vehicle_Hull(0).Extent == Vector3(0.55f, 0.28f, 0.45f),
+        "Vehicle simulation did not use the W3D WorldBox");
     FirstJoinClient = {};
     SecondJoinClient = {};
     LateJoinClient = {};
@@ -1507,22 +1564,36 @@ void Check_Vehicle_Seats(const HeadlessCollision &collision, const HeadlessJoinD
     const int distant = FirstJoinClient.Soldiers.at(2);
     Check(FirstJoinClient.VehicleDriver.size() == 1, "Placed vehicle did not join the map");
     const int vehicle = FirstJoinClient.VehicleDriver.begin()->first;
-    const auto use = [&](cConnection &client, int soldier, bool create) {
+    constexpr ULONG action = 1u << ControlClass::BOOLEAN_ACTION;
+    const auto send_control = [&](cConnection &client, int soldier, bool create, ULONG buttons,
+                                  bool throttle = false, ULONG turn = 128, bool reverse = false) {
         const int peer = client.Get_Local_Id();
         const int before = received;
         cPacket packet;
         Write_Movement(packet, FirstControlObject + (peer - 1) * 100000, create ? peer : 0, soldier,
-            {0, -8, 1.62f}, 21.0f, 8, 1u << ControlClass::BOOLEAN_ACTION, 0, false);
+            {0, -8, 1.62f}, 21.0f, 8, buttons, 0, throttle, turn, reverse);
         client.Send_Packet_To_Individual(packet, SERVER_RHOST_ID, create ? SEND_RELIABLE : SEND_UNRELIABLE);
         pump([&] { return received > before; });
-        session.Advance(100ms);
+        session.Advance(50ms);
     };
-    use(second, distant, true);
+    const auto &observer = SecondJoinClient.VehicleFrames.at(vehicle);
+    const auto start = observer.Position;
+    send_control(second, distant, true, action);
     pump([&] { return SecondJoinClient.Y.count(distant); });
     Check(SecondJoinClient.VehicleDriver.at(vehicle) == -1, "Distant player entered a vehicle");
-    use(first, driver, true);
+    send_control(first, driver, true, action);
     pump([&] { return FirstJoinClient.VehicleDriver.at(vehicle) == driver &&
         SecondJoinClient.VehicleDriver.at(vehicle) == driver; });
+    Check(observer.Engine && observer.Position == start, "Entering should enable the engine at the parked position");
+
+    for (int i = 0; i < 30; ++i) {
+        send_control(first, driver, false, 0, true);
+    }
+    session.Advance(100ms);
+    pump([&] { return observer.Position.X > -5.55f && std::abs(observer.Velocity.X) < 0.08f; });
+    Check(observer.Position.X < -5.14f && observer.Position.X > start.X + 0.9f,
+        "Vehicle hull did not stop at the static vehicle-only wall");
+    const auto at_wall = observer.Position;
 
     Connect_Join_Client(late, u"Late", u"testpass", JoinKey, Receive_Late_Join);
     pump([&] { return LateJoinClient.OptionsTime.has_value(); });
@@ -1530,15 +1601,34 @@ void Check_Vehicle_Seats(const HeadlessCollision &collision, const HeadlessJoinD
     pump([&] { return LateJoinClient.GameDataTime && LateJoinClient.VehicleDriver.count(vehicle); });
     Check(LateJoinClient.VehicleDriver.at(vehicle) == driver && LateJoinClient.SeatedSoldiers.count(driver),
         "A later client did not receive the occupied driver seat");
+    Check(LateJoinClient.VehicleFrames.at(vehicle).Position == at_wall,
+        "A later client did not receive the vehicle's current position");
     const int contender = LateJoinClient.Soldiers.at(3);
-    use(late, contender, true);
+    send_control(late, contender, true, action);
     pump([&] { return LateJoinClient.Y.count(contender); });
     Check(LateJoinClient.VehicleDriver.at(vehicle) == driver, "A second soldier took an occupied driver seat");
 
-    use(first, driver, false);
+    for (int i = 0; i < 7; ++i) {
+        send_control(first, driver, false, 0, true, 255, true);
+    }
+    pump([&] { return observer.Position.X < at_wall.X - 0.22f && observer.Yaw < -0.08f && observer.YawRate < -0.1f; });
+    for (int i = 0; i < 13; ++i) {
+        session.Advance(100ms);
+    }
+    pump([&] { return observer.Velocity.Length2() < 0.0005f && std::abs(observer.YawRate) < 0.015f; });
+    const auto stopped = observer.Position;
+    const float stopped_yaw = observer.Yaw;
+    send_control(second, driver, false, 0, true, 0);
+    session.Advance(100ms);
+    pump([&] { return FirstJoinClient.VehicleFrames.at(vehicle).Position == stopped; });
+    Check(observer.Position == stopped && observer.Yaw == stopped_yaw, "A different peer moved the parked vehicle");
+
+    send_control(first, driver, false, action);
+    const float exit_y = stopped.Y + 0.5f * std::sin(stopped_yaw) - 0.65f * std::cos(stopped_yaw);
     pump([&] { return LateJoinClient.VehicleDriver.at(vehicle) == -1 &&
-        std::abs(LateJoinClient.Y.at(driver) - 1.35f) <= 0.13f; });
-    use(late, contender, false);
+        std::abs(LateJoinClient.Y.at(driver) - exit_y) <= 0.18f; });
+    Check(!observer.Engine && observer.Position == stopped, "Exit moved the vehicle or left its engine on");
+    send_control(late, contender, false, action);
     pump([&] { return SecondJoinClient.VehicleDriver.at(vehicle) == contender; });
     join.Disconnected(3);
     pump([&] { return SecondJoinClient.Deleted.count(contender) && SecondJoinClient.VehicleDriver.at(vehicle) == -1; });
@@ -2526,13 +2616,13 @@ int main(int argc, char **argv)
         const auto charge_join_data = Load_Headless_Join_Data(838, charge_armor, core.Find("strings.tdb").value(),
             core.Find("objects.ddb").value(), std::nullopt, [](const std::string &) { return std::nullopt; });
         Write_Archive(data / "C&C_Vehicles.mix", {{"VEHICLES.LDD", Dynamic_Data(2, false, 6, true)},
-            {"VEHICLES.LSD", Static_Data()}, {"VEHICLES.DEP", dependencies}, {"COLLIDERS.W3D", collision_data}});
+            {"VEHICLES.LSD", Static_Data()}, {"VEHICLES.DEP", dependencies}, {"COLLIDERS.W3D", Collision_Data(2, true)}});
         const MixArchive vehicles_archive(data / "C&C_Vehicles.mix");
         auto vehicles_level = HeadlessLevel::Load(vehicles_archive.Find("vehicles.lsd").value(),
             vehicles_archive.Find("vehicles.ldd").value(), core.Find("objects.ddb").value(), std::nullopt);
         const auto vehicles_collision = HeadlessCollision::Load(std::move(vehicles_level),
             [&](const std::string &name) { return vehicles_archive.Find(name); }, vehicles_archive.Find("vehicles.dep"));
-        Check_Vehicle_Seats(vehicles_collision, charge_join_data);
+        Check_Vehicle_Driving(vehicles_collision, charge_join_data);
         Check_Building_Combat(buildings_collision, true, &charge_join_data);
         const auto remote_join_data = Load_Headless_Join_Data(838, charge_armor, core.Find("strings.tdb").value(),
             core.Find("objects.ddb").value(), std::nullopt, [](const std::string &) { return std::nullopt; },
