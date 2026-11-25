@@ -93,9 +93,15 @@ The join sends the original teams and game options and waits for the client's
 post-load biography before creating its player and soldier objects. Connected
 peers receive position and movement updates for the soldiers known to them.
 The two-client UDP fixture covers login, map readiness, movement replication,
-and object removal when a player leaves. Testing with the graphical Windows
-client is pending. The experimental session covers movement on the initial
-map. Weapons, match rules, map rotation, and server discovery are still pending.
+and object removal when a player leaves.
+
+On Linux arm64, graphical EA 1.038 Windows clients loaded `C&C_Field.mix`,
+spawned and displayed another player's movement. The test used a separate copy of
+the client with `C&C_Field.mix` as the only `.mix` map in `Data`. Adding
+`C&C_Under.mix` to that copy reproduced the client's "Missing map" error on
+the next join to `C&C_Field.mix`. Removing the extra map restored the join.
+Graphical testing against Linux amd64, weapons, match rules, map rotation, and
+server discovery are still pending.
 
 
 ### Level Edit (Public Release)
