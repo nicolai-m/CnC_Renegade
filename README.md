@@ -105,12 +105,21 @@ object removal when a player leaves, and LAN announcements and withdrawal.
 
 On Linux arm64 and with the Linux amd64 build running under QEMU, graphical EA
 1.038 Windows clients loaded `C&C_Field.mix`, spawned and displayed another
-player's movement. The test used a separate copy of the client with
-`C&C_Field.mix` as the only `.mix` map in `Data`. Adding
-`C&C_Under.mix` to that copy reproduced the client's "Missing map" error on
-the next join to `C&C_Field.mix`. Removing the extra map restored the join.
-Graphical testing on native Linux amd64, weapons, match rules, and map rotation
-are still pending.
+player's movement. These tests used a separate client copy with
+`C&C_Field.mix` as the only `.mix` in `Data`.
+
+The tested EA 1.038 Windows executable (February 2025 build) computes the map
+lookup CRC from the last file returned by the Windows `Data\*.mix` search on
+every comparison. With all 26 installed maps, the LAN browser showed the
+server running `Skirmish00.mix`, the last file returned, and omitted the
+server running `C&C_Field.mix`. Both amd64 servers sent LAN announcements
+under QEMU, and a direct connection to the `Skirmish00.mix` server loaded the
+map and spawned the player. For testing other maps with this particular
+client, use a separate client copy with only the target `.mix` in `Data`.
+
+Graphical testing on native Linux amd64, multiple-map testing with a client
+that handles the full map set, weapons, match rules, and map rotation are
+still pending.
 
 
 ### Level Edit (Public Release)
