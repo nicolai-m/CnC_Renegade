@@ -209,14 +209,14 @@ std::string Collision_Data(uint32 last_vertex = 2)
                 part("testmesh.wall", 0) + part("testmesh.bulletwall", 0)));
 }
 
-std::string Dynamic_Data(float spawn_y = 2, bool with_buildings = false)
+std::string Dynamic_Data(float spawn_y = 2, bool with_buildings = false, float gdi_spawn_x = 6)
 {
     auto spawner = [spawn_y](sint32 id, sint32 definition, float x) {
         const std::array<float, 12> transform{1, 0, 0, x, 0, 1, 0, spawn_y, 0, 0, 1, 3};
         return Chunk(1014991133, Chunk(1014991054,
             Micro(1, id) + Micro(2, transform) + Micro(3, definition) + Micro(6, uint8{1}), false));
     };
-    const auto spawners = Chunk(916991657, spawner(10, 100, -6) + spawner(20, 200, 6));
+    const auto spawners = Chunk(916991657, spawner(10, 100, -6) + spawner(20, 200, gdi_spawn_x));
     auto building = [](sint32 preset, sint32 id, std::array<float, 3> position, float health) {
         const std::array<float, 4> sphere{position[0], position[1], position[2], 5.0f};
         const auto defense = Chunk(914991020, Micro(3, health) + Micro(4, health) + Micro(5, uint32{17}) +
@@ -345,7 +345,11 @@ std::string Definitions()
         const auto physical = Chunk(418001829, Chunk(909991657, Micro(18, physics), false));
         const auto weapons = Chunk(418001830, Micro(11, sint32{600 + id % 2}) + Micro(12, sint32{500}) +
             Micro(14, charge), false);
-        const auto scripts = Chunk(627001057, Micro(2, "M00_GrantPowerup_Created") + Micro(3, "POW_Pistol"), false);
+        auto grants = Micro(2, "M00_GrantPowerup_Created") + Micro(3, "POW_Pistol");
+        if (charge == 0) {
+            grants += Micro(2, "M00_GrantPowerup_Created") + Micro(3, "POW_Proximity");
+        }
+        const auto scripts = Chunk(627001057, grants, false);
         return Chunk(CHUNKID_GAME_OBJECT_DEF_SOLDIER,
             Chunk(0x00100101, identity + defense + physical + weapons + scripts));
     };
@@ -370,6 +374,9 @@ std::string Definitions()
     const auto powerup = Chunk(CHUNKID_GAME_OBJECT_DEF_POWERUP, Chunk(0x00100101,
         Chunk(909991656, Chunk(0x100, Micro(1, sint32{630}) + Micro(3, "pow_pistol"), false)) +
         Chunk(909991657, Micro(8, sint32{610}) + Micro(9, uint8{1}) + Micro(10, sint32{-1}), false)));
+    const auto mine_powerup = Chunk(CHUNKID_GAME_OBJECT_DEF_POWERUP, Chunk(0x00100101,
+        Chunk(909991656, Chunk(0x100, Micro(1, sint32{631}) + Micro(3, "pow_proximity"), false)) +
+        Chunk(909991657, Micro(8, sint32{625}) + Micro(9, uint8{1}) + Micro(10, sint32{2}), false)));
     auto building = [](sint32 id, const auto &prefix) {
         return Chunk(CHUNKID_GAME_OBJECT_DEF_POWERPLANT, Chunk(0x00100101,
             Chunk(0x100, Micro(1, id), false) + Chunk(207011031, Micro(1, prefix) + Micro(2, uint32{1}), false) +
@@ -392,6 +399,11 @@ std::string Definitions()
         Chunk(1206091430, Chunk(0x100, Micro(1, sint32{646}), false)) +
         Chunk(1206091429, Micro(2, "test\\charge.w3d") + Micro(24, sint32{643}) + Micro(31, sint32{1}) +
             Micro(32, sint32{1}) + Micro(48, 10.0f), false)));
+    const auto proximity_ammo = Chunk(CHUNKID_AMMO_DEF, Chunk(0x00100101,
+        Chunk(1206091430, Chunk(0x100, Micro(1, sint32{647}), false)) +
+        Chunk(1206091429, Micro(2, "test\\charge.w3d") + Micro(24, sint32{643}) + Micro(31, sint32{1}) +
+            Micro(32, sint32{3}) + Micro(35, 0.0f) + Micro(36, 0.8f) + Micro(37, 0.0f) +
+            Micro(38, 0.25f) + Micro(39, 1.9f) + Micro(40, 0.5f) + Micro(48, 10.0f), false)));
     const auto charge_explosion = Chunk(CHUNKID_EXPLOSION_DEF, Chunk(0x00100101,
         Chunk(0317001526, Chunk(0x100, Micro(1, sint32{643}), false)) +
         Chunk(0317001525, Micro(3, 3.0f) + Micro(4, 45.0f) + Micro(5, uint32{0}) + Micro(6, uint8{0}), false)));
@@ -400,10 +412,12 @@ std::string Definitions()
         building(300, "plant") + building(301, "base") + terminal +
         soldier(400, "CnC_Nod_Minigunner_0", 500) + soldier(401, "CnC_GDI_MiniGunner_0", 501) +
         soldier(402, "CnC_Nod_Engineer_0", 500, 624) + soldier(403, "CnC_GDI_Engineer_0", 501, 624) +
+        soldier(404, "CnC_Nod_Technician_0", 500, 0) + soldier(405, "CnC_GDI_Engineer_2SF", 501, 0) +
         physics(500, "test\\soldier0.w3d") + physics(501, "test\\soldier1.w3d") +
         weapon(600, 40, 200, 2, 2) + weapon(601, 40, 200, 2, 2) + weapon(610, 12, 100, 1, 5) +
         weapon(620, 1, 0, 7, 0, 642, 642) + ammo(640, 20, 40.0f) + ammo(641, 7, 400.0f) + powerup +
-        weapon(624, 1, 1, 7, 0, 646, 646) + thrown_charge + charge_physics + charge_ammo + remote_ammo + charge_explosion));
+        weapon(624, 1, 1, 7, 0, 646, 646) + weapon(625, 1, 1, 7, 0, 647, 647) + mine_powerup +
+        thrown_charge + charge_physics + charge_ammo + remote_ammo + proximity_ammo + charge_explosion));
 }
 
 struct ArchiveEntry {
@@ -932,13 +946,13 @@ float Read_Join_Position_Y(cPacket &packet, uint32 map_crc)
     return y;
 }
 
-std::vector<HeadlessSpawnWeapon> Fixture_Weapons(int team, bool engineer = false)
+std::vector<HeadlessSpawnWeapon> Fixture_Weapons(int team, int charge = 620)
 {
     const HeadlessFireMode primary{0.5f, 0, 20};
     const HeadlessFireMode secondary{0.5f, 0, 7};
     return {{610, 1, 12, 12, -1, 0.35f, primary, secondary},
         {600 + team, 2, 40, 40, 200, 0.35f, primary, secondary},
-        {engineer ? 624 : 620, 7, 1, 1, engineer ? 1 : 0, 0.35f, {}, {}}};
+        {charge, 7, 1, 1, charge == 620 ? 0 : 1, 0.35f, {}, {}}};
 }
 
 void Read_Soldier_Frequent(cPacket &packet, Join_Client_State &client, int object)
@@ -950,7 +964,7 @@ void Read_Soldier_Frequent(cPacket &packet, Join_Client_State &client, int objec
         id = Field<int>(packet);
         rounds = Field<int>(packet);
         Check((id == 610 && rounds == -1) || ((id == 600 || id == 601) && rounds >= 0 && rounds <= 240) ||
-            (id == 620 && rounds >= 0 && rounds <= 1) || (id == 624 && rounds >= 0 && rounds <= 2),
+            (id == 620 && rounds >= 0 && rounds <= 1) || ((id == 624 || id == 625) && rounds >= 0 && rounds <= 2),
             "Incorrect equipped weapon or ammo count");
     }
     client.SelectedWeapon[object] = id;
@@ -972,7 +986,7 @@ void Read_Soldier_Frequent(cPacket &packet, Join_Client_State &client, int objec
     packet.Get_Bits(bits, 32); // Analog controls.
 }
 
-void Read_Soldier_Occasional(cPacket &packet, Join_Client_State &client, int object, int team = -1, bool engineer = false)
+void Read_Soldier_Occasional(cPacket &packet, Join_Client_State &client, int object, int team = -1, int charge = 620)
 {
     Join_Client_State::Defense state{Field<bool>(packet)};
     packet.Get_Bits(state.Health, 11);
@@ -982,7 +996,7 @@ void Read_Soldier_Occasional(cPacket &packet, Join_Client_State &client, int obj
     Check(shield_type == 2, "The original shield save ID did not map to the network index");
     const int count = Field<int>(packet);
     Check(count == 3, "Wrong size of the soldier inventory");
-    for (const auto &weapon : Fixture_Weapons(team, engineer)) {
+    for (const auto &weapon : Fixture_Weapons(team, charge)) {
         const int id = Field<int>(packet);
         const int rounds = Field<int>(packet);
         if (team >= 0) {
@@ -1023,7 +1037,7 @@ void Read_Charge(cPacket &packet, Join_Client_State &client, int object)
         Field<int>(packet) == 0 && Field<int>(packet) == 0 && Field<int>(packet) == PLAYERTYPE_NOD &&
         !Field<bool>(packet), "Invalid C4 model or team");
     const int ammo = Field<int>(packet);
-    Check(ammo == 642 || ammo == 646, "Invalid C4 ammo preset");
+    Check(ammo == 642 || ammo == 646 || ammo == 647, "Invalid C4 ammo preset");
     auto &charge = client.Charges[object];
     charge.Owner = Field<int>(packet);
     ULONG code;
@@ -1173,7 +1187,8 @@ void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
             break;
         }
         const bool engineer = preset == 402 || preset == 403;
-        const int first_preset = client.MapCRC == NextMapCRC ? 410 : (engineer ? 402 : 400);
+        const bool technician = preset == 404 || preset == 405;
+        const int first_preset = client.MapCRC == NextMapCRC ? 410 : (technician ? 404 : (engineer ? 402 : 400));
         client.Y[object] = Read_Join_Position_Y(packet, client.MapCRC);
         const float facing = Field<float>(packet);
         const int owner = Field<int>(packet);
@@ -1190,7 +1205,7 @@ void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
             Field<int>(packet) == 0 && Field<int>(packet) == 0 && Field<int>(packet) == preset - first_preset &&
             !Field<bool>(packet) && Field<int>(packet) == preset,
             "Incorrect soldier rare fields");
-        Read_Soldier_Occasional(packet, client, object, preset - first_preset, engineer);
+        Read_Soldier_Occasional(packet, client, object, preset - first_preset, technician ? 625 : (engineer ? 624 : 620));
         const auto &defense = client.Vitals.at(object);
         Check(!defense.Dead && defense.Health == 102 && defense.Shield == 51, "Incorrect spawn vitals");
         Read_Soldier_Frequent(packet, client, object);
@@ -1526,6 +1541,125 @@ void Check_Building_Combat(const HeadlessCollision &collision, bool ends_game,
             Check(SecondJoinClient.ExplosionOwners.size() == 2 && SecondJoinClient.Charges.empty(),
                 "The remote charge did not disarm when its owner left");
         }
+    }
+}
+
+void Check_Proximity_Combat(const HeadlessCollision &collision, const HeadlessJoinData &data)
+{
+    FirstJoinClient = {};
+    SecondJoinClient = {};
+    LateJoinClient = {};
+    LateJoinClient.JoiningActiveCombat = true;
+    const std::vector<HeadlessMap> maps{{"C&C_Test.mix", collision, data}};
+    HeadlessJoinOptions options;
+    options.Owner = u"FixtureHost";
+    options.Title = u"Join fixture";
+    options.Motd = u"Ready";
+    options.Password = u"testpass";
+    options.Address = htonl(INADDR_LOOPBACK);
+    options.TimeLimit = 23;
+    options.FriendlyFire = true;
+    cConnection server;
+    Check(server.Init_As_Server(0, 16, true, INADDR_LOOPBACK), "Could not bind the proximity mine test server");
+    server.Set_Bandwidth_Budget_Out(TestBandwidth);
+    JoinPort = server.Get_Local_Port();
+    JoinKey = data.VersionKey;
+    HeadlessPlayerSession session(maps.front().Collision, server);
+    HeadlessJoin join(server, session, maps, options);
+    server.Install_Application_Acceptance_Handler([&](cPacket &packet) { return join.Accept(packet); });
+    server.Install_Conn_Handler([&](int id) { join.Connected(id); });
+    int received = 0;
+    server.Install_Server_Packet_Handler([&](cPacket &packet, int id) {
+        join.Receive(packet, id);
+        ++received;
+    });
+
+    cConnection first;
+    cConnection second;
+    cConnection late;
+    const auto pump = [&](const auto &ready) {
+        Pump_Clients({&first, &second, &late}, [&] {
+            server.Service_Read();
+            server.Service_Send(true);
+            return ready();
+        });
+    };
+    const auto advance = [&](int ticks) {
+        for (int i = 0; i < ticks; ++i) {
+            session.Advance(100ms);
+            join.Update_Combat();
+        }
+    };
+    Connect_Join_Client(first, u"First", u"testpass", JoinKey, Receive_First_Join);
+    Connect_Join_Client(second, u"Second", u"testpass", JoinKey, Receive_Second_Join);
+    pump([&] { return FirstJoinClient.OptionsTime && SecondJoinClient.OptionsTime; });
+    Send_Bio(first, u"First", PLAYERTYPE_NOD, 1, "C&C_Test.mix");
+    Send_Bio(second, u"Second", PLAYERTYPE_GDI, 1, "C&C_Test.mix");
+    pump([&] { return FirstJoinClient.Soldiers.size() == 2 && SecondJoinClient.GameDataTime; });
+    const int owner = FirstJoinClient.Soldiers.at(1);
+    const int enemy = FirstJoinClient.Soldiers.at(2);
+    const int terminal = FirstJoinClient.Buildings.at(301);
+    const auto controls = [&](cConnection &client, int soldier, bool create, const Vector3 &aim,
+                              ULONG buttons, ULONG trigger, bool moving) {
+        const int peer = client.Get_Local_Id();
+        const int before = received;
+        cPacket packet;
+        Write_Movement(packet, FirstControlObject + (peer - 1) * 100000, create ? peer : 0, soldier,
+            aim, 21.0f, 8, buttons, trigger, moving);
+        client.Send_Packet_To_Individual(packet, SERVER_RHOST_ID, create ? SEND_RELIABLE : SEND_UNRELIABLE);
+        pump([&] { return received > before; });
+    };
+    constexpr ULONG select_mine = 1u << ControlClass::BOOLEAN_SELECT_WEAPON_7;
+    constexpr ULONG use_weapon = 1u << ControlClass::BOOLEAN_WEAPON_USE;
+    const Vector3 aim(0, -8, 1.62f);
+    controls(first, owner, true, aim, select_mine | use_weapon, 2, false); // Select the second proximity mode.
+    advance(12);
+    pump([&] { return FirstJoinClient.SelectedWeapon.at(owner) == 625 &&
+        SecondJoinClient.SelectedWeapon.at(owner) == 625; });
+    Check(FirstJoinClient.Rounds.at(owner) == 2, "The technician did not receive the original mine grant");
+    controls(first, owner, false, aim, 0, 1, false);
+    advance(3);
+    pump([&] {
+        return FirstJoinClient.Charges.size() == 1 && FirstJoinClient.Charges.begin()->second.Stuck &&
+            FirstJoinClient.Rounds.at(owner) == 1 && SecondJoinClient.Charges.size() == 1;
+    });
+    const int mine = FirstJoinClient.Charges.begin()->first;
+    Check(FirstJoinClient.Charges.at(mine).MCT && FirstJoinClient.Charges.at(mine).AttachedObject == terminal,
+        "The proximity mine did not attach to the terminal");
+
+    Connect_Join_Client(late, u"Late", u"testpass", JoinKey, Receive_Late_Join);
+    pump([&] { return LateJoinClient.OptionsTime.has_value(); });
+    Send_Bio(late, u"Late", PLAYERTYPE_NOD, 1, "C&C_Test.mix");
+    pump([&] { return LateJoinClient.GameDataTime && LateJoinClient.Charges.count(mine); });
+    const int ally = LateJoinClient.Soldiers.at(3);
+    const auto still_placed = [&] {
+        pump([&] { return true; });
+        for (const auto *client : {&FirstJoinClient, &SecondJoinClient, &LateJoinClient}) {
+            Check(client->ExplosionOwners.empty() && client->Charges.count(mine),
+                "The proximity mine detonated before its trigger conditions were met");
+        }
+    };
+
+    controls(second, enemy, true, {-8, 0, 0}, 0, 0, true);
+    advance(2); // The enemy enters the selected radius before the mine is armed.
+    still_placed();
+    controls(second, enemy, false, {8, 0, 0}, 0, 0, true);
+    advance(2); // The enemy retreats before the first scan.
+    controls(second, enemy, false, {8, 0, 0}, 0, 0, false);
+    controls(first, owner, false, aim, use_weapon, 2, false);
+    advance(7); // The mine is now armed, with only teammates in range.
+    still_placed();
+
+    controls(second, enemy, false, {-8, 0, 0}, 0, 0, true);
+    advance(6);
+    pump([&] {
+        return FirstJoinClient.Deleted.count(mine) && SecondJoinClient.Deleted.count(mine) &&
+            LateJoinClient.Deleted.count(mine) && FirstJoinClient.BuildingDestroyed.at(terminal) &&
+            SecondJoinClient.Vitals.at(enemy).Health < 102 && LateJoinClient.Vitals.at(ally).Health < 102;
+    });
+    for (const auto *client : {&FirstJoinClient, &SecondJoinClient, &LateJoinClient}) {
+        Check(client->ExplosionOwners == std::vector<int>{owner} && client->Charges.empty() &&
+            client->BuildingDestroyed.at(terminal), "The proximity mine did not detonate once for all clients");
     }
 }
 
@@ -2047,6 +2181,17 @@ int main(int argc, char **argv)
             core.Find("objects.ddb").value(), std::nullopt, [](const std::string &) { return std::nullopt; },
             HeadlessSpawnCharacter::Engineer);
         Check_Building_Combat(buildings_collision, true, &remote_join_data, true);
+        Write_Archive(data / "C&C_Proximity.mix", {{"PROXIMITY.LDD", Dynamic_Data(2, true, -5.15f)},
+            {"PROXIMITY.LSD", Static_Data(2, 20, true)}, {"PROXIMITY.DEP", dependencies}, {"COLLIDERS.W3D", collision_data}});
+        const MixArchive proximity_archive(data / "C&C_Proximity.mix");
+        auto proximity_level = HeadlessLevel::Load(proximity_archive.Find("proximity.lsd").value(),
+            proximity_archive.Find("proximity.ldd").value(), core.Find("objects.ddb").value(), std::nullopt);
+        const auto proximity_collision = HeadlessCollision::Load(std::move(proximity_level),
+            [&](const std::string &name) { return proximity_archive.Find(name); }, proximity_archive.Find("proximity.dep"));
+        const auto proximity_join_data = Load_Headless_Join_Data(838, charge_armor, core.Find("strings.tdb").value(),
+            core.Find("objects.ddb").value(), std::nullopt, [](const std::string &) { return std::nullopt; },
+            HeadlessSpawnCharacter::Technician);
+        Check_Proximity_Combat(proximity_collision, proximity_join_data);
         Write_Archive(data / "C&C_Next.mix", {{"C&C_NEXT.LDD", Dynamic_Data(1.2f)},
             {"C&C_NEXT.LSD", Static_Data(2, 60)}, {"C&C_NEXT.DEP", dependencies}, {"COLLIDERS.W3D", collision_data}});
         const MixArchive next_archive(data / "C&C_Next.mix");

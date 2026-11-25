@@ -329,8 +329,10 @@ Settings Load_Settings(const Options &options, const fs::path &data_dir)
         const auto character = Fold_Ascii(Setting(rules->second, "spawncharacter"));
         if (character == "engineer") {
             result.SpawnCharacter = HeadlessSpawnCharacter::Engineer;
+        } else if (character == "technician") {
+            result.SpawnCharacter = HeadlessSpawnCharacter::Technician;
         } else if (!character.empty() && character != "minigunner") {
-            throw std::runtime_error("SpawnCharacter must be Minigunner or Engineer");
+            throw std::runtime_error("SpawnCharacter must be Minigunner, Engineer, or Technician");
         }
         const auto loop = Fold_Ascii(Setting(rules->second, "domapsloop"));
         if (!loop.empty() && std::string_view("nf0").find(loop.front()) != std::string_view::npos) {

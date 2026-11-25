@@ -19,6 +19,7 @@
 #include "lineseg.h"
 #include "netclassids.h"
 #include "networkobject.h"
+#include "playertype.h"
 
 namespace {
 
@@ -39,7 +40,8 @@ constexpr ULONG FireSecondary = 1u << (ControlClass::BOOLEAN_WEAPON_FIRE_SECONDA
 constexpr float InstantBulletSpeed = 400.0f; // BulletManager::Create_Bullet.
 constexpr std::size_t MaxActiveBullets = 4096;
 constexpr std::size_t MaxActiveCharges = 4096;
-constexpr int TeamRemoteChargeLimit = 30; // C4GameObj::Maintain_C4_Limit.
+constexpr int TeamMineLimit = 30; // C4GameObj::Maintain_C4_Limit excludes timed charges.
+constexpr double ProximityCheckInterval = 0.25; // C4GameObj::Think.
 
 int Building_State(const HeadlessLevel::Building &building, float health)
 {
@@ -431,8 +433,8 @@ bool HeadlessPlayerSession::Read_Control(cPacket &packet, int peer_id, Peer &pee
         if (weapon.PrimaryFire && weapon.PrimaryFire->Charge) {
             const auto &charge = *weapon.PrimaryFire->Charge;
             peer.DetonateRemoteCharges = true;
-            if (charge.Trigger == HeadlessChargeTrigger::Timed) {
-                weapon.DetonationMode = (weapon.DetonationMode + 1) % charge.FuseSeconds.size();
+            if (charge.Trigger != HeadlessChargeTrigger::Remote) {
+                weapon.DetonationMode = (weapon.DetonationMode + 1) % charge.TriggerTimes.size();
             }
         }
     }
@@ -676,15 +678,12 @@ void HeadlessPlayerSession::Throw_Charge(int owner, const Peer &peer,
         return;
     }
     const auto &soldier = *Simulation.Find_Soldier(owner);
-    std::optional<double> fuse;
-    if (definition.Trigger == HeadlessChargeTrigger::Timed) {
-        fuse = definition.FuseSeconds[mode];
-    } else {
-        const auto same_team_remote = [&](const auto &charge) {
-            return charge.Team == soldier.PlayerType && charge.Definition.Trigger == HeadlessChargeTrigger::Remote;
+    if (definition.Trigger != HeadlessChargeTrigger::Timed) {
+        const auto same_team_mine = [&](const auto &charge) {
+            return charge.Team == soldier.PlayerType && charge.Definition.Trigger != HeadlessChargeTrigger::Timed;
         };
-        if (std::count_if(Charges.begin(), Charges.end(), same_team_remote) >= TeamRemoteChargeLimit) {
-            const auto oldest = std::find_if(Charges.begin(), Charges.end(), same_team_remote);
+        if (std::count_if(Charges.begin(), Charges.end(), same_team_mine) >= TeamMineLimit) {
+            const auto oldest = std::find_if(Charges.begin(), Charges.end(), same_team_mine);
             Send_Map_Object_Deletion(oldest->ObjectId);
             Charges.erase(oldest);
         }
@@ -697,7 +696,8 @@ void HeadlessPlayerSession::Throw_Charge(int owner, const Peer &peer,
     direction.Normalize();
     const float facing = std::atan2(peer.Forward.Y, peer.Forward.X);
     const auto &charge = Charges.emplace_back(Charge{Allocate_Network_Object(), owner, peer.SoldierObject,
-        soldier.PlayerType, definition, origin, definition.ThrowSpeed * direction, facing, fuse});
+        soldier.PlayerType, definition, origin, definition.ThrowSpeed * direction, facing,
+        definition.TriggerTimes[mode], definition.TriggerRanges[mode]});
     for (const int recipient : MapViewers) {
         if (Connection.Get_Remote_Host(recipient)) {
             Send_Charge(charge, recipient, NetworkObjectClass::BIT_CREATION);
@@ -747,6 +747,29 @@ void HeadlessPlayerSession::Move_Charge(Charge &charge, float seconds)
     }
 }
 
+bool HeadlessPlayerSession::Charge_Triggers(Charge &charge, const Peer &owner, double seconds) const
+{
+    const auto trigger = charge.Definition.Trigger;
+    if (trigger == HeadlessChargeTrigger::Remote) {
+        return owner.DetonateRemoteCharges;
+    }
+    charge.TriggerRemaining -= seconds;
+    if (charge.TriggerRemaining > 0) {
+        return false;
+    }
+    if (trigger == HeadlessChargeTrigger::Timed) {
+        return true;
+    }
+    // A stalled frame checks the current positions once and retains the polling schedule.
+    charge.TriggerRemaining = ProximityCheckInterval - std::fmod(-charge.TriggerRemaining, ProximityCheckInterval);
+    const float range_squared = charge.TriggerRange * charge.TriggerRange;
+    return std::any_of(Peers.begin(), Peers.end(), [&](const auto &entry) {
+        const auto *soldier = Simulation.Find_Soldier(entry.first);
+        return entry.second.Ready && soldier && Player_Types_Are_Enemies(charge.Team, soldier->PlayerType) &&
+            (soldier->Position - charge.Position).Length2() <= range_squared;
+    });
+}
+
 void HeadlessPlayerSession::Advance_Charges(double seconds, float movement_seconds)
 {
     const auto &bounds = Simulation.Map_Collision().Level().World_Bounds();
@@ -765,7 +788,8 @@ void HeadlessPlayerSession::Advance_Charges(double seconds, float movement_secon
         const int previous_owner = charge.OwnerObject;
         charge.OwnerObject = owner->second.SoldierObject;
         if (!charge.Stuck) {
-            const double flight_time = std::min<double>(movement_seconds, charge.FuseRemaining.value_or(movement_seconds));
+            const double flight_time = charge.Definition.Trigger == HeadlessChargeTrigger::Timed ?
+                std::min<double>(movement_seconds, charge.TriggerRemaining) : movement_seconds;
             Move_Charge(charge, static_cast<float>(flight_time));
             if (charge.Position.Z < world_floor) {
                 Send_Map_Object_Deletion(charge.ObjectId);
@@ -777,12 +801,7 @@ void HeadlessPlayerSession::Advance_Charges(double seconds, float movement_secon
             charge.Position = Simulation.Find_Soldier(charge.AttachedPeer)->Position +
                 Vector3(xy.X, xy.Y, charge.AttachedOffset.Z);
         }
-        bool detonate = remote && owner->second.DetonateRemoteCharges;
-        if (charge.FuseRemaining) {
-            *charge.FuseRemaining -= seconds;
-            detonate = *charge.FuseRemaining <= 0;
-        }
-        if (detonate) {
+        if (Charge_Triggers(charge, owner->second, seconds)) {
             Detonate_Charge(charge);
             Send_Map_Object_Deletion(charge.ObjectId);
             return true;

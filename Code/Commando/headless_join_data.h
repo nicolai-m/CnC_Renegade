@@ -26,7 +26,7 @@ struct HeadlessExplosionDefinition {
     bool Scaled = false;
 };
 
-enum class HeadlessChargeTrigger { Remote, Timed };
+enum class HeadlessChargeTrigger { Remote, Timed, Proximity };
 
 struct HeadlessChargeDefinition {
     HeadlessChargeTrigger Trigger;
@@ -35,7 +35,8 @@ struct HeadlessChargeDefinition {
     std::string Model;
     float ThrowSpeed;
     float GravityScale;
-    std::array<float, 3> FuseSeconds;
+    std::array<float, 3> TriggerTimes;
+    std::array<float, 3> TriggerRanges;
     float Health;
     float Shield;
     unsigned ShieldType;
@@ -99,7 +100,7 @@ struct HeadlessJoinData {
     std::array<HeadlessSoldierPreset, 2> Soldiers; // Nod, GDI.
 };
 
-enum class HeadlessSpawnCharacter { Minigunner, Engineer };
+enum class HeadlessSpawnCharacter { Minigunner, Engineer, Technician };
 
 HeadlessJoinData Load_Headless_Join_Data(std::uint32_t client_build, const HeadlessArmorTable &armor,
     const GameDataFile &strings, const GameDataFile &definitions, const std::optional<GameDataFile> &map_definitions,

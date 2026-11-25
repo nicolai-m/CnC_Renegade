@@ -136,7 +136,7 @@ component, including the alternate armor of the Master Control Terminal.
 Clients receive the original building health and destruction updates.
 Building damage and destruction award preset points and credits.
 
-Timed and remote C4 use the original weapon, projectile, and explosion
+Timed, remote, and proximity C4 use the original weapon, projectile, and explosion
 presets. A throw consumes one charge. The charge sticks
 to terrain, a building component, or a soldier's collision box. Detonation
 damages nearby soldiers, with reduced damage through cover. A charge stuck to
@@ -150,9 +150,17 @@ their original engineer loadouts, including two remote charges. The default
 remote C4 and use primary fire to throw a charge. With C4 equipped, secondary
 fire detonates all remote charges belonging to that soldier. Remote charges
 have no fuse and are disarmed when the owner disconnects or their soldier
-is removed. The oldest remote charge is disarmed when its team exceeds 30.
-Purchase terminals, proximity C4, repair-gun functionality, and animated
-attachments still need to be ported.
+is removed.
+
+Set `SpawnCharacter=Technician` to use the original Nod Technician and GDI
+Hotwire loadouts. Both start with five proximity mines. Select proximity C4
+and use primary fire to throw a mine. It uses the arming delay and trigger
+range in its ammo preset. The stock mine arms immediately and checks for
+opposing soldiers within three meters every quarter second. Remote charges
+and proximity mines share a limit of 30 per team. A new placement at that
+limit disarms the team's oldest mine or remote charge. Purchase terminals,
+vehicle-triggered proximity detection, repair-gun functionality, and
+animated attachments still need to be ported.
 
 `TimeLimitMinutes` starts counting down when the server starts the loaded map.
 Clients receive the remaining round time when joining and after loading the
@@ -189,6 +197,9 @@ the selected fuse, and a base destruction win after detonation.
 The remote C4 case covers the engineer loadout, both charges surviving
 until their owner triggers them, visibility for a late join, and disarming
 when the owner disconnects.
+The proximity fixture verifies the technician's ammunition grant, arming
+delay, selected trigger radius, late-join replication, and a single detonation
+when the opposing soldier moves into range.
 
 On Linux arm64 and with the Linux amd64 build running under QEMU, graphical EA
 1.038 Windows clients loaded `C&C_Field.mix`, spawned and displayed another

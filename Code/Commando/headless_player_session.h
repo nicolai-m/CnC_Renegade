@@ -108,7 +108,8 @@ private:
         Vector3 Position;
         Vector3 Velocity;
         float Facing;
-        std::optional<double> FuseRemaining;
+        double TriggerRemaining;
+        float TriggerRange;
         bool Stuck = false;
         std::optional<std::size_t> Building;
         bool StuckMCT = false;
@@ -139,6 +140,7 @@ private:
     void Throw_Charge(int owner, const Peer &peer, const HeadlessChargeDefinition &definition, unsigned mode);
     void Advance_Charges(double seconds, float movement_seconds);
     void Move_Charge(Charge &charge, float seconds);
+    bool Charge_Triggers(Charge &charge, const Peer &owner, double seconds) const;
     void Detonate_Charge(const Charge &charge);
     void Send_Charge(const Charge &charge, int recipient, BYTE dirty);
     void Send_Map_Object_Deletion(int object);
