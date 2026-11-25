@@ -17,9 +17,12 @@ class cPacket;
 
 class HeadlessPlayerSession {
 public:
-    struct SoldierDeath {
+    struct SoldierHit {
         int VictimPeer;
-        int KillerSoldier; // A soldier network ID, which cannot be reused by a new connection.
+        int ShooterSoldier; // A network ID, which cannot be reused by a new connection.
+        double DamagePoints;
+        float DeathPoints;
+        bool Fatal;
     };
 
     HeadlessPlayerSession(const HeadlessCollision &collision, cConnection &connection);
@@ -36,7 +39,7 @@ public:
     void Reset_Map(const HeadlessCollision &collision);
     void Receive_Control(cPacket &packet, int peer_id);
     void Advance(HeadlessSimulation::Clock::duration elapsed);
-    std::vector<SoldierDeath> Take_Soldier_Deaths();
+    std::vector<SoldierHit> Take_Soldier_Hits();
     static bool Client_Owns_Object_Id(int peer_id, int object_id);
 
 private:
@@ -62,6 +65,8 @@ private:
         float Shield = 0;
         unsigned Skin = 0;
         unsigned ShieldType = 0;
+        float DamagePoints = 0;
+        float DeathPoints = 0;
         bool DefenseChanged = false;
     };
 
@@ -99,7 +104,7 @@ private:
     cEncoderTypeEntry ArmorEncoder;
     std::mt19937 SpreadRandom;
     std::vector<Bullet> Bullets;
-    std::vector<SoldierDeath> Deaths;
+    std::vector<SoldierHit> Hits;
     HeadlessSimulation::Clock::duration PublishElapsed{};
 };
 

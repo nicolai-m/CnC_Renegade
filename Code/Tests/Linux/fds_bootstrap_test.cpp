@@ -323,7 +323,7 @@ std::string Definitions()
     auto soldier = [](sint32 id, const char (&name)[21], sint32 physics) {
         const auto identity = Chunk(0x100, Micro(1, id) + Micro(3, name), false);
         const auto defense = Chunk(7311607, Micro(0, 100.0f) + Micro(2, sint32{17}) +
-            Micro(3, 50.0f) + Micro(5, sint32{23}), false);
+            Micro(3, 50.0f) + Micro(5, sint32{23}) + Micro(6, 0.5f) + Micro(7, 4.0f), false);
         const auto physical = Chunk(418001829, Chunk(909991657, Micro(18, physics), false));
         const auto weapons = Chunk(418001830, Micro(11, sint32{600 + id - 400}) + Micro(12, sint32{500}) +
             Micro(14, sint32{620}), false);
@@ -706,8 +706,11 @@ struct Join_Client_State {
     std::set<int> Teams;
     std::map<int, int> TeamObjects; // Network object ID to team.
     std::map<int, std::pair<int, int>> TeamCounts;
+    std::map<int, float> TeamScores;
     std::map<int, int> Players; // Peer ID to network object ID.
     std::map<int, std::pair<int, int>> PlayerCounts; // By network object ID.
+    std::map<int, float> PlayerScores;
+    std::map<int, float> PlayerCredits;
     std::vector<std::pair<int, int>> KillMessages;
     std::map<int, int> Soldiers;
     std::map<int, float> Y;
@@ -721,6 +724,7 @@ struct Join_Client_State {
     int Round = 1;
     uint32 MapCRC = 0;
     bool CycleEnded = false;
+    int LastWinner = -1;
 };
 
 Join_Client_State FirstJoinClient;
@@ -817,14 +821,17 @@ std::pair<int, int> Read_Combat_Counts(cPacket &packet)
 
 void Read_Player_Counts(cPacket &packet, Join_Client_State &client, int object)
 {
-    Check(Field<float>(packet) == 0 && Field<float>(packet) == 0, "Unexpected player score or money");
+    client.PlayerScores[object] = Field<float>(packet);
+    client.PlayerCredits[object] = Field<float>(packet);
+    Check(std::isfinite(client.PlayerScores[object]) && std::isfinite(client.PlayerCredits[object]) &&
+        client.PlayerCredits[object] >= 0, "Invalid score or credits");
     client.PlayerCounts[object] = Read_Combat_Counts(packet);
 }
 
 void Read_Team_Counts(cPacket &packet, Join_Client_State &client, int team)
 {
     client.TeamCounts[team] = Read_Combat_Counts(packet);
-    Check(Field<float>(packet) == 0, "Unexpected team score");
+    client.TeamScores[team] = Field<float>(packet);
 }
 
 void Read_Player(cPacket &packet, Join_Client_State &client, int object, bool creation)
@@ -943,6 +950,11 @@ void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
         Check(!deleting && packet.Is_Flushed(), "Incorrect cPlayer statistics update");
         return;
     }
+    if (dirty == NetworkObjectClass::BIT_OCCASIONAL && client.TeamObjects.count(object)) {
+        client.TeamScores[client.TeamObjects.at(object)] = Field<float>(packet);
+        Check(!deleting && packet.Is_Flushed(), "Incorrect cTeam score update");
+        return;
+    }
     if (dirty == NetworkObjectClass::BIT_FREQUENT || dirty == NetworkObjectClass::BIT_OCCASIONAL) {
         Check(!deleting, "Unexpected deletion flag on soldier update");
         if (dirty == NetworkObjectClass::BIT_OCCASIONAL) {
@@ -1036,7 +1048,9 @@ void Receive_Join_Packet(cPacket &packet, Join_Client_State &client)
         break;
     }
     case 1003: { // cWinEvent.
-        Check(deleting && Field<int>(packet) == PLAYERTYPE_NOD && Field<int>(packet) == -99999 &&
+        client.LastWinner = Field<int>(packet);
+        Check(deleting && (client.LastWinner == PLAYERTYPE_NOD || client.LastWinner == PLAYERTYPE_GDI) &&
+            Field<int>(packet) == -99999 &&
             Field<int>(packet) == client.Round, "Incorrect timed round result");
         client.CycleEnded = Field<bool>(packet);
         Check(Field<int>(packet) == 2 && Field<uint32>(packet) == 1380, "Incorrect reason or duration for round end");
@@ -1142,8 +1156,13 @@ void Check_Map_Rotation(const HeadlessCollision &collision, const HeadlessCollis
         {401, "soldier1", 100, 50, 1, Fixture_Weapons(1), 601}}}};
     auto next_data = data;
     next_data.Soldiers[PLAYERTYPE_NOD].DefinitionId = 410;
-    next_data.Soldiers[PLAYERTYPE_NOD].Weapons[1].PrimaryFire->Bullet = HeadlessBulletDefinition{200, 0, 20, 400, 0};
     next_data.Soldiers[PLAYERTYPE_GDI].DefinitionId = 411;
+    // Test a points lead over more kills when looping, and the kill tiebreaker when ending the cycle.
+    const int combat_team = loop ? PLAYERTYPE_NOD : PLAYERTYPE_GDI;
+    auto &combat_preset = next_data.Soldiers[combat_team];
+    combat_preset.Weapons[1].PrimaryFire->Bullet = HeadlessBulletDefinition{200, 0, 20, 400, 0};
+    combat_preset.DamagePoints = loop ? 0.5f : 0.0f;
+    combat_preset.DeathPoints = loop ? 4.0f : 0.0f;
     const std::vector<HeadlessMap> maps{{"C&C_Test.mix", collision, data}, {"C&C_Next.mix", next_collision, next_data}};
     HeadlessJoinOptions options;
     options.Owner = u"FixtureHost";
@@ -1202,6 +1221,8 @@ void Check_Map_Rotation(const HeadlessCollision &collision, const HeadlessCollis
     pump([&] { return FirstJoinClient.Round == 2 && SecondJoinClient.Round == 2; });
     Check(FirstJoinClient.MapCRC == NextMapCRC && SecondJoinClient.MapCRC == NextMapCRC &&
         !FirstJoinClient.CycleEnded && !SecondJoinClient.CycleEnded, "Round result did not name the next map");
+    Check(FirstJoinClient.LastWinner == PLAYERTYPE_NOD && SecondJoinClient.LastWinner == PLAYERTYPE_NOD,
+        "An exact tie did not use the first team in the original order");
     cPacket announcement;
     join.Write_Lan_Announcement(announcement, options.Address, 1, true);
     Check(Field<BYTE>(announcement) == 0, "Unexpected LAN announcement type");
@@ -1246,7 +1267,7 @@ void Check_Map_Rotation(const HeadlessCollision &collision, const HeadlessCollis
     session.Advance(100ms);
     pump([&] { return FirstJoinClient.Y[new_soldier] > 1.5f && SecondJoinClient.Y[new_soldier] > 1.5f; });
 
-    Send_Bio(late, u"Late", PLAYERTYPE_NOD, 1, "C&C_Test.mix");
+    Send_Bio(late, u"Late", combat_team, 1, "C&C_Test.mix");
     pump([&] { return LateJoinClient.Round == 2; });
     Check(LateJoinClient.MapCRC == NextMapCRC && LateJoinClient.Players.count(3) == 1 &&
         LateJoinClient.Soldiers.empty(), "A join finishing on the previous map must be redirected before spawning");
@@ -1257,18 +1278,30 @@ void Check_Map_Rotation(const HeadlessCollision &collision, const HeadlessCollis
         session.Advance(100ms); // Wait out the automatic weapon switch after spawning.
     }
     const int before_shot = received;
+    const int shooter = loop ? 2 : 1;
     cPacket friendly_shot;
-    Write_Movement(friendly_shot, FirstControlObject + 100000, 2, SecondJoinClient.Soldiers.at(2),
-        {12, 0, 1.62f}, 61.0f, 10, 0, 1, false);
-    second.Send_Packet_To_Individual(friendly_shot, SERVER_RHOST_ID, SEND_RELIABLE);
+    if (loop) {
+        Write_Movement(friendly_shot, FirstControlObject + 100000, 2, SecondJoinClient.Soldiers.at(2),
+            {12, 0, 1.62f}, 61.0f, 10, 0, 1, false);
+        second.Send_Packet_To_Individual(friendly_shot, SERVER_RHOST_ID, SEND_RELIABLE);
+    } else {
+        Write_Movement(friendly_shot, FirstControlObject, 0, new_soldier, {0, -4, 1.62f}, 61.0f, 10, 0, 1, false);
+        first.Send_Packet_To_Individual(friendly_shot, SERVER_RHOST_ID, SEND_UNRELIABLE);
+    }
     pump([&] { return received > before_shot; });
     session.Advance(50ms);
     join.Update_Combat();
+    const float expected_score = loop ? -54 : 0;
+    const auto scored = [&](const Join_Client_State &client) {
+        const int object = client.Players.at(shooter);
+        return Has_Combat_Counts(client, shooter, 3, combat_team, combat_team) &&
+            client.PlayerScores.at(object) == expected_score && client.PlayerCredits.at(object) == 0 &&
+            client.TeamScores.at(combat_team) == expected_score;
+    };
     pump([&] {
-        return Has_Combat_Counts(FirstJoinClient, 2, 3, PLAYERTYPE_NOD, PLAYERTYPE_NOD) &&
-            Has_Combat_Counts(SecondJoinClient, 2, 3, PLAYERTYPE_NOD, PLAYERTYPE_NOD) &&
-            Has_Combat_Counts(LateJoinClient, 2, 3, PLAYERTYPE_NOD, PLAYERTYPE_NOD) &&
-            LoadingJoinClient.TeamCounts.at(PLAYERTYPE_NOD) == std::pair<int, int>{1, 1};
+        return scored(FirstJoinClient) && scored(SecondJoinClient) && scored(LateJoinClient) &&
+            LoadingJoinClient.TeamCounts.at(combat_team) == std::pair<int, int>{1, 1} &&
+            LoadingJoinClient.TeamScores.at(combat_team) == expected_score;
     });
     Check(LoadingJoinClient.KillMessages.empty() && LoadingJoinClient.PlayerCounts.empty(),
         "A peer still loading received player statistics or a kill message before the player objects");
@@ -1278,6 +1311,8 @@ void Check_Map_Rotation(const HeadlessCollision &collision, const HeadlessCollis
     pump([&] { return FirstJoinClient.Round == 3 && SecondJoinClient.Round == 3 && LateJoinClient.Round == 3; });
     Check(FirstJoinClient.CycleEnded == !loop && FirstJoinClient.MapCRC == (loop ? TestMapCRC : NextMapCRC),
         "The last map did not honor DoMapsLoop");
+    Check(FirstJoinClient.LastWinner == PLAYERTYPE_GDI && SecondJoinClient.LastWinner == PLAYERTYPE_GDI &&
+        LateJoinClient.LastWinner == PLAYERTYPE_GDI, "The timed result did not rank by score and then kills");
     cPacket final_announcement;
     join.Write_Lan_Announcement(final_announcement, options.Address, 2, true);
     Check(Field<BYTE>(final_announcement) == 0, "Unexpected LAN announcement type after the last map");
@@ -1292,9 +1327,13 @@ void Check_Map_Rotation(const HeadlessCollision &collision, const HeadlessCollis
             "Wrapping the map cycle did not restore the first map's spawn and coordinate precision");
         for (const auto *client : {&FirstJoinClient, &SecondJoinClient, &LateJoinClient, &LoadingJoinClient}) {
             const auto zero = [](const auto &entry) { return entry.second == std::pair<int, int>{0, 0}; };
+            const auto zero_points = [](const auto &entry) { return entry.second == 0; };
             Check(std::all_of(client->PlayerCounts.begin(), client->PlayerCounts.end(), zero) &&
-                std::all_of(client->TeamCounts.begin(), client->TeamCounts.end(), zero),
-                "The next round did not reset player and team combat counts");
+                std::all_of(client->TeamCounts.begin(), client->TeamCounts.end(), zero) &&
+                std::all_of(client->PlayerScores.begin(), client->PlayerScores.end(), zero_points) &&
+                std::all_of(client->PlayerCredits.begin(), client->PlayerCredits.end(), zero_points) &&
+                std::all_of(client->TeamScores.begin(), client->TeamScores.end(), zero_points),
+                "The next round did not reset player and team combat statistics");
         }
     }
 }
@@ -1399,6 +1438,18 @@ void Check_Original_Join(unsigned short port, const std::string &definitions, co
     Pump_Clients({&first, &second}, [&] { return replicated(160, 0); });
 
     const int second_soldier = SecondJoinClient.Soldiers.at(2);
+    const auto score = [&](float points) {
+        const auto meets = [&](const Join_Client_State &client) {
+            const int attacker = client.Players.at(1);
+            const int victim = client.Players.at(2);
+            return std::abs(client.PlayerScores.at(attacker) - points) < 0.001f &&
+                std::abs(client.PlayerCredits.at(attacker) - points) < 0.001f &&
+                std::abs(client.TeamScores.at(PLAYERTYPE_GDI) - points) < 0.001f &&
+                client.TeamScores.at(PLAYERTYPE_NOD) == 0 &&
+                client.PlayerScores.at(victim) == 0 && client.PlayerCredits.at(victim) == 0;
+        };
+        return meets(FirstJoinClient) && meets(SecondJoinClient);
+    };
     const auto defense = [&](int hp, int shield) {
         cEncoderTypeEntry encoder;
         encoder.Init(0, 2000, 1);
@@ -1418,6 +1469,7 @@ void Check_Original_Join(unsigned short port, const std::string &definitions, co
     fire(primary, 140, aim_at_second());
     wait(900ms);
     Check(defense(100, 50), "Static projectile cover did not block the rifle shot");
+    Check(score(0), "A blocked projectile earned points");
 
     const int second_control_id = FirstControlObject + 100000;
     cPacket sidestep;
@@ -1429,9 +1481,11 @@ void Check_Original_Join(unsigned short port, const std::string &definitions, co
     fire(primary, 120, aim_at_second());
     Check(defense(100, 50), "The rifle projectile arrived before its travel time");
     Pump_Clients({&first, &second}, [&] { return defense(82, 14); });
+    Pump_Clients({&first, &second}, [&] { return score(18.0f); });
     wait(550ms);
     fire(primary, 100, aim_at_second());
     Pump_Clients({&first, &second}, [&] { return defense(48, 0); });
+    Pump_Clients({&first, &second}, [&] { return score(38.75f); });
     wait(550ms);
     fire(secondary, 93, aim_at_second());
     Pump_Clients({&first, &second}, [&] { return defense(3, 0); });
@@ -1446,6 +1500,7 @@ void Check_Original_Join(unsigned short port, const std::string &definitions, co
             Has_Combat_Counts(SecondJoinClient, 1, 2, PLAYERTYPE_GDI, PLAYERTYPE_NOD);
     };
     Pump_Clients({&first, &second}, counted);
+    Pump_Clients({&first, &second}, [&] { return score(66.5f); });
 
     const float dead_position = SecondJoinClient.Y.at(second_soldier);
     cPacket dead_input;
@@ -1474,7 +1529,7 @@ void Check_Original_Join(unsigned short port, const std::string &definitions, co
     Check(std::abs(spawn_y - 2.0f) < 0.1f && SecondJoinClient.Rounds.at(replacement) == 240 &&
         SecondJoinClient.SelectedWeapon.at(replacement) == 600,
         "The replacement did not spawn with the same team's original health, position and loadout");
-    Check(counted(), "Respawning cleared or duplicated the combat counts or kill message");
+    Check(counted() && score(66.5f), "Respawning cleared or duplicated combat statistics");
 
     cPacket stale;
     Write_Movement(stale, second_control_id, 0, second_soldier, {0, -8, 0});

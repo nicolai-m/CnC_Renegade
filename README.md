@@ -125,6 +125,11 @@ the original kill notification to players in the match. A respawn preserves the
 counters. The next round resets them. Friendly-fire kills count when enabled,
 as on the Windows server.
 
+Minigunner hits award the damage points and kill bonus defined on the victim's
+preset. Shield damage counts in unscaled units, as in the Windows damage
+calculation. Points apply to the player and team. Positive awards also grant
+credits to the player, and friendly fire deducts points.
+
 `TimeLimitMinutes` starts counting down when the server starts the loaded map.
 Clients receive the remaining round time when joining and after loading the
 map. A value of `0` disables the time limit. When the timer expires, the server
@@ -135,18 +140,19 @@ existing connections and spawns players as each client finishes loading.
 `MapName99` in order, with a matching `MapName00` counted once. The default
 `DoMapsLoop=yes` returns to the first map after the last. With `DoMapsLoop=no`,
 the server withdraws its LAN entry and exits after the final intermission.
-Both teams currently have zero points, so the result uses Nod as the
-tiebreaker. Scoring and combat-based victory rules are still being ported.
+At the time limit the team with the highest score wins, with kills breaking a
+points tie. An exact tie goes to Nod. A new round clears scores and credits.
+Building and beacon victory conditions are still being ported.
 
 The two-client UDP fixture covers login, map readiness, movement replication,
 the remaining time for a late join, spawn inventory, weapon selection visible
 to both peers, firing and reloads, cover, projectile travel, shield and health
 damage, blocked input at zero health, respawn with the original player and
-control objects, combat counts and kill notifications, object removal, and
-LAN announcements and withdrawal.
+control objects, combat points, credits and kills, object removal, and LAN
+announcements and withdrawal.
 The round fixture advances the server clock through a timeout
-and checks the announced map, its spawn and position encoding, movement after
-a map reload, and the end of the map cycle.
+and checks the timed result and tiebreakers, the announced map, its spawn and
+position encoding, movement after a map reload, and the end of the map cycle.
 
 On Linux arm64 and with the Linux amd64 build running under QEMU, graphical EA
 1.038 Windows clients loaded `C&C_Field.mix`, spawned and displayed another

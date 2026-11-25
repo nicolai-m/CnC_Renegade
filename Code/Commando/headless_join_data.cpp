@@ -161,6 +161,14 @@ void Read_Record(BoundedChunkReader &reader, Record &record, uint32 parent, unsi
                     record.Soldier.Shield = Read_Defense_Value(reader);
                 } else if (field == 5) {
                     record.ShieldSaveId = reader.Value<sint32>();
+                } else if (field == 6 || field == 7) {
+                    const float points = reader.Value<float>();
+                    reader.Require(std::isfinite(points), "Invalid soldier score coefficient");
+                    if (field == 6) {
+                        record.Soldier.DamagePoints = points;
+                    } else {
+                        record.Soldier.DeathPoints = points;
+                    }
                 }
             });
         } else if (id == PhysicsModelVariables) {

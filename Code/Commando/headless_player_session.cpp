@@ -105,6 +105,8 @@ bool HeadlessPlayerSession::Attach_Player(int peer_id, int player_type, int sold
     peer.Shield = preset.Shield;
     peer.Skin = preset.Skin;
     peer.ShieldType = preset.ShieldType;
+    peer.DamagePoints = preset.DamagePoints;
+    peer.DeathPoints = preset.DeathPoints;
     peer.Weapons = preset.Weapons;
     const auto starting_weapon = std::find_if(peer.Weapons.begin(), peer.Weapons.end(), [&](const auto &weapon) {
         return weapon.DefinitionId == preset.StartingWeapon;
@@ -197,7 +199,7 @@ void HeadlessPlayerSession::Reset_Map(const HeadlessCollision &collision)
     Init_Position_Encoders(collision, PositionEncoders);
     Simulation = HeadlessSimulation(collision);
     Bullets.clear();
-    Deaths.clear();
+    Hits.clear();
     PublishElapsed = {};
     for (auto &[id, peer] : Peers) {
         Clear_Soldier(peer);
@@ -455,20 +457,28 @@ void HeadlessPlayerSession::Apply_Bullet_Damage(int player_id, Peer &peer, const
         return;
     }
     double damage = bullet.Definition.Damage;
+    double shield_damage = 0;
     const float previous_shield = peer.Shield;
     if (peer.Shield > 0) {
         const auto &rule = shield[warhead];
         const double absorbed = damage * std::clamp(rule.ShieldAbsorption, 0.0f, 1.0f);
         const double shield_loss = std::min<double>(peer.Shield, absorbed * std::max(0.0f, rule.Scale));
         peer.Shield -= static_cast<float>(shield_loss);
+        shield_damage = rule.Scale > 0 ? shield_loss / rule.Scale : 0;
         // DefenseObjectClass sends the unabsorbed fraction and spillover through the skin multiplier.
-        damage = std::max(0.0, damage - (rule.Scale > 0 ? shield_loss / rule.Scale : absorbed));
+        damage = std::max(0.0, damage - (rule.Scale > 0 ? shield_damage : absorbed));
     }
     const float previous_health = peer.Health;
-    peer.Health -= static_cast<float>(std::min<double>(peer.Health, damage * std::max(0.0f, skin[warhead].Scale)));
+    const float health_damage = static_cast<float>(std::min<double>(peer.Health, damage * std::max(0.0f, skin[warhead].Scale)));
+    peer.Health -= health_damage;
     peer.DefenseChanged |= peer.Health != previous_health || peer.Shield != previous_shield;
-    if (peer.Health == 0) {
-        Deaths.push_back({player_id, bullet.ShooterObject});
+    const bool fatal = peer.Health == 0;
+    // Windows awards points for scaled health damage and shield damage in unscaled units.
+    const double points = (health_damage + shield_damage) * peer.DamagePoints;
+    if (points != 0 || fatal) {
+        Hits.push_back({player_id, bullet.ShooterObject, points, peer.DeathPoints, fatal});
+    }
+    if (fatal) {
         peer.MoveAxes.Set(0, 0);
         peer.FireControls = 0;
         peer.InputRemaining = {};
@@ -477,9 +487,9 @@ void HeadlessPlayerSession::Apply_Bullet_Damage(int player_id, Peer &peer, const
     }
 }
 
-std::vector<HeadlessPlayerSession::SoldierDeath> HeadlessPlayerSession::Take_Soldier_Deaths()
+std::vector<HeadlessPlayerSession::SoldierHit> HeadlessPlayerSession::Take_Soldier_Hits()
 {
-    return std::exchange(Deaths, {});
+    return std::exchange(Hits, {});
 }
 
 void HeadlessPlayerSession::Advance_Bullets(float seconds)

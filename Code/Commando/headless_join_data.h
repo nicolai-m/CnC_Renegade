@@ -47,6 +47,8 @@ struct HeadlessSoldierPreset {
     std::vector<HeadlessSpawnWeapon> Weapons;
     int StartingWeapon = 0;
     unsigned Skin = 0;
+    float DamagePoints = 0;
+    float DeathPoints = 0;
 };
 
 struct HeadlessDamageRule {
